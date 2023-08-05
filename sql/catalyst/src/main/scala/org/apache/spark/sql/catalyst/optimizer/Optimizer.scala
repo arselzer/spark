@@ -75,6 +75,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
         // Operator push down
         PushProjectionThroughUnion,
         PushProjectionThroughLimit,
+        RewriteJoinsAsSemijoins,
         ReorderJoin,
         EliminateOuterJoin,
         PushDownPredicates,

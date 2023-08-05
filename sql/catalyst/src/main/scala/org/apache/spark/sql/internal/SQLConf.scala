@@ -2592,6 +2592,13 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val YANNAKAKIS_ENABLED =
+    buildConf("spark.sql.yannakakis.enabled")
+      .doc("Enables semi-join rewriting")
+      .version("2.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
       .doc("Enables CBO for estimation of plan statistics when set true.")
@@ -4880,6 +4887,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def histogramNumBins: Int = getConf(HISTOGRAM_NUM_BINS)
 
   def percentileAccuracy: Int = getConf(PERCENTILE_ACCURACY)
+
+  def yannakakisEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_ENABLED)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 
