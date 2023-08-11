@@ -17,7 +17,10 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, ExpressionSet, PredicateHelper}
+import scala.collection.mutable
+
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.expressions.{Attribute, EqualTo, ExpressionSet, ExprId, PredicateHelper}
 import org.apache.spark.sql.catalyst.plans.InnerLike
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, JoinHint, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -33,15 +36,38 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         case agg @ Aggregate(groupingExpressions, aggExpressions,
           join @ Join(_, _, _, _, _)) =>
           val (items, conditions) = extractInnerJoins(join)
-          logWarning("items: " + items.toString() + ", conditions: " + conditions)
-          print(items)
+          logWarning("agg(join)")
+          logWarning("items: " + items.toString())
+          logWarning("conditions: " + conditions)
+          for (cond <- conditions) {
+            logWarning("condition: " + cond)
+          }
           val agg2 = agg.copy(groupingExpressions)
           agg
         case agg@Aggregate(groupingExpressions, aggExpressions,
           filter@Filter(filterConds,
             join@Join(_, _, _, _, _))) =>
           val (items, conditions) = extractInnerJoins(join)
-          logWarning("items: " + items.toString() + ", conditions: " + conditions)
+          logWarning("agg(filter(join))")
+          logWarning("items: " + items.toString())
+          logWarning("conditions: " + conditions)
+          for (cond <- conditions) {
+            logWarning("condition: " + cond)
+          }
+          val agg2 = agg.copy(groupingExpressions)
+          agg
+        case agg@Aggregate(groupingExpressions, aggExpressions,
+        project@Project(projectList,
+        join@Join(_, _, _, _, _))) =>
+          val (items, conditions) = extractInnerJoins(join)
+          logWarning("agg(project(join))")
+          logWarning("items: " + items.toString())
+          logWarning("conditions: " + conditions)
+
+
+          val hypergraph = new Hypergraph(items, conditions)
+
+
           val agg2 = agg.copy(groupingExpressions)
           agg
       }
@@ -54,6 +80,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
    */
   private def extractInnerJoins(plan: LogicalPlan): (Seq[LogicalPlan], ExpressionSet) = {
     plan match {
+      // replace innerlike by more general join type?
       case Join(left, right, _: InnerLike, Some(cond), JoinHint.NONE) =>
         val (leftPlans, leftConditions) = extractInnerJoins(left)
         val (rightPlans, rightConditions) = extractInnerJoins(right)
@@ -66,4 +93,80 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         (Seq(plan), ExpressionSet())
     }
   }
+}
+
+class HGEdge(vertices: Set[String], planReference: LogicalPlan) {
+
+  override def toString: String = vertices.toString()
+}
+class Hypergraph (private val items: Seq[LogicalPlan],
+                  private val conditions: ExpressionSet) extends Logging {
+
+  private var vertices: mutable.Set[String] = mutable.Set.empty
+  private var edges: mutable.Set[HGEdge] = mutable.Set.empty
+  private var vertexToAttributes: mutable.Map[String, Set[Attribute]] = mutable.Map.empty
+  private var attributeToVertex: mutable.Map[ExprId, String] = mutable.Map.empty
+
+  private var equivalenceClasses: Set[Set[Attribute]] = Set.empty
+
+  for (cond <- conditions) {
+    logWarning("condition: " + cond)
+    cond match {
+      case EqualTo(lhs, rhs) =>
+        logWarning("equality condition: " + lhs.references + " , " + rhs.references)
+        val lAtt = lhs.references.head
+        val rAtt = rhs.references.head
+        equivalenceClasses += Set(lAtt, rAtt)
+      case other =>
+        logWarning("other")
+    }
+  }
+
+  // Compute the equivalence classes
+  while (combineEquivalenceClasses) {
+
+  }
+
+  logWarning("equivalence classes: " + equivalenceClasses)
+
+  for (equivalenceClass <- equivalenceClasses) {
+    val attName = equivalenceClass.head.name
+    vertices.add(attName)
+    vertexToAttributes.put(attName, equivalenceClass)
+    for (equivAtt <- equivalenceClass) {
+      attributeToVertex.put(equivAtt.exprId, attName)
+    }
+  }
+
+  logWarning("vertex to attribute mapping: " + vertexToAttributes)
+  logWarning("attribute to vertex mapping: " + attributeToVertex)
+
+  for (item <- items) {
+    logWarning("join item: " + item)
+
+    val projectAttributes = item.outputSet
+    val hyperedgeVertices = projectAttributes
+      .map(att => attributeToVertex.getOrElse(att.exprId, ""))
+      .filterNot(att => att.equals("")).toSet
+
+    val hyperedge = new HGEdge(hyperedgeVertices, item)
+    edges.add(hyperedge)
+  }
+
+  logWarning("hyperedges: " + edges)
+
+  def combineEquivalenceClasses: Boolean = {
+    for (set <- equivalenceClasses) {
+      for (otherSet <- (equivalenceClasses - set)) {
+        if ((set intersect otherSet).nonEmpty) {
+          equivalenceClasses += (set union otherSet)
+          equivalenceClasses -= set
+          equivalenceClasses -= otherSet
+          true
+        }
+      }
+    }
+    false
+  }
+
 }
