@@ -65,8 +65,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           logWarning("conditions: " + conditions)
 
 
-          val hypergraph = new Hypergraph(items, conditions)
+          val hg = new Hypergraph(items, conditions)
 
+          val jointree = hg.flatGYO
+
+          logWarning("join tree: " + jointree)
 
           val agg2 = agg.copy(groupingExpressions)
           agg
@@ -95,9 +98,27 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   }
 }
 
-class HGEdge(vertices: Set[String], planReference: LogicalPlan) {
+class HGEdge(val vertices: Set[String], val name: String, val planReference: LogicalPlan) {
+  def contains(other: HGEdge): Boolean = {
+    other.vertices subsetOf vertices
+  }
+  def containsNotEqual (other: HGEdge): Boolean = {
+    contains(other) && !(vertices subsetOf other.vertices)
+  }
+  def copy(newVertices: Set[String] = vertices,
+           newName: String = name,
+           newPlanReference: LogicalPlan = planReference): HGEdge =
+    new HGEdge(newVertices, newName, newPlanReference)
+  override def toString: String = s"""${name}(${vertices.mkString(", ")})"""
+}
+class TreeNode (val edges: Set[HGEdge], val children: Set[TreeNode]) {
+  def copy(newEdges: Set[HGEdge] = edges, newChildren: Set[TreeNode] = children): TreeNode =
+    new TreeNode(newEdges, newChildren)
 
-  override def toString: String = vertices.toString()
+  def toString(level: Int): String =
+    s"""${"--".repeat(level)}TreeNode(${edges})
+       |${children.map(c => c.toString(level + 1)).mkString("\n")}""".stripMargin
+  override def toString: String = toString(0)
 }
 class Hypergraph (private val items: Seq[LogicalPlan],
                   private val conditions: ExpressionSet) extends Logging {
@@ -141,6 +162,7 @@ class Hypergraph (private val items: Seq[LogicalPlan],
   logWarning("vertex to attribute mapping: " + vertexToAttributes)
   logWarning("attribute to vertex mapping: " + attributeToVertex)
 
+  var tableIndex = 1
   for (item <- items) {
     logWarning("join item: " + item)
 
@@ -149,13 +171,20 @@ class Hypergraph (private val items: Seq[LogicalPlan],
       .map(att => attributeToVertex.getOrElse(att.exprId, ""))
       .filterNot(att => att.equals("")).toSet
 
-    val hyperedge = new HGEdge(hyperedgeVertices, item)
+    item match {
+      // TODO Extract table name?
+      case Project(_, Filter(_, rel)) =>
+        logWarning("relation: " + rel)
+    }
+
+    val hyperedge = new HGEdge(hyperedgeVertices, s"E${tableIndex}", item)
+    tableIndex += 1
     edges.add(hyperedge)
   }
 
   logWarning("hyperedges: " + edges)
 
-  def combineEquivalenceClasses: Boolean = {
+  private def combineEquivalenceClasses: Boolean = {
     for (set <- equivalenceClasses) {
       for (otherSet <- (equivalenceClasses - set)) {
         if ((set intersect otherSet).nonEmpty) {
@@ -169,4 +198,73 @@ class Hypergraph (private val items: Seq[LogicalPlan],
     false
   }
 
+  def isAcyclic: Boolean = {
+    flatGYO == null
+  }
+
+  def flatGYO: TreeNode = {
+    var gyoEdges: mutable.Set[HGEdge] = mutable.Set.empty
+    var mapping: mutable.Map[String, HGEdge] = mutable.Map.empty
+    var root: TreeNode = null
+    var treeNodes: mutable.Map[String, TreeNode] = mutable.Map.empty
+
+    for (edge <- edges) {
+      mapping.put(edge.name, edge)
+      gyoEdges.add(edge.copy())
+    }
+
+    var progress = true
+    while (gyoEdges.size > 1 && progress) {
+      for (e <- gyoEdges) {
+        logWarning("gyo edge: " + e)
+        // Remove vertices that only occur in this edge
+        val allOtherVertices = (gyoEdges - e).map(o => o.vertices)
+          .reduce((o1, o2) => o1 union o2)
+        val singleNodeVertices = e.vertices -- allOtherVertices
+
+        logWarning("single vertices: " + singleNodeVertices)
+
+        val eNew = e.copy(newVertices = e.vertices -- singleNodeVertices)
+        gyoEdges = (gyoEdges - e) + eNew
+
+        logWarning("removed single vertices: " + gyoEdges)
+      }
+
+      var nodeAdded = false
+      for (e <- gyoEdges) {
+        val supersets = gyoEdges.filter(o => o containsNotEqual e)
+        logWarning("supersets: " + supersets)
+
+        // For each edge e, check if it is not contained in another edge
+        if (supersets.isEmpty) {
+          // Append the contained edges as children in the tree
+          val containedEdges = gyoEdges.filter(o => (e contains o) && (e.name != o.name))
+          val childNodes = containedEdges
+            .map(c => treeNodes.getOrElse(c.name, new TreeNode(Set(c), Set())))
+            .toSet
+          logWarning("edge: " + e)
+          logWarning("subsets: " + childNodes)
+          var parentNode = treeNodes.getOrElse(e.name, new TreeNode(Set(e), Set()))
+          parentNode = parentNode.copy(newChildren = parentNode.children ++ childNodes)
+
+          treeNodes.put(e.name, parentNode)
+          childNodes.foreach(c => treeNodes.put(c.edges.head.name, c))
+          root = parentNode
+          gyoEdges --= containedEdges
+          nodeAdded = true
+        }
+      }
+      if (!nodeAdded) progress = false
+    }
+
+    logWarning("root: " + root)
+    logWarning("gyo edges: " + gyoEdges)
+
+    if (gyoEdges.size > 1) {
+      return null
+    }
+
+    root
+  }
 }
+
