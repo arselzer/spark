@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.optimizer
 import scala.collection.mutable
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.{Attribute, EqualTo, ExpressionSet, ExprId, PredicateHelper}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, EqualTo, ExpressionSet, ExprId, PredicateHelper}
 import org.apache.spark.sql.catalyst.plans.InnerLike
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, JoinHint, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -64,12 +64,32 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           logWarning("items: " + items.toString())
           logWarning("conditions: " + conditions)
 
+          val aggregateAttributes = aggExpressions.map(expr => expr.references)
+            .reduce((a1, a2) => a1 ++ a2)
+          logWarning("aggregate attributes: " + aggregateAttributes)
+          val groupAttributes = groupingExpressions
+            .map (g => g.references)
+            .reduce((g1, g2) => g1 ++ g2)
+          logWarning("group attributes: " + groupAttributes)
+          val aggAttributes = aggregateAttributes ++ groupAttributes
+
 
           val hg = new Hypergraph(items, conditions)
 
           val jointree = hg.flatGYO
 
-          logWarning("join tree: " + jointree)
+          logWarning("join tree: \n" + jointree)
+
+          val nodeContainingAttributes = jointree.findNodeContainingAttributes(aggAttributes)
+          if (nodeContainingAttributes != null) {
+            val root = nodeContainingAttributes.reroot
+            logWarning("rerooted: \n" + root)
+
+
+          }
+          else {
+            logWarning("query is not 0MA")
+          }
 
           val agg2 = agg.copy(groupingExpressions)
           agg
@@ -105,18 +125,52 @@ class HGEdge(val vertices: Set[String], val name: String, val planReference: Log
   def containsNotEqual (other: HGEdge): Boolean = {
     contains(other) && !(vertices subsetOf other.vertices)
   }
+  def outputSet: AttributeSet = planReference.outputSet
   def copy(newVertices: Set[String] = vertices,
            newName: String = name,
            newPlanReference: LogicalPlan = planReference): HGEdge =
     new HGEdge(newVertices, newName, newPlanReference)
   override def toString: String = s"""${name}(${vertices.mkString(", ")})"""
 }
-class TreeNode (val edges: Set[HGEdge], val children: Set[TreeNode]) {
-  def copy(newEdges: Set[HGEdge] = edges, newChildren: Set[TreeNode] = children): TreeNode =
-    new TreeNode(newEdges, newChildren)
-
-  def toString(level: Int): String =
-    s"""${"--".repeat(level)}TreeNode(${edges})
+class TreeNode (val edges: Set[HGEdge], var children: Set[TreeNode], var parent: TreeNode)
+  extends Logging {
+  def reroot: TreeNode = {
+    if (parent == null) {
+      this
+    }
+    else {
+      logWarning("parent: " + parent)
+      val oldParent = parent.copy(newChildren = parent.children - this)
+      // Fix broken parent references
+      oldParent.children = oldParent.children.map(c => c.copy(newParent = oldParent))
+      logWarning("newParent: " + oldParent)
+      this.copy(newChildren = children + oldParent.reroot)
+    }
+  }
+  def findNodeContainingAttributes(aggAttributes: AttributeSet): TreeNode = {
+    val nodeAttributes = edges
+      .map(e => e.planReference.outputSet)
+      .reduce((e1, e2) => e1 ++ e2)
+    logWarning("aggAttributes: " + aggAttributes)
+    logWarning("nodeAttributes: " + nodeAttributes)
+    if (aggAttributes subsetOf nodeAttributes) {
+      logWarning("subset")
+      this
+    } else {
+      for (c <- children) {
+        val node = c.findNodeContainingAttributes(aggAttributes)
+        if (node != null) {
+          return node
+        }
+      }
+      null
+    }
+  }
+  def copy(newEdges: Set[HGEdge] = edges, newChildren: Set[TreeNode] = children,
+           newParent: TreeNode = parent): TreeNode =
+    new TreeNode(newEdges, newChildren, newParent)
+  private def toString(level: Int = 0): String =
+    s"""${"-- ".repeat(level)}TreeNode(${edges}) [${edges.map(e => e.planReference.outputSet)}]
        |${children.map(c => c.toString(level + 1)).mkString("\n")}""".stripMargin
   override def toString: String = toString(0)
 }
@@ -131,10 +185,10 @@ class Hypergraph (private val items: Seq[LogicalPlan],
   private var equivalenceClasses: Set[Set[Attribute]] = Set.empty
 
   for (cond <- conditions) {
-    logWarning("condition: " + cond)
+    // logWarning("condition: " + cond)
     cond match {
       case EqualTo(lhs, rhs) =>
-        logWarning("equality condition: " + lhs.references + " , " + rhs.references)
+        // logWarning("equality condition: " + lhs.references + " , " + rhs.references)
         val lAtt = lhs.references.head
         val rAtt = rhs.references.head
         equivalenceClasses += Set(lAtt, rAtt)
@@ -148,7 +202,7 @@ class Hypergraph (private val items: Seq[LogicalPlan],
 
   }
 
-  logWarning("equivalence classes: " + equivalenceClasses)
+  // logWarning("equivalence classes: " + equivalenceClasses)
 
   for (equivalenceClass <- equivalenceClasses) {
     val attName = equivalenceClass.head.name
@@ -216,36 +270,37 @@ class Hypergraph (private val items: Seq[LogicalPlan],
     var progress = true
     while (gyoEdges.size > 1 && progress) {
       for (e <- gyoEdges) {
-        logWarning("gyo edge: " + e)
+        // logWarning("gyo edge: " + e)
         // Remove vertices that only occur in this edge
         val allOtherVertices = (gyoEdges - e).map(o => o.vertices)
           .reduce((o1, o2) => o1 union o2)
         val singleNodeVertices = e.vertices -- allOtherVertices
 
-        logWarning("single vertices: " + singleNodeVertices)
+        // logWarning("single vertices: " + singleNodeVertices)
 
         val eNew = e.copy(newVertices = e.vertices -- singleNodeVertices)
         gyoEdges = (gyoEdges - e) + eNew
 
-        logWarning("removed single vertices: " + gyoEdges)
+        // logWarning("removed single vertices: " + gyoEdges)
       }
 
       var nodeAdded = false
       for (e <- gyoEdges) {
         val supersets = gyoEdges.filter(o => o containsNotEqual e)
-        logWarning("supersets: " + supersets)
+        // logWarning("supersets: " + supersets)
 
         // For each edge e, check if it is not contained in another edge
         if (supersets.isEmpty) {
           // Append the contained edges as children in the tree
           val containedEdges = gyoEdges.filter(o => (e contains o) && (e.name != o.name))
+          // logWarning("edge: " + e)
+          // logWarning("subsets: " + childNodes)
+          var parentNode = treeNodes.getOrElse(e.name, new TreeNode(Set(e), Set(), null))
           val childNodes = containedEdges
-            .map(c => treeNodes.getOrElse(c.name, new TreeNode(Set(c), Set())))
+            .map(c => treeNodes.getOrElse(c.name, new TreeNode(Set(c), Set(), null)))
+            .map(c => c.copy(newParent = parentNode))
             .toSet
-          logWarning("edge: " + e)
-          logWarning("subsets: " + childNodes)
-          var parentNode = treeNodes.getOrElse(e.name, new TreeNode(Set(e), Set()))
-          parentNode = parentNode.copy(newChildren = parentNode.children ++ childNodes)
+          parentNode.children ++= childNodes
 
           treeNodes.put(e.name, parentNode)
           childNodes.foreach(c => treeNodes.put(c.edges.head.name, c))
@@ -256,9 +311,6 @@ class Hypergraph (private val items: Seq[LogicalPlan],
       }
       if (!nodeAdded) progress = false
     }
-
-    logWarning("root: " + root)
-    logWarning("gyo edges: " + gyoEdges)
 
     if (gyoEdges.size > 1) {
       return null
