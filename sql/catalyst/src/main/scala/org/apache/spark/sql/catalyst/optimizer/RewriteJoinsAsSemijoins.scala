@@ -85,16 +85,24 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             val root = nodeContainingAttributes.reroot
             logWarning("rerooted: \n" + root)
 
+            val yannakakisJoins = buildBottomUpJoins(root)
 
+            val newAgg = Aggregate(groupingExpressions, aggExpressions,
+              Project(projectList, yannakakisJoins))
+
+            // newAgg
+            agg
           }
           else {
             logWarning("query is not 0MA")
+            agg
           }
-
-          val agg2 = agg.copy(groupingExpressions)
-          agg
       }
     }
+  }
+
+  private def buildBottomUpJoins(joinTree: HTNode): LogicalPlan = {
+    return null
   }
 
   /**
@@ -132,29 +140,39 @@ class HGEdge(val vertices: Set[String], val name: String, val planReference: Log
     new HGEdge(newVertices, newName, newPlanReference)
   override def toString: String = s"""${name}(${vertices.mkString(", ")})"""
 }
-class TreeNode (val edges: Set[HGEdge], var children: Set[TreeNode], var parent: TreeNode)
+class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNode)
   extends Logging {
-  def reroot: TreeNode = {
+  def reroot: HTNode = {
     if (parent == null) {
       this
     }
     else {
       logWarning("parent: " + parent)
-      val oldParent = parent.copy(newChildren = parent.children - this)
-      // Fix broken parent references
-      oldParent.children = oldParent.children.map(c => c.copy(newParent = oldParent))
-      logWarning("newParent: " + oldParent)
-      this.copy(newChildren = children + oldParent.reroot)
+      var current = this
+      var newCurrent = this.copy(newParent = null)
+      val root = newCurrent
+      while (current.parent != null) {
+        val p = current.parent
+        logWarning("p: " + p)
+        val newChild = p.copy(newChildren = p.children - current, newParent = null)
+        logWarning("new child: " + newChild)
+        newCurrent.children += newChild
+        logWarning("c: " + current)
+        current = p
+        newCurrent = newChild
+      }
+      root.setParentReferences
+      root
     }
   }
-  def findNodeContainingAttributes(aggAttributes: AttributeSet): TreeNode = {
+  def findNodeContainingAttributes(aggAttributes: AttributeSet): HTNode = {
     val nodeAttributes = edges
       .map(e => e.planReference.outputSet)
       .reduce((e1, e2) => e1 ++ e2)
     logWarning("aggAttributes: " + aggAttributes)
     logWarning("nodeAttributes: " + nodeAttributes)
     if (aggAttributes subsetOf nodeAttributes) {
-      logWarning("subset")
+      logWarning("found subset in:\n" + this)
       this
     } else {
       for (c <- children) {
@@ -166,12 +184,20 @@ class TreeNode (val edges: Set[HGEdge], var children: Set[TreeNode], var parent:
       null
     }
   }
-  def copy(newEdges: Set[HGEdge] = edges, newChildren: Set[TreeNode] = children,
-           newParent: TreeNode = parent): TreeNode =
-    new TreeNode(newEdges, newChildren, newParent)
+
+  def setParentReferences: Unit = {
+    for (c <- children) {
+      c.parent = this
+      c.setParentReferences
+    }
+  }
+  def copy(newEdges: Set[HGEdge] = edges, newChildren: Set[HTNode] = children,
+           newParent: HTNode = parent): HTNode =
+    new HTNode(newEdges, newChildren, newParent)
   private def toString(level: Int = 0): String =
-    s"""${"-- ".repeat(level)}TreeNode(${edges}) [${edges.map(e => e.planReference.outputSet)}]
-       |${children.map(c => c.toString(level + 1)).mkString("\n")}""".stripMargin
+    s"""${"-- ".repeat(level)}TreeNode(${edges})""" +
+      s"""[${edges.map(e => e.planReference.outputSet)}] [[parent: ${parent != null}]]
+      |${children.map(c => c.toString(level + 1)).mkString("\n")}""".stripMargin
   override def toString: String = toString(0)
 }
 class Hypergraph (private val items: Seq[LogicalPlan],
@@ -256,11 +282,11 @@ class Hypergraph (private val items: Seq[LogicalPlan],
     flatGYO == null
   }
 
-  def flatGYO: TreeNode = {
+  def flatGYO: HTNode = {
     var gyoEdges: mutable.Set[HGEdge] = mutable.Set.empty
     var mapping: mutable.Map[String, HGEdge] = mutable.Map.empty
-    var root: TreeNode = null
-    var treeNodes: mutable.Map[String, TreeNode] = mutable.Map.empty
+    var root: HTNode = null
+    var treeNodes: mutable.Map[String, HTNode] = mutable.Map.empty
 
     for (edge <- edges) {
       mapping.put(edge.name, edge)
@@ -295,16 +321,16 @@ class Hypergraph (private val items: Seq[LogicalPlan],
           val containedEdges = gyoEdges.filter(o => (e contains o) && (e.name != o.name))
           // logWarning("edge: " + e)
           // logWarning("subsets: " + childNodes)
-          var parentNode = treeNodes.getOrElse(e.name, new TreeNode(Set(e), Set(), null))
+          val parentNode = treeNodes.getOrElse(e.name, new HTNode(Set(e), Set(), null))
           val childNodes = containedEdges
-            .map(c => treeNodes.getOrElse(c.name, new TreeNode(Set(c), Set(), null)))
-            .map(c => c.copy(newParent = parentNode))
+            .map(c => treeNodes.getOrElse(c.name, new HTNode(Set(c), Set(), null)))
             .toSet
           parentNode.children ++= childNodes
 
           treeNodes.put(e.name, parentNode)
           childNodes.foreach(c => treeNodes.put(c.edges.head.name, c))
           root = parentNode
+          root.setParentReferences
           gyoEdges --= containedEdges
           nodeAdded = true
         }
