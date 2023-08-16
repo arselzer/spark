@@ -260,10 +260,10 @@ class Hypergraph (private val items: Seq[LogicalPlan],
 
   }
 
-  // logWarning("equivalence classes: " + equivalenceClasses)
+  logWarning("equivalence classes: " + equivalenceClasses)
 
   for (equivalenceClass <- equivalenceClasses) {
-    val attName = equivalenceClass.head.name
+    val attName = equivalenceClass.head.toString
     vertices.add(attName)
     vertexToAttributes.put(attName, equivalenceClass)
     for (equivAtt <- equivalenceClass) {
@@ -298,12 +298,17 @@ class Hypergraph (private val items: Seq[LogicalPlan],
 
   private def combineEquivalenceClasses: Boolean = {
     for (set <- equivalenceClasses) {
+      logWarning("set: " + set )
       for (otherSet <- (equivalenceClasses - set)) {
+        logWarning("otherSet: " + otherSet)
+        logWarning("intersect: " + (set intersect otherSet))
         if ((set intersect otherSet).nonEmpty) {
           equivalenceClasses += (set union otherSet)
           equivalenceClasses -= set
           equivalenceClasses -= otherSet
-          true
+          logWarning("union: " + (set union otherSet))
+          logWarning("equivalenceClasses: " + equivalenceClasses + "\n")
+          return true
         }
       }
     }
