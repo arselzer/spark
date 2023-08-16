@@ -20,8 +20,8 @@ package org.apache.spark.sql.catalyst.optimizer
 import scala.collection.mutable
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, EqualTo, ExpressionSet, ExprId, PredicateHelper}
-import org.apache.spark.sql.catalyst.plans.InnerLike
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, JoinHint, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern
@@ -34,7 +34,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     else {
       plan.transformDownWithPruning(_.containsPattern(TreePattern.AGGREGATE), ruleId) {
         case agg @ Aggregate(groupingExpressions, aggExpressions,
-          join @ Join(_, _, _, _, _)) =>
+          join @ Join(_, _, Inner, _, _)) =>
           val (items, conditions) = extractInnerJoins(join)
           logWarning("agg(join)")
           logWarning("items: " + items.toString())
@@ -46,7 +46,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           agg
         case agg@Aggregate(groupingExpressions, aggExpressions,
           filter@Filter(filterConds,
-            join@Join(_, _, _, _, _))) =>
+            join@Join(_, _, Inner, _, _))) =>
           val (items, conditions) = extractInnerJoins(join)
           logWarning("agg(filter(join))")
           logWarning("items: " + items.toString())
@@ -58,7 +58,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           agg
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
-        join@Join(_, _, _, _, _))) =>
+        join@Join(_, _, Inner, _, _))) =>
+          // TODO allow different joins
+          // logWarning("join type: " + joinType)
           val (items, conditions) = extractInnerJoins(join)
           logWarning("agg(project(join))")
           logWarning("items: " + items.toString())
@@ -67,15 +69,20 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           val aggregateAttributes = aggExpressions.map(expr => expr.references)
             .reduce((a1, a2) => a1 ++ a2)
           logWarning("aggregate attributes: " + aggregateAttributes)
-          val groupAttributes = groupingExpressions
-            .map (g => g.references)
-            .reduce((g1, g2) => g1 ++ g2)
+          logWarning("groupingExpressions: " + groupingExpressions)
+          val groupAttributes = if (groupingExpressions.isEmpty) {
+            AttributeSet.empty
+          }
+          else {
+            groupingExpressions
+              .map(g => g.references)
+              .reduce((g1, g2) => g1 ++ g2)
+          }
+
           logWarning("group attributes: " + groupAttributes)
+
           val aggAttributes = aggregateAttributes ++ groupAttributes
-
-
           val hg = new Hypergraph(items, conditions)
-
           val jointree = hg.flatGYO
 
           logWarning("join tree: \n" + jointree)
@@ -85,13 +92,14 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             val root = nodeContainingAttributes.reroot
             logWarning("rerooted: \n" + root)
 
-            val yannakakisJoins = buildBottomUpJoins(root)
+            val yannakakisJoins = root.buildBottomUpJoins
+
+            // logWarning("yannakakis join: \n" + yannakakisJoins)
 
             val newAgg = Aggregate(groupingExpressions, aggExpressions,
               Project(projectList, yannakakisJoins))
-
-            // newAgg
-            agg
+            logWarning("new aggregate: " + newAgg)
+            newAgg
           }
           else {
             logWarning("query is not 0MA")
@@ -99,10 +107,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }
       }
     }
-  }
-
-  private def buildBottomUpJoins(joinTree: HTNode): LogicalPlan = {
-    return null
   }
 
   /**
@@ -126,7 +130,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   }
 }
 
-class HGEdge(val vertices: Set[String], val name: String, val planReference: LogicalPlan) {
+class HGEdge(val vertices: Set[String], val name: String, val planReference: LogicalPlan,
+             val attributeToVertex: mutable.Map[ExprId, String]) {
+  val vertexToAttribute: Map[String, Attribute] = planReference.outputSet.map(
+    att => (attributeToVertex.getOrElse(att.exprId, null), att))
+    .toMap
+
   def contains(other: HGEdge): Boolean = {
     other.vertices subsetOf vertices
   }
@@ -137,11 +146,34 @@ class HGEdge(val vertices: Set[String], val name: String, val planReference: Log
   def copy(newVertices: Set[String] = vertices,
            newName: String = name,
            newPlanReference: LogicalPlan = planReference): HGEdge =
-    new HGEdge(newVertices, newName, newPlanReference)
+    new HGEdge(newVertices, newName, newPlanReference, attributeToVertex)
   override def toString: String = s"""${name}(${vertices.mkString(", ")})"""
 }
 class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNode)
   extends Logging {
+  def buildBottomUpJoins: LogicalPlan = {
+    // TODO generalize to cylic queries
+    val edge = edges.head
+    val scanPlan = edge.planReference
+    val vertices = edge.vertices
+    var prevJoin: LogicalPlan = scanPlan
+    for (c <- children) {
+      val cEdge = c.edges.head
+      val childAttributes = cEdge.planReference.outputSet
+      val childVertices = cEdge.vertices
+      val overlappingVertices = vertices intersect childVertices
+      logWarning("overlapping vertices: " + overlappingVertices)
+      val joinConditions = overlappingVertices
+        .map(vertex => (edge.vertexToAttribute(vertex), cEdge.vertexToAttribute(vertex)))
+        .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
+        .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
+      logWarning("join conditions: " + joinConditions)
+      val semiJoin = Join(prevJoin, c.buildBottomUpJoins, LeftSemi, Option(joinConditions),
+        JoinHint(Option.empty, Option.empty))
+      prevJoin = semiJoin
+    }
+    return prevJoin
+  }
   def reroot: HTNode = {
     if (parent == null) {
       this
@@ -257,7 +289,7 @@ class Hypergraph (private val items: Seq[LogicalPlan],
         logWarning("relation: " + rel)
     }
 
-    val hyperedge = new HGEdge(hyperedgeVertices, s"E${tableIndex}", item)
+    val hyperedge = new HGEdge(hyperedgeVertices, s"E${tableIndex}", item, attributeToVertex)
     tableIndex += 1
     edges.add(hyperedge)
   }
