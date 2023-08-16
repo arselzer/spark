@@ -85,6 +85,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           val hg = new Hypergraph(items, conditions)
           val jointree = hg.flatGYO
 
+          if (jointree == null) {
+            logWarning("join is cyclic")
+            return agg
+          }
+
           logWarning("join tree: \n" + jointree)
 
           val nodeContainingAttributes = jointree.findNodeContainingAttributes(aggAttributes)
@@ -99,11 +104,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             val newAgg = Aggregate(groupingExpressions, aggExpressions,
               Project(projectList, yannakakisJoins))
             logWarning("new aggregate: " + newAgg)
-            newAgg
+            return newAgg
           }
           else {
             logWarning("query is not 0MA")
-            agg
+            return agg
           }
       }
     }
@@ -159,6 +164,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     var prevJoin: LogicalPlan = scanPlan
     for (c <- children) {
       val cEdge = c.edges.head
+      logWarning("cur edge: " + edge + ", child edge: " + cEdge)
       val childAttributes = cEdge.planReference.outputSet
       val childVertices = cEdge.vertices
       val overlappingVertices = vertices intersect childVertices
@@ -283,12 +289,6 @@ class Hypergraph (private val items: Seq[LogicalPlan],
       .map(att => attributeToVertex.getOrElse(att.exprId, ""))
       .filterNot(att => att.equals("")).toSet
 
-    item match {
-      // TODO Extract table name?
-      case Project(_, Filter(_, rel)) =>
-        logWarning("relation: " + rel)
-    }
-
     val hyperedge = new HGEdge(hyperedgeVertices, s"E${tableIndex}", item, attributeToVertex)
     tableIndex += 1
     edges.add(hyperedge)
@@ -298,16 +298,12 @@ class Hypergraph (private val items: Seq[LogicalPlan],
 
   private def combineEquivalenceClasses: Boolean = {
     for (set <- equivalenceClasses) {
-      logWarning("set: " + set )
       for (otherSet <- (equivalenceClasses - set)) {
-        logWarning("otherSet: " + otherSet)
-        logWarning("intersect: " + (set intersect otherSet))
         if ((set intersect otherSet).nonEmpty) {
-          equivalenceClasses += (set union otherSet)
+          val unionSet = (set union otherSet)
           equivalenceClasses -= set
           equivalenceClasses -= otherSet
-          logWarning("union: " + (set union otherSet))
-          logWarning("equivalenceClasses: " + equivalenceClasses + "\n")
+          equivalenceClasses += unionSet
           return true
         }
       }
@@ -349,27 +345,30 @@ class Hypergraph (private val items: Seq[LogicalPlan],
 
       var nodeAdded = false
       for (e <- gyoEdges) {
+        logWarning("gyo edge: " + e)
         val supersets = gyoEdges.filter(o => o containsNotEqual e)
-        // logWarning("supersets: " + supersets)
+        logWarning("supersets: " + supersets)
 
         // For each edge e, check if it is not contained in another edge
         if (supersets.isEmpty) {
           // Append the contained edges as children in the tree
           val containedEdges = gyoEdges.filter(o => (e contains o) && (e.name != o.name))
-          // logWarning("edge: " + e)
-          // logWarning("subsets: " + childNodes)
           val parentNode = treeNodes.getOrElse(e.name, new HTNode(Set(e), Set(), null))
           val childNodes = containedEdges
             .map(c => treeNodes.getOrElse(c.name, new HTNode(Set(c), Set(), null)))
             .toSet
+          logWarning("parentNode: " + parentNode)
           parentNode.children ++= childNodes
+          logWarning("subsets: " + childNodes)
+          if (childNodes.nonEmpty) {
+            nodeAdded = true
+          }
 
           treeNodes.put(e.name, parentNode)
           childNodes.foreach(c => treeNodes.put(c.edges.head.name, c))
           root = parentNode
           root.setParentReferences
           gyoEdges --= containedEdges
-          nodeAdded = true
         }
       }
       if (!nodeAdded) progress = false
