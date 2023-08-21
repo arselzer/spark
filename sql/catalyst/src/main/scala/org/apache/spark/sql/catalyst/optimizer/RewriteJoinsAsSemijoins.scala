@@ -21,10 +21,12 @@ import scala.collection.mutable
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, JoinHint, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern
+import org.apache.spark.sql.types.IntegerType
 
 object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   override def apply(plan: LogicalPlan): LogicalPlan = {
@@ -34,37 +36,25 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     else {
       plan.transformDownWithPruning(_.containsPattern(TreePattern.AGGREGATE), ruleId) {
         case agg @ Aggregate(groupingExpressions, aggExpressions,
-          join @ Join(_, _, Inner, _, _)) =>
-          val (items, conditions) = extractInnerJoins(join)
-          logWarning("agg(join)")
-          logWarning("items: " + items.toString())
-          logWarning("conditions: " + conditions)
-          for (cond <- conditions) {
-            logWarning("condition: " + cond)
-          }
-          val agg2 = agg.copy(groupingExpressions)
-          agg
+          join @ Join(_, _, Inner, _, _)) => agg
         case agg@Aggregate(groupingExpressions, aggExpressions,
           filter@Filter(filterConds,
-            join@Join(_, _, Inner, _, _))) =>
-          val (items, conditions) = extractInnerJoins(join)
-          logWarning("agg(filter(join))")
-          logWarning("items: " + items.toString())
-          logWarning("conditions: " + conditions)
-          for (cond <- conditions) {
-            logWarning("condition: " + cond)
-          }
-          val agg2 = agg.copy(groupingExpressions)
-          agg
+            join@Join(_, _, Inner, _, _))) => agg
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
         join@Join(_, _, Inner, _, _))) =>
+          logWarning("applying yannakakis rewriting to join: " + agg)
           // TODO allow different joins
           // logWarning("join type: " + joinType)
           val (items, conditions) = extractInnerJoins(join)
           logWarning("agg(project(join))")
           logWarning("items: " + items.toString())
           logWarning("conditions: " + conditions)
+          for (agg <- aggExpressions) {
+            logWarning("agg: " + agg)
+            logWarning("is 0MA: " + is0MA(agg))
+            logWarning("is counting: " + isCounting(agg))
+          }
 
           val aggregateAttributes = aggExpressions.map(expr => expr.references)
             .reduce((a1, a2) => a1 ++ a2)
@@ -79,9 +69,14 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               .reduce((g1, g2) => g1 ++ g2)
           }
 
-          logWarning("group attributes: " + groupAttributes)
+          val countingAggregates = aggExpressions
+            .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
+            .filter(agg => isCounting(agg))
 
-          val aggAttributes = aggregateAttributes ++ groupAttributes
+          logWarning("group attributes: " + groupAttributes)
+          logWarning("counting aggregates: " + countingAggregates)
+
+          val allAggAttributes = aggregateAttributes ++ groupAttributes
           val hg = new Hypergraph(items, conditions)
           val jointree = hg.flatGYO
 
@@ -92,25 +87,73 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
 
           logWarning("join tree: \n" + jointree)
 
-          val nodeContainingAttributes = jointree.findNodeContainingAttributes(aggAttributes)
+          val nodeContainingAttributes = jointree.findNodeContainingAttributes(allAggAttributes)
           if (nodeContainingAttributes != null) {
             val root = nodeContainingAttributes.reroot
             logWarning("rerooted: \n" + root)
 
-            val yannakakisJoins = root.buildBottomUpJoins
+            if (countingAggregates.isEmpty) {
+              val yannakakisJoins = root.buildBottomUpJoins
 
-            // logWarning("yannakakis join: \n" + yannakakisJoins)
+              val newAgg = Aggregate(groupingExpressions, aggExpressions,
+                yannakakisJoins)
+              logWarning("new aggregate: " + newAgg)
+              newAgg
+            }
+            else {
+              val starCountingAggregates = countingAggregates
+                .filter(agg => agg.references.isEmpty)
+              logWarning("star counting aggregates: " + starCountingAggregates)
+              val (yannakakisJoins, countingAttribute) =
+                root.buildBottomUpJoinsCounting(countingAggregates)
 
-            val newAgg = Aggregate(groupingExpressions, aggExpressions,
-              Project(projectList, yannakakisJoins))
-            logWarning("new aggregate: " + newAgg)
-            return newAgg
+              val newCountingAggregates = starCountingAggregates
+                .map(agg => agg.transformDown {
+                  case AggregateExpression(aggFn, mode, isDistinct, filter, resultId)
+                  => aggFn match {
+                    case Count(s) => AggregateExpression(
+                      Sum(countingAttribute), mode, isDistinct, filter, resultId)
+                  }
+                }).asInstanceOf[Seq[NamedExpression]]
+              val newAgg = Aggregate(groupingExpressions, newCountingAggregates,
+                Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
+              logWarning("new aggregate: " + newAgg)
+              newAgg
+            }
           }
           else {
             logWarning("query is not 0MA")
-            return agg
+            agg
           }
       }
+    }
+  }
+  def is0MA(expr: Expression): Boolean = {
+    logWarning("expr: " + expr)
+    logWarning("class: " + expr.getClass)
+    expr match {
+      case Alias(child, name) => is0MA(child)
+      case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
+        case Min(c) => true
+        case Max(c) => true
+        case _ => false
+      }
+      case _: Attribute => true
+      case _ => false
+    }
+  }
+  def isCounting(expr: Expression): Boolean = {
+    logWarning("expr: " + expr)
+    logWarning("class: " + expr.getClass)
+    // TODO check if there are not further special cases we are missing
+    expr match {
+      case Alias(child, name) => isCounting(child)
+      case ToPrettyString(child, tz) => isCounting(child)
+      case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
+        case Count(s) => true
+        case _ => false
+      }
+      case _ => false
     }
   }
 
@@ -157,28 +200,74 @@ class HGEdge(val vertices: Set[String], val name: String, val planReference: Log
 class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNode)
   extends Logging {
   def buildBottomUpJoins: LogicalPlan = {
-    // TODO generalize to cylic queries
     val edge = edges.head
     val scanPlan = edge.planReference
     val vertices = edge.vertices
     var prevJoin: LogicalPlan = scanPlan
     for (c <- children) {
-      val cEdge = c.edges.head
-      logWarning("cur edge: " + edge + ", child edge: " + cEdge)
-      val childAttributes = cEdge.planReference.outputSet
-      val childVertices = cEdge.vertices
+      val childEdge = c.edges.head
+      val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
-      logWarning("overlapping vertices: " + overlappingVertices)
       val joinConditions = overlappingVertices
-        .map(vertex => (edge.vertexToAttribute(vertex), cEdge.vertexToAttribute(vertex)))
+        .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
         .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
         .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
-      logWarning("join conditions: " + joinConditions)
-      val semiJoin = Join(prevJoin, c.buildBottomUpJoins, LeftSemi, Option(joinConditions),
-        JoinHint(Option.empty, Option.empty))
-      prevJoin = semiJoin
+      val semijoin = Join(prevJoin, c.buildBottomUpJoins,
+        LeftSemi, Option(joinConditions), JoinHint(Option.empty, Option.empty))
+      prevJoin = semijoin
     }
-    return prevJoin
+    prevJoin
+  }
+
+  def buildBottomUpJoinsCounting(countingAggregates: Seq[NamedExpression]):
+  (LogicalPlan, NamedExpression) = {
+    if (countingAggregates.isEmpty) {
+      buildBottomUpJoins
+    }
+
+    val edge = edges.head
+    val scanPlan = edge.planReference
+    val vertices = edge.vertices
+
+    var prevCountExpr: NamedExpression = Alias(Literal(1, IntegerType), "c")()
+    var prevPlan: LogicalPlan = Project(
+      scanPlan.output ++ Seq(prevCountExpr), scanPlan)
+    logWarning("prevJoin: " + prevPlan)
+    logWarning("prevCount: " + prevCountExpr)
+
+    for (c <- children) {
+      val childEdge = c.edges.head
+      val childVertices = childEdge.vertices
+      val overlappingVertices = vertices intersect childVertices
+      val (bottomUpJoins, childCountExpr) = c.buildBottomUpJoinsCounting(countingAggregates)
+
+      val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
+      val countExpressionRight = Alias(
+        Sum(childCountExpr.toAttribute).toAggregateExpression(), "c")()
+      val countGroupLeft = vertices.map(v => edge.vertexToAttribute(v)).toSeq
+      val countGroupRight = overlappingVertices.map(v => childEdge.vertexToAttribute(v)).toSeq
+
+      val leftPlan = Aggregate(countGroupLeft,
+        Seq(countExpressionLeft) ++ countGroupLeft, prevPlan)
+      val rightPlan = Aggregate(countGroupRight,
+        Seq(countExpressionRight) ++ countGroupRight, bottomUpJoins)
+
+      val joinConditions = overlappingVertices
+        .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
+        .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
+        .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
+
+      val join = Join(leftPlan, rightPlan,
+        Inner, Option(joinConditions), JoinHint(Option.empty, Option.empty))
+      val finalCountExpr = Alias(Multiply(
+        countExpressionLeft.toAttribute,
+        countExpressionRight.toAttribute), "c")()
+      val multiplication = Project(Seq(finalCountExpr) ++ join.output, join)
+
+      prevPlan = multiplication
+      prevCountExpr = finalCountExpr.toAttribute
+    }
+    (prevPlan, prevCountExpr)
   }
   def reroot: HTNode = {
     if (parent == null) {
