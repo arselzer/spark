@@ -104,7 +104,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               val starCountingAggregates = countingAggregates
                 .filter(agg => agg.references.isEmpty)
               logWarning("star counting aggregates: " + starCountingAggregates)
-              val (yannakakisJoins, countingAttribute) =
+              val (yannakakisJoins, countingAttribute, _) =
                 root.buildBottomUpJoinsCounting(countingAggregates)
 
               val newCountingAggregates = starCountingAggregates
@@ -220,7 +220,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
   }
 
   def buildBottomUpJoinsCounting(countingAggregates: Seq[NamedExpression]):
-  (LogicalPlan, NamedExpression) = {
+  (LogicalPlan, NamedExpression, Boolean) = {
     if (countingAggregates.isEmpty) {
       buildBottomUpJoins
     }
@@ -232,14 +232,14 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     var prevCountExpr: NamedExpression = Alias(Literal(1, IntegerType), "c")()
     var prevPlan: LogicalPlan = Project(
       scanPlan.output ++ Seq(prevCountExpr), scanPlan)
-    logWarning("prevJoin: " + prevPlan)
-    logWarning("prevCount: " + prevCountExpr)
+    var isLeafNode = true
 
     for (c <- children) {
       val childEdge = c.edges.head
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
-      val (bottomUpJoins, childCountExpr) = c.buildBottomUpJoinsCounting(countingAggregates)
+      val (bottomUpJoins, childCountExpr, rightPlanIsLeaf) =
+        c.buildBottomUpJoinsCounting(countingAggregates)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
@@ -247,10 +247,23 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val countGroupLeft = vertices.map(v => edge.vertexToAttribute(v)).toSeq
       val countGroupRight = overlappingVertices.map(v => childEdge.vertexToAttribute(v)).toSeq
 
-      val leftPlan = Aggregate(countGroupLeft,
-        Seq(countExpressionLeft) ++ countGroupLeft, prevPlan)
-      val rightPlan = Aggregate(countGroupRight,
-        Seq(countExpressionRight) ++ countGroupRight, bottomUpJoins)
+      val (leftPlan, leftCountAttribute) = if (isLeafNode) {
+        (prevPlan, prevCountExpr.toAttribute)
+      }
+      else {
+        (Aggregate(countGroupLeft,
+          Seq(countExpressionLeft) ++ countGroupLeft, prevPlan),
+          countExpressionLeft.toAttribute)
+      }
+
+      val (rightPlan, rightCountAttribute) = if (rightPlanIsLeaf) {
+        (bottomUpJoins, childCountExpr.toAttribute)
+      }
+      else {
+        (Aggregate(countGroupRight,
+          Seq(countExpressionRight) ++ countGroupRight, bottomUpJoins),
+          countExpressionRight.toAttribute)
+      }
 
       val joinConditions = overlappingVertices
         .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
@@ -260,14 +273,15 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val join = Join(leftPlan, rightPlan,
         Inner, Option(joinConditions), JoinHint(Option.empty, Option.empty))
       val finalCountExpr = Alias(Multiply(
-        countExpressionLeft.toAttribute,
-        countExpressionRight.toAttribute), "c")()
+        Cast(leftCountAttribute, rightCountAttribute.dataType),
+        rightCountAttribute), "c")()
       val multiplication = Project(Seq(finalCountExpr) ++ join.output, join)
 
       prevPlan = multiplication
-      prevCountExpr = finalCountExpr.toAttribute
-    }
-    (prevPlan, prevCountExpr)
+      prevCountExpr = finalCountExpr
+      isLeafNode = false
+      }
+    (prevPlan, prevCountExpr.toAttribute, isLeafNode)
   }
   def reroot: HTNode = {
     if (parent == null) {
