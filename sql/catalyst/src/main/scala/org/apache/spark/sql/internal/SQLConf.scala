@@ -2599,6 +2599,13 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val YANNAKAKIS_COUNT_GROUP_LEAVES =
+    buildConf("spark.sql.yannakakis.countGroupInLeaves")
+      .doc("Perform grouping directly in the leaves")
+      .version("2.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
       .doc("Enables CBO for estimation of plan statistics when set true.")
@@ -4889,6 +4896,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def percentileAccuracy: Int = getConf(PERCENTILE_ACCURACY)
 
   def yannakakisEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_ENABLED)
+
+  def yannakakisCountGroupInLeavesEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_COUNT_GROUP_LEAVES)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 
