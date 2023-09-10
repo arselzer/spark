@@ -23,12 +23,138 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, JoinHint, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern
 import org.apache.spark.sql.types.IntegerType
 
 object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
+  def rewritePlan(agg: Aggregate, groupingExpressions: Seq[Expression],
+                  aggExpressions: Seq[NamedExpression], projectList: Seq[NamedExpression],
+                  join: Join, keyRefs: Seq[Seq[Expression]]) : LogicalPlan = {
+    logWarning("applying yannakakis rewriting to join: " + agg)
+    // TODO allow different joins
+    // logWarning("join type: " + joinType)
+    val (items, conditions) = extractInnerJoins(join)
+    logWarning("agg(project(join))")
+    logWarning("items: " + items.toString())
+    logWarning("conditions: " + conditions)
+    for (agg <- aggExpressions) {
+      logWarning("agg: " + agg)
+      logWarning("is 0MA: " + is0MA(agg))
+      logWarning("is counting: " + isCounting(agg))
+      logWarning("is percentile: " + isPercentile(agg))
+    }
+
+    val aggregateAttributes = aggExpressions.map(expr => expr.references)
+      .reduce((a1, a2) => a1 ++ a2)
+    logWarning("aggregate attributes: " + aggregateAttributes)
+    logWarning("groupingExpressions: " + groupingExpressions)
+    val groupAttributes = if (groupingExpressions.isEmpty) {
+      AttributeSet.empty
+    }
+    else {
+      groupingExpressions
+        .map(g => g.references)
+        .reduce((g1, g2) => g1 ++ g2)
+    }
+
+    val zeroMAAggregates = aggExpressions
+      .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
+      .filter(agg => is0MA(agg))
+    val percentileAggregates = aggExpressions
+      .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
+      .filter(agg => isPercentile(agg))
+    val countingAggregates = aggExpressions
+      .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
+      .filter(agg => isCounting(agg))
+
+    if (zeroMAAggregates.isEmpty
+      && percentileAggregates.isEmpty
+      && countingAggregates.isEmpty) {
+      logWarning("query is not applicable (0MA, counting, or percentile)")
+      agg
+    }
+    else {
+      logWarning("group attributes: " + groupAttributes)
+      logWarning("counting aggregates: " + countingAggregates)
+
+      val allAggAttributes = aggregateAttributes ++ groupAttributes
+      val hg = new Hypergraph(items, conditions)
+      val jointree = hg.flatGYO
+
+      if (jointree == null) {
+        logWarning("join is cyclic")
+        agg
+      }
+      else {
+        logWarning("join tree: \n" + jointree)
+
+        val nodeContainingAttributes = jointree.findNodeContainingAttributes(allAggAttributes)
+        if (nodeContainingAttributes == null) {
+          logWarning("query is not 0MA")
+          agg
+        }
+        else {
+          val root = nodeContainingAttributes.reroot
+          logWarning("rerooted: \n" + root)
+
+          if (countingAggregates.isEmpty && percentileAggregates.isEmpty) {
+            val yannakakisJoins = root.buildBottomUpJoins
+
+            val newAgg = Aggregate(groupingExpressions, aggExpressions,
+              yannakakisJoins)
+            logWarning("new aggregate: " + newAgg)
+            newAgg
+          }
+          else {
+            if (countingAggregates.nonEmpty) {
+              val starCountingAggregates = countingAggregates
+                .filter(agg => agg.references.isEmpty)
+              logWarning("star counting aggregates: " + starCountingAggregates)
+              val (yannakakisJoins, countingAttribute, _, _) =
+                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs,
+                  conf.yannakakisCountGroupInLeavesEnabled)
+
+              val newCountingAggregates = starCountingAggregates
+                .map(agg => agg.transformDown {
+                  case AggregateExpression(aggFn, mode, isDistinct, filter, resultId)
+                  => aggFn match {
+                    case Count(s) => AggregateExpression(
+                      Sum(countingAttribute), mode, isDistinct, filter, resultId)
+                  }
+                }).asInstanceOf[Seq[NamedExpression]]
+              val newAgg = Aggregate(groupingExpressions, newCountingAggregates,
+                Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
+              logWarning("new aggregate: " + newAgg)
+              newAgg
+            }
+            else {
+              logWarning("percentile aggregates: " + percentileAggregates)
+              val (yannakakisJoins, countingAttribute, _, _) =
+                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs,
+                  conf.yannakakisCountGroupInLeavesEnabled)
+
+              val newPercentileAggregates = percentileAggregates
+                .map(agg => agg.transformDown {
+                  case AggregateExpression(aggFn, mode, isDistinct, filter, resultId)
+                  => aggFn match {
+                    case Percentile(c, percExp, freqExp, mutableAggBufferOffset,
+                    inputAggBufferOffset, reverse) => AggregateExpression(
+                      Percentile(c, percExp, countingAttribute, mutableAggBufferOffset,
+                        inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
+                  }
+                }).asInstanceOf[Seq[NamedExpression]]
+              val newAgg = Aggregate(groupingExpressions, newPercentileAggregates,
+                Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
+              logWarning("new aggregate: " + newAgg)
+              newAgg
+            }
+          }
+        }
+      }
+    }
+  }
   override def apply(plan: LogicalPlan): LogicalPlan = {
     if (!conf.yannakakisEnabled) {
       plan
@@ -43,128 +169,16 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
         join@Join(_, _, Inner, _, _))) =>
-          logWarning("applying yannakakis rewriting to join: " + agg)
-          // TODO allow different joins
-          // logWarning("join type: " + joinType)
-          val (items, conditions) = extractInnerJoins(join)
-          logWarning("agg(project(join))")
-          logWarning("items: " + items.toString())
-          logWarning("conditions: " + conditions)
-          for (agg <- aggExpressions) {
-            logWarning("agg: " + agg)
-            logWarning("is 0MA: " + is0MA(agg))
-            logWarning("is counting: " + isCounting(agg))
-            logWarning("is percentile: " + isPercentile(agg))
-          }
-
-          val aggregateAttributes = aggExpressions.map(expr => expr.references)
-            .reduce((a1, a2) => a1 ++ a2)
-          logWarning("aggregate attributes: " + aggregateAttributes)
-          logWarning("groupingExpressions: " + groupingExpressions)
-          val groupAttributes = if (groupingExpressions.isEmpty) {
-            AttributeSet.empty
-          }
-          else {
-            groupingExpressions
-              .map(g => g.references)
-              .reduce((g1, g2) => g1 ++ g2)
-          }
-
-          val zeroMAAggregates = aggExpressions
-            .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
-            .filter(agg => is0MA(agg))
-          val percentileAggregates = aggExpressions
-            .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
-            .filter(agg => isPercentile(agg))
-          val countingAggregates = aggExpressions
-            .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
-            .filter(agg => isCounting(agg))
-
-          if (zeroMAAggregates.isEmpty
-            && percentileAggregates.isEmpty
-            && countingAggregates.isEmpty) {
-            logWarning("query is not applicable (0MA, counting, or percentile)")
-            agg
-          }
-          else {
-            logWarning("group attributes: " + groupAttributes)
-            logWarning("counting aggregates: " + countingAggregates)
-
-            val allAggAttributes = aggregateAttributes ++ groupAttributes
-            val hg = new Hypergraph(items, conditions)
-            val jointree = hg.flatGYO
-
-            if (jointree == null) {
-              logWarning("join is cyclic")
-              agg
-            }
-            else {
-              logWarning("join tree: \n" + jointree)
-
-              val nodeContainingAttributes = jointree.findNodeContainingAttributes(allAggAttributes)
-              if (nodeContainingAttributes == null) {
-                logWarning("query is not 0MA")
-                agg
-              }
-              else {
-                val root = nodeContainingAttributes.reroot
-                logWarning("rerooted: \n" + root)
-
-                if (countingAggregates.isEmpty && percentileAggregates.isEmpty) {
-                  val yannakakisJoins = root.buildBottomUpJoins
-
-                  val newAgg = Aggregate(groupingExpressions, aggExpressions,
-                    yannakakisJoins)
-                  logWarning("new aggregate: " + newAgg)
-                  newAgg
-                }
-                else {
-                  if (countingAggregates.nonEmpty) {
-                    val starCountingAggregates = countingAggregates
-                      .filter(agg => agg.references.isEmpty)
-                    logWarning("star counting aggregates: " + starCountingAggregates)
-                    val (yannakakisJoins, countingAttribute, _) =
-                      root.buildBottomUpJoinsCounting(aggregateAttributes,
-                        conf.yannakakisCountGroupInLeavesEnabled)
-
-                    val newCountingAggregates = starCountingAggregates
-                      .map(agg => agg.transformDown {
-                        case AggregateExpression(aggFn, mode, isDistinct, filter, resultId)
-                        => aggFn match {
-                          case Count(s) => AggregateExpression(
-                            Sum(countingAttribute), mode, isDistinct, filter, resultId)
-                        }
-                      }).asInstanceOf[Seq[NamedExpression]]
-                    val newAgg = Aggregate(groupingExpressions, newCountingAggregates,
-                      Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
-                    logWarning("new aggregate: " + newAgg)
-                    newAgg
-                  }
-                  else {
-                    logWarning("percentile aggregates: " + percentileAggregates)
-                    val (yannakakisJoins, countingAttribute, _) =
-                      root.buildBottomUpJoinsCounting(aggregateAttributes,
-                        conf.yannakakisCountGroupInLeavesEnabled)
-
-                    val newPercentileAggregates = percentileAggregates
-                      .map(agg => agg.transformDown {
-                        case AggregateExpression(aggFn, mode, isDistinct, filter, resultId)
-                        => aggFn match {
-                          case Percentile(c, percExp, freqExp, mutableAggBufferOffset,
-                          inputAggBufferOffset, reverse) => AggregateExpression(
-                            Percentile(c, percExp, countingAttribute, mutableAggBufferOffset,
-                              inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
-                        }
-                      }).asInstanceOf[Seq[NamedExpression]]
-                    val newAgg = Aggregate(groupingExpressions, newPercentileAggregates,
-                      Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
-                    logWarning("new aggregate: " + newAgg)
-                    newAgg
-                  }
-                }
-              }
-            }
-          }
+          rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+            join, keyRefs = Seq())
+        case agg@Aggregate(groupingExpressions, aggExpressions,
+        project@Project(projectList,
+        FKHint(join@Join(_, _, Inner, _, _), keyRefs))) =>
+          rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+            join, keyRefs)
+        case agg@Aggregate(_, _, _) =>
+          logWarning("not applicable to aggregate: " + agg)
+          agg
       }
     }
   }
@@ -236,7 +250,9 @@ class HGEdge(val vertices: Set[String], val name: String, val planReference: Log
   val vertexToAttribute: Map[String, Attribute] = planReference.outputSet.map(
       att => (attributeToVertex.getOrElse(att.exprId, null), att))
     .toMap
-
+  def attributes: AttributeSet = {
+    planReference.outputSet
+  }
   def contains(other: HGEdge): Boolean = {
     other.vertices subsetOf vertices
   }
@@ -272,8 +288,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     prevJoin
   }
 
-  def buildBottomUpJoinsCounting(aggregateAttributes: AttributeSet, groupInLeaves: Boolean):
-  (LogicalPlan, NamedExpression, Boolean) = {
+  def buildBottomUpJoinsCounting(aggregateAttributes: AttributeSet, keyRefs: Seq[Seq[Expression]],
+                                 groupInLeaves: Boolean):
+  (LogicalPlan, NamedExpression, Boolean, Boolean) = {
 
     val edge = edges.head
     val scanPlan = edge.planReference
@@ -293,21 +310,23 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         scanPlan.output ++ Seq(prevCountExpr), scanPlan)
     }
     var isLeafNode = true
+    var prevSemijoined = false
 
     for (c <- children) {
       val childEdge = c.edges.head
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
-      val (bottomUpJoins, childCountExpr, rightPlanIsLeaf) =
-        c.buildBottomUpJoinsCounting(aggregateAttributes, groupInLeaves)
+      val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, childWasSemijoined) =
+        c.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, groupInLeaves)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
         Sum(childCountExpr.toAttribute).toAggregateExpression(), "c")()
+
       val countGroupLeft = vertices.map(v => edge.vertexToAttribute(v)).toSeq
       val countGroupRight = overlappingVertices.map(v => childEdge.vertexToAttribute(v)).toSeq
 
-      val (leftPlan, leftCountAttribute) = if (isLeafNode) {
+      val (leftPlan, leftCountAttribute) = if (isLeafNode || prevSemijoined) {
         (prevPlan, prevCountExpr.toAttribute)
       }
       else {
@@ -317,7 +336,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
           countExpressionLeft.toAttribute)
       }
 
-      val (rightPlan, rightCountAttribute) = if (rightPlanIsLeaf) {
+      val (rightPlan, rightCountAttribute) = if (rightPlanIsLeaf || childWasSemijoined) {
         (bottomUpJoins, childCountExpr.toAttribute)
       }
       else {
@@ -335,20 +354,43 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       //        Option(HintInfo(Option(PREFER_SHUFFLE_HASH))))
       // TODO check if forcing hash joins has a positive effect on larger DBs/queries
       val joinHint = JoinHint(Option.empty, Option.empty)
+      // val joinHint = JoinHint(Option(HintInfo(Option(SHUFFLE_MERGE))),
+      //  Option(HintInfo(Option(SHUFFLE_MERGE))))
+      // Each keyref [fk, pk] represents a reference from a foreign key fk to a primary key pk
+      val canSemiJoin: Boolean = overlappingVertices
+        .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
+        // Check if the fk is contained in the parent node attributes
+        .forall(atts => keyRefs.exists(ref => ref.head.references.head.exprId == atts._1.exprId
+          // and if the pk is contained in the child node attributes
+        && ref.last.references.head.exprId == atts._2.exprId))
+
+      if (canSemiJoin) {
+        prevSemijoined = canSemiJoin
+      }
+
+      logWarning("keyRefs: " + keyRefs)
+      logWarning("edge: " + edge)
+      logWarning("overlapping vertices: " + overlappingVertices
+        .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex))))
+      logWarning("can semi join: " + canSemiJoin)
 
       val join = Join(leftPlan, rightPlan,
-        Inner, Option(joinConditions), joinHint)
+        if (canSemiJoin) LeftSemi else Inner, Option(joinConditions), joinHint)
       logWarning("join output: " + join.output)
-      val finalCountExpr = Alias(Multiply(
-        Cast(leftCountAttribute, rightCountAttribute.dataType),
-        rightCountAttribute), "c")()
+      val finalCountExpr = if (canSemiJoin) {
+        leftCountAttribute
+      } else {
+        Alias(Multiply(
+          Cast(leftCountAttribute, rightCountAttribute.dataType),
+          rightCountAttribute), "c")()
+      }
       val multiplication = Project(Seq(finalCountExpr) ++ join.output, join)
 
       prevPlan = multiplication
       prevCountExpr = finalCountExpr
       isLeafNode = false
     }
-    (prevPlan, prevCountExpr.toAttribute, isLeafNode)
+    (prevPlan, prevCountExpr.toAttribute, isLeafNode, prevSemijoined)
   }
   def reroot: HTNode = {
     if (parent == null) {

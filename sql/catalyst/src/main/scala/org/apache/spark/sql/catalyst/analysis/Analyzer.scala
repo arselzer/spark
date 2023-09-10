@@ -273,7 +273,8 @@ class Analyzer(override val catalogManager: CatalogManager) extends RuleExecutor
       new ResolveHints.DisableHints),
     Batch("Hints", fixedPoint,
       ResolveHints.ResolveJoinStrategyHints,
-      ResolveHints.ResolveCoalesceHints),
+      ResolveHints.ResolveCoalesceHints,
+      ResolveHints.ResolveForeignKeyHints),
     Batch("Simple Sanity Check", Once,
       LookupFunctions),
     Batch("Keep Legacy Outputs", Once,
@@ -1714,6 +1715,10 @@ class Analyzer(override val catalogManager: CatalogManager) extends RuleExecutor
         } else {
           Project(child.output, r.copy(finalPartitionExprs, newChild))
         }
+
+      // Resolve the missing attributes in the case of foreign key hints
+      case fk @ FKHint(child, keyRefs) if !fk.resolved || fk.missingInput.nonEmpty =>
+        FKHint(child, keyRefs.map(ref => ref.map(att => resolveExpressionByPlanChildren(att, fk))))
 
       // Filter can host both grouping expressions/aggregate functions and missing attributes.
       // The grouping expressions/aggregate functions resolution takes precedence over missing

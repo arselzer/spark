@@ -289,6 +289,42 @@ object ResolveHints {
     }
   }
 
+  object ResolveForeignKeyHints extends Rule[LogicalPlan] {
+    def addFKHintBeforeJoin(child: LogicalPlan, left: Expression, right: Expression):
+      LogicalPlan = {
+      child match {
+        case h @ FKHint(child, keyRefs) => FKHint(child, keyRefs ++ Seq(Seq(left, right)))
+        // Add the hint before the filter, so that it does not break the pushdown of the join conds
+        case f @ Filter(_, _) => FKHint(f, Seq(Seq(left, right)))
+        case _ => child.mapChildren(c => addFKHintBeforeJoin(c, left, right))
+      }
+    }
+    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsWithPruning(
+      _.containsPattern(UNRESOLVED_HINT), ruleId) {
+      case hint@UnresolvedHint(hintName, parameters, child)
+        => hintName.toUpperCase(Locale.ROOT) match {
+        case "FK" if parameters.size == 2 =>
+          val invalidParams = parameters.filter(!_.isInstanceOf[UnresolvedAttribute])
+
+          if (invalidParams.nonEmpty) {
+            throw QueryCompilationErrors.invalidHintParameterError(hintName, invalidParams)
+          }
+          else {
+            if (!conf.yannakakisEnabled) {
+              // TODO create a new error
+              logWarning("cannot not apply foreign key hint if yannakakis is not enabled")
+              hint
+            }
+            else {
+              addFKHintBeforeJoin(child, parameters.head.asInstanceOf[Expression],
+                parameters.last.asInstanceOf[Expression])
+            }
+          }
+        case _ => hint
+      }
+    }
+  }
+
   /**
    * Removes all the hints, used to remove invalid hints provided by the user.
    * This must be executed after all the other hint rules are executed.

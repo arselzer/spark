@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.catalyst.plans.logical
 
-import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.catalyst.trees.TreePattern.{TreePattern, UNRESOLVED_HINT}
 
 /**
@@ -53,6 +53,17 @@ case class ResolvedHint(child: LogicalPlan, hints: HintInfo = HintInfo())
   override def doCanonicalize(): LogicalPlan = child.canonicalized
 
   override protected def withNewChildInternal(newChild: LogicalPlan): ResolvedHint =
+    copy(child = newChild)
+}
+
+// Use a Seq of expressions so that it can be determined whether all attributes are resolved
+case class FKHint(child: LogicalPlan, keyRefs: Seq[Seq[Expression]])
+  extends UnaryNode {
+  override def output: Seq[Attribute] = child.output
+
+  override def doCanonicalize(): LogicalPlan = child.canonicalized
+
+  override protected def withNewChildInternal(newChild: LogicalPlan): FKHint =
     copy(child = newChild)
 }
 
