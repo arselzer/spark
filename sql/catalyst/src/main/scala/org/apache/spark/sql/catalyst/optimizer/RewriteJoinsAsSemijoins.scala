@@ -295,6 +295,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     val edge = edges.head
     val scanPlan = edge.planReference
     val vertices = edge.vertices
+    val primaryKeys = AttributeSet(keyRefs.map(ref => ref.last.references.head))
 
     var prevCountExpr: NamedExpression = if (groupInLeaves) {
       Alias(Count(Literal(1, IntegerType)).toAggregateExpression(), "c")()
@@ -326,23 +327,38 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val countGroupLeft = vertices.map(v => edge.vertexToAttribute(v)).toSeq
       val countGroupRight = overlappingVertices.map(v => childEdge.vertexToAttribute(v)).toSeq
 
-      val (leftPlan, leftCountAttribute) = if (isLeafNode || prevSemijoined) {
+      // Grouping directly after each leaf node results in bad performance.
+      // Possible solution: make use of primary keys to determine if grouping is necessary
+      val (leftPlan, leftCountAttribute) = if (isLeafNode) {
         (prevPlan, prevCountExpr.toAttribute)
       }
       else {
         val outputAggregateAttributes = prevPlan.outputSet intersect aggregateAttributes
-        (Aggregate(countGroupLeft ++ outputAggregateAttributes,
-          Seq(countExpressionLeft) ++ countGroupLeft ++ outputAggregateAttributes, prevPlan),
-          countExpressionLeft.toAttribute)
+        val groupAttributes = countGroupLeft ++ outputAggregateAttributes
+        // Check if the grouping attributes contain a primary key.
+        // In this case, grouping would not remove any tuples, hence do not aggregate.
+        if (groupAttributes.exists(att => primaryKeys contains att)) {
+          (prevPlan, prevCountExpr.toAttribute)
+        }
+        else {
+          (Aggregate(groupAttributes,
+            Seq(countExpressionLeft) ++ groupAttributes, prevPlan),
+            countExpressionLeft.toAttribute)
+        }
       }
 
-      val (rightPlan, rightCountAttribute) = if (rightPlanIsLeaf || childWasSemijoined) {
+      val (rightPlan, rightCountAttribute) = if (rightPlanIsLeaf) {
         (bottomUpJoins, childCountExpr.toAttribute)
       }
       else {
-        (Aggregate(countGroupRight,
-          Seq(countExpressionRight) ++ countGroupRight, bottomUpJoins),
-          countExpressionRight.toAttribute)
+        if (countGroupRight.exists(att => primaryKeys contains att)) {
+          (bottomUpJoins, childCountExpr.toAttribute)
+        }
+        else {
+          (Aggregate(countGroupRight,
+            Seq(countExpressionRight) ++ countGroupRight, bottomUpJoins),
+            countExpressionRight.toAttribute)
+        }
       }
 
       val joinConditions = overlappingVertices
@@ -352,7 +368,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
       //      val joinHint = JoinHint(Option(HintInfo(Option(PREFER_SHUFFLE_HASH))),
       //        Option(HintInfo(Option(PREFER_SHUFFLE_HASH))))
-      // TODO check if forcing hash joins has a positive effect on larger DBs/queries
       val joinHint = JoinHint(Option.empty, Option.empty)
       // val joinHint = JoinHint(Option(HintInfo(Option(SHUFFLE_MERGE))),
       //  Option(HintInfo(Option(SHUFFLE_MERGE))))
