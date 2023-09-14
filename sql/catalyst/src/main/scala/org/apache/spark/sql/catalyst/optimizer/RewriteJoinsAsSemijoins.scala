@@ -255,6 +255,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     expr match {
       case Alias(child, name) => isPercentile(child)
       case ToPrettyString(child, tz) => isPercentile(child)
+      case Multiply(l, r, _) => isPercentile(l) || isPercentile(r)
+      case Add(l, r, _) => isPercentile(l) || isPercentile(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
         case Percentile(_, _, _, _, _, _) => true
         case _ => false
@@ -267,8 +269,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     expr match {
       case Alias(child, name) => isSum(child)
       case ToPrettyString(child, tz) => isSum(child)
-      case Multiply(l, r, _) => isSum(l) && isSum(r)
-      case Add(l, r, _ ) => isSum(l) && isSum(r)
+      case Multiply(l, r, _) => isSum(l) || isSum(r)
+      case Add(l, r, _ ) => isSum(l) || isSum(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
         case Sum(_, _) => true
         case _ => false
