@@ -44,6 +44,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       logWarning("is 0MA: " + is0MA(agg))
       logWarning("is counting: " + isCounting(agg))
       logWarning("is percentile: " + isPercentile(agg))
+      logWarning("is sum: " + isSum(agg))
+      logWarning("is non-agg: " + isNonAgg(agg))
     }
 
     val aggregateAttributes = aggExpressions.map(expr => expr.references)
@@ -59,6 +61,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         .reduce((g1, g2) => g1 ++ g2)
     }
 
+    // 0MA queries can be evaluated purely by bottom-up semi joins
+    // Currently, they are limited to Min and Max queries
+    // For all aggregates (0MA or counting-based), check if there are no references to attributes
+    // (e.g., COUNT(1)) or the references are not part of the grouping attributes
+    // TODO remove duplicated code. Use enum for representing query types?
     val zeroMAAggregates = aggExpressions
       .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
       .filter(agg => is0MA(agg))
@@ -68,11 +75,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     val countingAggregates = aggExpressions
       .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
       .filter(agg => isCounting(agg))
+    val sumAggregates = aggExpressions
+      .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
+      .filter(agg => isSum(agg))
+    val projectExpressions = aggExpressions
+      .filter(agg => isNonAgg(agg))
 
     if (zeroMAAggregates.isEmpty
       && percentileAggregates.isEmpty
-      && countingAggregates.isEmpty) {
-      logWarning("query is not applicable (0MA, counting, or percentile)")
+      && countingAggregates.isEmpty
+      && sumAggregates.isEmpty) {
+      logWarning("query is not applicable (0MA, counting, percentile, sum)")
       agg
     }
     else {
@@ -89,7 +102,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       }
       else {
         logWarning("join tree: \n" + jointree)
-
+        // First check if there is a single tree node, i.e., relation that contains all attributes
+        // contained in the aggregate functions and the GROUP BY clause
         val nodeContainingAttributes = jointree.findNodeContainingAttributes(allAggAttributes)
         if (nodeContainingAttributes == null) {
           logWarning("query is not 0MA")
@@ -99,7 +113,10 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           val root = nodeContainingAttributes.reroot
           logWarning("rerooted: \n" + root)
 
-          if (countingAggregates.isEmpty && percentileAggregates.isEmpty) {
+          if (countingAggregates.isEmpty
+            && percentileAggregates.isEmpty
+            && sumAggregates.isEmpty) {
+            // If the query is a 0MA query, only perform bottom-up semijoins
             val yannakakisJoins = root.buildBottomUpJoins
 
             val newAgg = Aggregate(groupingExpressions, aggExpressions,
@@ -108,6 +125,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             newAgg
           }
           else {
+            // Otherwise, use the counting plan as a basis
             if (countingAggregates.nonEmpty) {
               val starCountingAggregates = countingAggregates
                 .filter(agg => agg.references.isEmpty)
@@ -124,12 +142,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                       Sum(countingAttribute), mode, isDistinct, filter, resultId)
                   }
                 }).asInstanceOf[Seq[NamedExpression]]
-              val newAgg = Aggregate(groupingExpressions, newCountingAggregates,
+              val newAgg = Aggregate(groupingExpressions,
+                newCountingAggregates ++ projectExpressions,
                 Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
               logWarning("new aggregate: " + newAgg)
               newAgg
             }
-            else {
+            else if (percentileAggregates.nonEmpty) {
               logWarning("percentile aggregates: " + percentileAggregates)
               val (yannakakisJoins, countingAttribute, _, _) =
                 root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs,
@@ -145,8 +164,34 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                         inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
                   }
                 }).asInstanceOf[Seq[NamedExpression]]
-              val newAgg = Aggregate(groupingExpressions, newPercentileAggregates,
+              val newAgg = Aggregate(groupingExpressions,
+                newPercentileAggregates ++ projectExpressions,
                 Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
+              logWarning("new aggregate: " + newAgg)
+              newAgg
+            }
+            else {
+              logWarning("sum aggregates: " + sumAggregates)
+              logWarning("project exprs: " + projectExpressions)
+              val (yannakakisJoins, countingAttribute, _, _) =
+                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs,
+                  conf.yannakakisCountGroupInLeavesEnabled)
+
+              val newSumAggregates = sumAggregates
+                .map(agg => agg.transformDown {
+                  case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) =>
+                    AggregateExpression(aggFn.transformUp {
+                    case s @ Sum(c, evalMode) =>
+                      logWarning("sum: " + s)
+                      Sum(c.transformUp {
+                      case att: Attribute => Multiply(att,
+                        Cast(countingAttribute, att.dataType), evalMode)
+                    }, evalMode)
+                  }.asInstanceOf[AggregateFunction], mode, isDistinct, filter, resultId)
+                }).asInstanceOf[Seq[NamedExpression]]
+              val newAgg = Aggregate(groupingExpressions, newSumAggregates ++ projectExpressions,
+              //  yannakakisJoins)
+              Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
               logWarning("new aggregate: " + newAgg)
               newAgg
             }
@@ -183,8 +228,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     }
   }
   def is0MA(expr: Expression): Boolean = {
-    logWarning("expr: " + expr)
-    logWarning("class: " + expr.getClass)
     expr match {
       case Alias(child, name) => is0MA(child)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
@@ -197,8 +240,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     }
   }
   def isCounting(expr: Expression): Boolean = {
-    logWarning("expr: " + expr)
-    logWarning("class: " + expr.getClass)
     expr match {
       case Alias(child, name) => isCounting(child)
       case ToPrettyString(child, tz) => isCounting(child)
@@ -211,8 +252,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   }
 
   def isPercentile(expr: Expression): Boolean = {
-    logWarning("expr: " + expr)
-    logWarning("class: " + expr.getClass)
     expr match {
       case Alias(child, name) => isPercentile(child)
       case ToPrettyString(child, tz) => isPercentile(child)
@@ -220,6 +259,32 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         case Percentile(_, _, _, _, _, _) => true
         case _ => false
       }
+      case _ => false
+    }
+  }
+
+  def isSum(expr: Expression): Boolean = {
+    expr match {
+      case Alias(child, name) => isSum(child)
+      case ToPrettyString(child, tz) => isSum(child)
+      case Multiply(l, r, _) => isSum(l) && isSum(r)
+      case Add(l, r, _ ) => isSum(l) && isSum(r)
+      case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
+        case Sum(_, _) => true
+        case _ => false
+      }
+      case _ => false
+    }
+  }
+
+  def isNonAgg(expr: Expression): Boolean = {
+    expr match {
+      case Alias(child, name) => isNonAgg(child)
+      case ToPrettyString(child, tz) => isNonAgg(child)
+      case Multiply(l, r, _) => isNonAgg(l) && isNonAgg(r)
+      case Add(l, r, _) => isNonAgg(l) && isNonAgg(r)
+      case _: Attribute => true
+      case _: Literal => true
       case _ => false
     }
   }
@@ -303,7 +368,10 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     else {
       Alias(Literal(1, IntegerType), "c")()
     }
-    var prevPlan: LogicalPlan = if (groupInLeaves) {
+    // Only group counts in leaves if it is explicitly enabled and there are no known
+    // primary keys in the leaf
+    var prevPlan: LogicalPlan = if (groupInLeaves
+      && !scanPlan.output.exists(att => primaryKeys.contains(att))) {
       Aggregate(scanPlan.output, Seq(prevCountExpr) ++ scanPlan.output, scanPlan)
     }
     else {
