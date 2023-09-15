@@ -21,7 +21,7 @@ import java.util.Locale
 
 import scala.collection.mutable
 
-import org.apache.spark.sql.catalyst.expressions.{Ascending, Expression, IntegerLiteral, SortOrder}
+import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.CurrentOrigin
@@ -290,13 +290,20 @@ object ResolveHints {
   }
 
   object ResolveForeignKeyHints extends Rule[LogicalPlan] {
-    def addFKHintBeforeJoin(child: LogicalPlan, left: Expression, right: Expression):
+    def addFKHintBeforeJoin(child: LogicalPlan, left: Option[Expression], right: Option[Expression],
+                            newUniqueConstraint: Seq[Expression]):
       LogicalPlan = {
       child match {
-        case h @ FKHint(child, keyRefs) => FKHint(child, keyRefs ++ Seq(Seq(left, right)))
+        case h @ FKHint(child, keyRefs, uniqueConstraints) =>
+          val newRefs = keyRefs ++
+            (if (left.nonEmpty && right.nonEmpty) Seq(Seq(left.get, right.get)) else Seq())
+          FKHint(child, newRefs, uniqueConstraints ++
+              (if (newUniqueConstraint.isEmpty) Seq() else Seq(newUniqueConstraint)))
         // Add the hint before the filter, so that it does not break the pushdown of the join conds
-        case f @ Filter(_, _) => FKHint(f, Seq(Seq(left, right)))
-        case _ => child.mapChildren(c => addFKHintBeforeJoin(c, left, right))
+        case f @ Filter(_, _) => FKHint(f,
+          if (left.nonEmpty && right.nonEmpty) Seq(Seq(left.get, right.get)) else Seq(),
+          (if (newUniqueConstraint.isEmpty) Seq() else Seq(newUniqueConstraint)))
+        case _ => child.mapChildren(c => addFKHintBeforeJoin(c, left, right, newUniqueConstraint))
       }
     }
     def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsWithPruning(
@@ -316,9 +323,19 @@ object ResolveHints {
               hint
             }
             else {
-              addFKHintBeforeJoin(child, parameters.head.asInstanceOf[Expression],
-                parameters.last.asInstanceOf[Expression])
+              addFKHintBeforeJoin(child, Option(parameters.head.asInstanceOf[Expression]),
+                Option(parameters.last.asInstanceOf[Expression]), Seq())
             }
+          }
+        case "PK" if parameters.nonEmpty =>
+          if (!conf.yannakakisEnabled) {
+            // TODO create a new error
+            logWarning("cannot not apply primary key hint if yannakakis is not enabled")
+            hint
+          }
+          else {
+            addFKHintBeforeJoin(child, Option.empty, Option.empty,
+              parameters.asInstanceOf[Seq[Expression]])
           }
         case _ => hint
       }

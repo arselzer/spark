@@ -31,7 +31,8 @@ import org.apache.spark.sql.types.IntegerType
 object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   def rewritePlan(agg: Aggregate, groupingExpressions: Seq[Expression],
                   aggExpressions: Seq[NamedExpression], projectList: Seq[NamedExpression],
-                  join: Join, keyRefs: Seq[Seq[Expression]]) : LogicalPlan = {
+                  join: Join, keyRefs: Seq[Seq[Expression]],
+                  uniqueConstraints: Seq[Seq[Expression]]) : LogicalPlan = {
     logWarning("applying yannakakis rewriting to join: " + agg)
     // TODO allow different joins
     // logWarning("join type: " + joinType)
@@ -131,7 +132,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                 .filter(agg => agg.references.isEmpty)
               logWarning("star counting aggregates: " + starCountingAggregates)
               val (yannakakisJoins, countingAttribute, _, _) =
-                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs,
+                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
                   conf.yannakakisCountGroupInLeavesEnabled)
 
               val newCountingAggregates = starCountingAggregates
@@ -151,7 +152,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             else if (percentileAggregates.nonEmpty) {
               logWarning("percentile aggregates: " + percentileAggregates)
               val (yannakakisJoins, countingAttribute, _, _) =
-                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs,
+                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
                   conf.yannakakisCountGroupInLeavesEnabled)
 
               val newPercentileAggregates = percentileAggregates
@@ -174,7 +175,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               logWarning("sum aggregates: " + sumAggregates)
               logWarning("project exprs: " + projectExpressions)
               val (yannakakisJoins, countingAttribute, _, _) =
-                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs,
+                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
                   conf.yannakakisCountGroupInLeavesEnabled)
 
               val newSumAggregates = sumAggregates
@@ -215,12 +216,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         project@Project(projectList,
         join@Join(_, _, Inner, _, _))) =>
           rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-            join, keyRefs = Seq())
+            join, keyRefs = Seq(), uniqueConstraints = Seq())
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
-        FKHint(join@Join(_, _, Inner, _, _), keyRefs))) =>
+        FKHint(join@Join(_, _, Inner, _, _), keyRefs, uniqueConstraints))) =>
           rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-            join, keyRefs)
+            join, keyRefs, uniqueConstraints)
         case agg@Aggregate(_, _, _) =>
           logWarning("not applicable to aggregate: " + agg)
           agg
@@ -257,6 +258,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case ToPrettyString(child, tz) => isPercentile(child)
       case Multiply(l, r, _) => isPercentile(l) || isPercentile(r)
       case Add(l, r, _) => isPercentile(l) || isPercentile(r)
+      case Subtract(l, r, _) => isPercentile(l) || isPercentile(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
         case Percentile(_, _, _, _, _, _) => true
         case _ => false
@@ -271,6 +273,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case ToPrettyString(child, tz) => isSum(child)
       case Multiply(l, r, _) => isSum(l) || isSum(r)
       case Add(l, r, _ ) => isSum(l) || isSum(r)
+      case Subtract(l, r, _) => isSum(l) || isSum(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
         case Sum(_, _) => true
         case _ => false
@@ -285,6 +288,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case ToPrettyString(child, tz) => isNonAgg(child)
       case Multiply(l, r, _) => isNonAgg(l) && isNonAgg(r)
       case Add(l, r, _) => isNonAgg(l) && isNonAgg(r)
+      case Subtract(l, r, _) => isNonAgg(l) && isNonAgg(r)
       case _: Attribute => true
       case _: Literal => true
       case _ => false
@@ -356,13 +360,14 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
   }
 
   def buildBottomUpJoinsCounting(aggregateAttributes: AttributeSet, keyRefs: Seq[Seq[Expression]],
-                                 groupInLeaves: Boolean):
+                                 uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean):
   (LogicalPlan, NamedExpression, Boolean, Boolean) = {
 
     val edge = edges.head
     val scanPlan = edge.planReference
     val vertices = edge.vertices
     val primaryKeys = AttributeSet(keyRefs.map(ref => ref.last.references.head))
+    val uniqueSets = uniqueConstraints.map(constraint => AttributeSet(constraint))
 
     var prevCountExpr: NamedExpression = if (groupInLeaves) {
       Alias(Count(Literal(1, IntegerType)).toAggregateExpression(), "c")()
@@ -373,7 +378,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     // Only group counts in leaves if it is explicitly enabled and there are no known
     // primary keys in the leaf
     var prevPlan: LogicalPlan = if (groupInLeaves
-      && !scanPlan.output.exists(att => primaryKeys.contains(att))) {
+      && !scanPlan.output.exists(att => primaryKeys.contains(att))
+      && !uniqueSets.exists(uniqueSet => uniqueSet subsetOf scanPlan.outputSet)) {
       Aggregate(scanPlan.output, Seq(prevCountExpr) ++ scanPlan.output, scanPlan)
     }
     else {
@@ -388,7 +394,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
       val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, childWasSemijoined) =
-        c.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, groupInLeaves)
+        c.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints, groupInLeaves)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
@@ -407,7 +413,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         val groupAttributes = countGroupLeft ++ outputAggregateAttributes
         // Check if the grouping attributes contain a primary key.
         // In this case, grouping would not remove any tuples, hence do not aggregate.
-        if (groupAttributes.exists(att => primaryKeys contains att)) {
+        if (groupAttributes.exists(att => primaryKeys contains att)
+        || uniqueSets.exists(uniqueSet => uniqueSet subsetOf AttributeSet(groupAttributes))) {
           (prevPlan, prevCountExpr.toAttribute)
         }
         else {
@@ -421,7 +428,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         (bottomUpJoins, childCountExpr.toAttribute)
       }
       else {
-        if (countGroupRight.exists(att => primaryKeys contains att)) {
+        if (countGroupRight.exists(att => primaryKeys contains att)
+        || uniqueSets.exists(uniqueSet => uniqueSet subsetOf AttributeSet(countGroupRight))) {
           (bottomUpJoins, childCountExpr.toAttribute)
         }
         else {

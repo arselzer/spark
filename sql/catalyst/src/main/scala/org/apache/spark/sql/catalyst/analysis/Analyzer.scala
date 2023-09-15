@@ -1717,8 +1717,11 @@ class Analyzer(override val catalogManager: CatalogManager) extends RuleExecutor
         }
 
       // Resolve the missing attributes in the case of foreign key hints
-      case fk @ FKHint(child, keyRefs) if !fk.resolved || fk.missingInput.nonEmpty =>
-        FKHint(child, keyRefs.map(ref => ref.map(att => resolveExpressionByPlanChildren(att, fk))))
+      case fk @ FKHint(child, keyRefs, uniqueConstraints)
+        if !fk.resolved || fk.missingInput.nonEmpty => FKHint(child, keyRefs.map(ref =>
+        ref.map(att => resolveExpressionByPlanChildren(att, fk))),
+          uniqueConstraints.map(constraint =>
+            constraint.map(att => resolveExpressionByPlanChildren(att, fk))))
 
       // Filter can host both grouping expressions/aggregate functions and missing attributes.
       // The grouping expressions/aggregate functions resolution takes precedence over missing

@@ -57,7 +57,8 @@ case class ResolvedHint(child: LogicalPlan, hints: HintInfo = HintInfo())
 }
 
 // Use a Seq of expressions so that it can be determined whether all attributes are resolved
-case class FKHint(child: LogicalPlan, keyRefs: Seq[Seq[Expression]])
+case class FKHint(child: LogicalPlan, keyRefs: Seq[Seq[Expression]],
+                  uniqueConstraints: Seq[Seq[Expression]])
   extends UnaryNode {
   override def output: Seq[Attribute] = child.output
 
