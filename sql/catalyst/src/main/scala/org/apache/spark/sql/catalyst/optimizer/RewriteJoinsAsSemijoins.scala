@@ -46,6 +46,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       logWarning("is counting: " + isCounting(agg))
       logWarning("is percentile: " + isPercentile(agg))
       logWarning("is sum: " + isSum(agg))
+      logWarning("is avg: " + isAverage(agg))
       logWarning("is non-agg: " + isNonAgg(agg))
     }
 
@@ -79,13 +80,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     val sumAggregates = aggExpressions
       .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
       .filter(agg => isSum(agg))
+    val averageAggregates = aggExpressions
+      .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
+      .filter(agg => isAverage(agg))
     val projectExpressions = aggExpressions
       .filter(agg => isNonAgg(agg))
 
     if (zeroMAAggregates.isEmpty
       && percentileAggregates.isEmpty
       && countingAggregates.isEmpty
-      && sumAggregates.isEmpty) {
+      && sumAggregates.isEmpty
+      && averageAggregates.isEmpty) {
       logWarning("query is not applicable (0MA, counting, percentile, sum)")
       agg
     }
@@ -116,7 +121,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
 
           if (countingAggregates.isEmpty
             && percentileAggregates.isEmpty
-            && sumAggregates.isEmpty) {
+            && sumAggregates.isEmpty
+            && averageAggregates.isEmpty) {
             // If the query is a 0MA query, only perform bottom-up semijoins
             val yannakakisJoins = root.buildBottomUpJoins
 
@@ -151,7 +157,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             }
             else if (percentileAggregates.nonEmpty) {
               logWarning("percentile aggregates: " + percentileAggregates)
-              val (yannakakisJoins, countingAttribute, _, _) =
+              val (yannakakisJoins, countingAttribute, _, lastJoinWasSemijoin) =
                 root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
                   conf.yannakakisCountGroupInLeavesEnabled)
 
@@ -160,13 +166,43 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                   case AggregateExpression(aggFn, mode, isDistinct, filter, resultId)
                   => aggFn match {
                     case Percentile(c, percExp, freqExp, mutableAggBufferOffset,
-                    inputAggBufferOffset, reverse) => AggregateExpression(
-                      Percentile(c, percExp, countingAttribute, mutableAggBufferOffset,
+                    inputAggBufferOffset, reverse) =>
+                      val freqExpr = if (lastJoinWasSemijoin) Literal(1) else countingAttribute
+                      AggregateExpression(
+                      Percentile(c, percExp, freqExpr, mutableAggBufferOffset,
                         inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
                   }
                 }).asInstanceOf[Seq[NamedExpression]]
               val newAgg = Aggregate(groupingExpressions,
                 newPercentileAggregates ++ projectExpressions,
+                Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
+              logWarning("new aggregate: " + newAgg)
+              newAgg
+            }
+            else if (averageAggregates.nonEmpty) {
+              logWarning("average aggregates: " + averageAggregates)
+              logWarning("project exprs: " + projectExpressions)
+              val (yannakakisJoins, countingAttribute, _, _) =
+                root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
+                  conf.yannakakisCountGroupInLeavesEnabled)
+
+              val newAverageAggregates = averageAggregates
+                .map(agg => agg.transformUp {
+                  case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) =>
+                    val avgAggregateExpr = AggregateExpression(aggFn.transformUp {
+                      case a@Average(c, evalMode) =>
+                        logWarning("avg: " + a)
+                        Sum(c.transformUp {
+                          case att: Attribute => Multiply(att,
+                            Cast(countingAttribute, att.dataType), evalMode)
+                        }, evalMode)
+                    }.asInstanceOf[AggregateFunction], mode, isDistinct, filter, resultId)
+                    val sumAggregateExpr = Sum(countingAttribute).toAggregateExpression()
+                  Divide(avgAggregateExpr,
+                    Cast(sumAggregateExpr, avgAggregateExpr.dataType))
+                }).asInstanceOf[Seq[NamedExpression]]
+              val newAgg = Aggregate(groupingExpressions, newAverageAggregates ++
+                projectExpressions,
                 Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
               logWarning("new aggregate: " + newAgg)
               newAgg
@@ -257,6 +293,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case Alias(child, name) => isPercentile(child)
       case ToPrettyString(child, tz) => isPercentile(child)
       case Multiply(l, r, _) => isPercentile(l) || isPercentile(r)
+      case Divide(l, r, _) => isPercentile(l) || isPercentile(r)
       case Add(l, r, _) => isPercentile(l) || isPercentile(r)
       case Subtract(l, r, _) => isPercentile(l) || isPercentile(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
@@ -272,10 +309,27 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case Alias(child, name) => isSum(child)
       case ToPrettyString(child, tz) => isSum(child)
       case Multiply(l, r, _) => isSum(l) || isSum(r)
+      case Divide(l, r, _) => isSum(l) || isSum(r)
       case Add(l, r, _ ) => isSum(l) || isSum(r)
       case Subtract(l, r, _) => isSum(l) || isSum(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
         case Sum(_, _) => true
+        case _ => false
+      }
+      case _ => false
+    }
+  }
+
+  def isAverage(expr: Expression): Boolean = {
+    expr match {
+      case Alias(child, name) => isAverage(child)
+      case ToPrettyString(child, tz) => isAverage(child)
+      case Multiply(l, r, _) => isAverage(l) || isAverage(r)
+      case Divide(l, r, _) => isAverage(l) || isAverage(r)
+      case Add(l, r, _) => isAverage(l) || isAverage(r)
+      case Subtract(l, r, _) => isAverage(l) || isAverage(r)
+      case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
+        case Average(_, _) => true
         case _ => false
       }
       case _ => false
@@ -287,6 +341,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case Alias(child, name) => isNonAgg(child)
       case ToPrettyString(child, tz) => isNonAgg(child)
       case Multiply(l, r, _) => isNonAgg(l) && isNonAgg(r)
+      case Divide(l, r, _) => isNonAgg(l) && isNonAgg(r)
       case Add(l, r, _) => isNonAgg(l) && isNonAgg(r)
       case Subtract(l, r, _) => isNonAgg(l) && isNonAgg(r)
       case _: Attribute => true
@@ -477,7 +532,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
           Cast(leftCountAttribute, rightCountAttribute.dataType),
           rightCountAttribute), "c")()
       }
-      val multiplication = Project(Seq(finalCountExpr) ++ join.output, join)
+      val multiplication = Project(
+        (if (canSemiJoin) Seq() else Seq(finalCountExpr)) ++ join.output, join)
 
       prevPlan = multiplication
       prevCountExpr = finalCountExpr
