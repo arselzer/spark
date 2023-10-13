@@ -20,13 +20,15 @@ package org.apache.spark.sql.catalyst.optimizer
 import scala.collection.mutable
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.dsl.expressions.DslExpression
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern
-import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.types.DecimalType.DoubleDecimal
 
 object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   def rewritePlan(agg: Aggregate, groupingExpressions: Seq[Expression],
@@ -136,6 +138,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             if (countingAggregates.nonEmpty) {
               val starCountingAggregates = countingAggregates
                 .filter(agg => agg.references.isEmpty)
+              val nonnullCountingAggregates = countingAggregates
+                .filter(agg => agg.references.nonEmpty)
               logWarning("star counting aggregates: " + starCountingAggregates)
               val (yannakakisJoins, countingAttribute, _, _) =
                 root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
@@ -167,7 +171,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                   => aggFn match {
                     case Percentile(c, percExp, freqExp, mutableAggBufferOffset,
                     inputAggBufferOffset, reverse) =>
-                      val freqExpr = if (lastJoinWasSemijoin) Literal(1) else countingAttribute
+                      val freqExpr = if (lastJoinWasSemijoin) Literal(1L, LongType)
+                        else countingAttribute
                       AggregateExpression(
                       Percentile(c, percExp, freqExpr, mutableAggBufferOffset,
                         inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
@@ -188,8 +193,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
 
               val newAverageAggregates = averageAggregates
                 .map(agg => agg.transformUp {
-                  case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) =>
-                    val avgAggregateExpr = AggregateExpression(aggFn.transformUp {
+                  case aggExpr @ AggregateExpression(aggFn, mode, isDistinct, filter, resultId) =>
+                    val aggAttribute = aggFn.references.head
+                    val sumAggregateExpr = AggregateExpression(aggFn.transformUp {
                       case a@Average(c, evalMode) =>
                         logWarning("avg: " + a)
                         Sum(c.transformUp {
@@ -197,10 +203,37 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                             Cast(countingAttribute, att.dataType), evalMode)
                         }, evalMode)
                     }.asInstanceOf[AggregateFunction], mode, isDistinct, filter, resultId)
-                    val sumAggregateExpr = Sum(countingAttribute).toAggregateExpression()
-                  Divide(avgAggregateExpr,
-                    Cast(sumAggregateExpr, avgAggregateExpr.dataType))
+                    val countAggregateExpr = Sum(
+                      If(aggAttribute.isNull,
+                        Literal(0L, LongType), countingAttribute))
+                      .toAggregateExpression()
+                    logWarning("sum resolved: " + sumAggregateExpr.resolved)
+                    logWarning("count resolved: " + countAggregateExpr.resolved)
+                    logWarning("sum children resolved: " + sumAggregateExpr.childrenResolved)
+                    logWarning("count children resolved: " + countAggregateExpr.childrenResolved)
+                  Cast(
+                    // Check if both aggregate results are of type Double - can do integer division
+                    if (DoubleType.acceptsType(sumAggregateExpr.dataType) &&
+                      DoubleType.acceptsType(countAggregateExpr.dataType)) {
+                      Divide(sumAggregateExpr, countAggregateExpr)
+                    } else {
+                      // TODO check if there is a better way than casting to DoubleDecimal?
+                      Divide(Cast(sumAggregateExpr, DoubleDecimal),
+                        Cast(countAggregateExpr, DoubleDecimal))
+                    }, aggExpr.dataType)
                 }).asInstanceOf[Seq[NamedExpression]]
+              newAverageAggregates.foreach(agg => {
+                logWarning("new agg: " + agg)
+                logWarning("new agg resolevd: " + agg.resolved)
+                logWarning("data type: " + agg.dataType)
+                agg.foreachUp(a => {
+                  logWarning("2 new agg: " + a)
+                  logWarning("2 new agg resolevd: " + a.resolved)
+                  logWarning("2 new agg type check: " + a.checkInputDataTypes())
+                  logWarning("2data type: " + a.dataType)
+                })
+              }
+              )
               val newAgg = Aggregate(groupingExpressions, newAverageAggregates ++
                 projectExpressions,
                 Project(projectList ++ Seq(countingAttribute), yannakakisJoins))
@@ -425,10 +458,10 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     val uniqueSets = uniqueConstraints.map(constraint => AttributeSet(constraint))
 
     var prevCountExpr: NamedExpression = if (groupInLeaves) {
-      Alias(Count(Literal(1, IntegerType)).toAggregateExpression(), "c")()
+      Alias(Count(Literal(1L, LongType)).toAggregateExpression(), "c")()
     }
     else {
-      Alias(Literal(1, IntegerType), "c")()
+      Alias(Literal(1L, LongType), "c")()
     }
     // Only group counts in leaves if it is explicitly enabled and there are no known
     // primary keys in the leaf
