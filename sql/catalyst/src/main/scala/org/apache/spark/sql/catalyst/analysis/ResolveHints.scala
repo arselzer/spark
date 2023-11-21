@@ -314,13 +314,14 @@ object ResolveHints {
           val invalidParams = parameters.filter(!_.isInstanceOf[UnresolvedAttribute])
 
           if (invalidParams.nonEmpty) {
-            throw QueryCompilationErrors.invalidHintParameterError(hintName, invalidParams)
+            logWarning("FK hint has no effect. Removing the hint.")
+            hint.child
+            // throw QueryCompilationErrors.invalidHintParameterError(hintName, invalidParams)
           }
           else {
             if (!conf.yannakakisEnabled) {
-              // TODO create a new error
               logWarning("cannot not apply foreign key hint if yannakakis is not enabled")
-              hint
+              hint.child
             }
             else {
               addFKHintBeforeJoin(child, Option(parameters.head.asInstanceOf[Expression]),
@@ -331,7 +332,7 @@ object ResolveHints {
           if (!conf.yannakakisEnabled) {
             // TODO create a new error
             logWarning("cannot not apply primary key hint if yannakakis is not enabled")
-            hint
+            hint.child
           }
           else {
             addFKHintBeforeJoin(child, Option.empty, Option.empty,

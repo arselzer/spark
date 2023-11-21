@@ -171,8 +171,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                   => aggFn match {
                     case Percentile(c, percExp, freqExp, mutableAggBufferOffset,
                     inputAggBufferOffset, reverse) =>
-                      val freqExpr = if (lastJoinWasSemijoin) Literal(1L, LongType)
-                        else countingAttribute
+                      val freqExpr = countingAttribute
                       AggregateExpression(
                       Percentile(c, percExp, freqExpr, mutableAggBufferOffset,
                         inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
@@ -291,6 +290,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         FKHint(join@Join(_, _, Inner, _, _), keyRefs, uniqueConstraints))) =>
           rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
             join, keyRefs, uniqueConstraints)
+        case agg@Aggregate(groupingExpressions, aggExpressions,
+        project@Project(projectList,
+        FKHint(
+        project2@Project(projectList2,
+        join@Join(_, _, Inner, _, _)), keyRefs, uniqueConstraints))) =>
+          rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+            join, keyRefs, uniqueConstraints)
         case agg@Aggregate(_, _, _) =>
           logWarning("not applicable to aggregate: " + agg)
           agg
@@ -300,6 +306,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   def is0MA(expr: Expression): Boolean = {
     expr match {
       case Alias(child, name) => is0MA(child)
+      case ToPrettyString(child, tz) => is0MA(child)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
         case Min(c) => true
         case Max(c) => true
@@ -463,6 +470,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     else {
       Alias(Literal(1L, LongType), "c")()
     }
+    // Get the attributes as part of the join tree
+    val nodeAttributes = AttributeSet(vertices.map(v => edge.vertexToAttribute(v)))
     // Only group counts in leaves if it is explicitly enabled and there are no known
     // primary keys in the leaf
     var prevPlan: LogicalPlan = if (groupInLeaves
@@ -471,14 +480,20 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       Aggregate(scanPlan.output, Seq(prevCountExpr) ++ scanPlan.output, scanPlan)
     }
     else {
+      // Make sure to project the output only to the attributes as part of the join tree
+      // This can occur when we have a FKHint before the join nodes which leads to
+      // Spark SQL not projecting away the attributes mentioned in the hints
       Project(
-        scanPlan.output ++ Seq(prevCountExpr), scanPlan)
+        scanPlan.output.filter(att => nodeAttributes contains att) ++ Seq(prevCountExpr), scanPlan)
     }
     var isLeafNode = true
     var prevSemijoined = false
 
+    var prevChildEdge: HGEdge = edge
     for (c <- children) {
+      logWarning("child: " + c)
       val childEdge = c.edges.head
+      logWarning("child edge: " + childEdge)
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
       val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, childWasSemijoined) =
@@ -493,16 +508,29 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
       // Grouping directly after each leaf node results in bad performance.
       // Possible solution: make use of primary keys to determine if grouping is necessary
+      // Construct the left subplan
       val (leftPlan, leftCountAttribute) = if (isLeafNode) {
         (prevPlan, prevCountExpr.toAttribute)
       }
       else {
         val outputAggregateAttributes = prevPlan.outputSet intersect aggregateAttributes
         val groupAttributes = countGroupLeft ++ outputAggregateAttributes
+        val prevChildAttributes = AttributeSet(
+          prevChildEdge.vertices.map(v => prevChildEdge.vertexToAttribute(v)))
         // Check if the grouping attributes contain a primary key.
         // In this case, grouping would not remove any tuples, hence do not aggregate.
-        if (groupAttributes.exists(att => primaryKeys contains att)
-        || uniqueSets.exists(uniqueSet => uniqueSet subsetOf AttributeSet(groupAttributes))) {
+        logWarning("left")
+        logWarning("child edges: " + c.edges)
+        logWarning("node attributes: " + nodeAttributes)
+        logWarning("aggregate attributes: " + aggregateAttributes)
+        logWarning("group attributes: " + groupAttributes)
+        logWarning("primary keys: " + primaryKeys)
+        logWarning("prev child edge: " + prevChildEdge)
+        logWarning("prev child attributes: " + prevChildAttributes)
+        logWarning("prev semi joined: " + prevSemijoined)
+
+        if ((prevSemijoined && primaryKeys.exists(att => nodeAttributes contains att))
+        || uniqueSets.exists(uniqueSet => AttributeSet(groupAttributes) subsetOf uniqueSet )) {
           (prevPlan, prevCountExpr.toAttribute)
         }
         else {
@@ -512,15 +540,22 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         }
       }
 
+      // Construct the right subplan
       val (rightPlan, rightCountAttribute) = if (rightPlanIsLeaf) {
         (bottomUpJoins, childCountExpr.toAttribute)
       }
       else {
-        if (countGroupRight.exists(att => primaryKeys contains att)
-        || uniqueSets.exists(uniqueSet => uniqueSet subsetOf AttributeSet(countGroupRight))) {
+        if (countGroupRight.forall(att => primaryKeys contains att)
+        || uniqueSets.exists(uniqueSet => AttributeSet(countGroupRight) subsetOf uniqueSet )) {
           (bottomUpJoins, childCountExpr.toAttribute)
         }
         else {
+          logWarning("right")
+          logWarning("child edges: " + c.edges)
+          logWarning("node attributes: " + nodeAttributes)
+          logWarning("aggregate attributes: " + aggregateAttributes)
+          logWarning("group attributes: " + countGroupRight)
+          logWarning("primary keys: " + primaryKeys)
           (Aggregate(countGroupRight,
             Seq(countExpressionRight) ++ countGroupRight, bottomUpJoins),
             countExpressionRight.toAttribute)
@@ -532,11 +567,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
         .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
 
-      //      val joinHint = JoinHint(Option(HintInfo(Option(PREFER_SHUFFLE_HASH))),
-      //        Option(HintInfo(Option(PREFER_SHUFFLE_HASH))))
+      // Currently unused (can be used to e.g., force hash/merge joins)
       val joinHint = JoinHint(Option.empty, Option.empty)
-      // val joinHint = JoinHint(Option(HintInfo(Option(SHUFFLE_MERGE))),
-      //  Option(HintInfo(Option(SHUFFLE_MERGE))))
+
       // Each keyref [fk, pk] represents a reference from a foreign key fk to a primary key pk
       val canSemiJoin: Boolean = overlappingVertices
         .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
@@ -544,10 +577,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         .forall(atts => keyRefs.exists(ref => ref.head.references.head.exprId == atts._1.exprId
           // and if the pk is contained in the child node attributes
         && ref.last.references.head.exprId == atts._2.exprId))
-
-      if (canSemiJoin) {
-        prevSemijoined = canSemiJoin
-      }
 
       logWarning("keyRefs: " + keyRefs)
       logWarning("edge: " + edge)
@@ -566,11 +595,15 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
           rightCountAttribute), "c")()
       }
       val multiplication = Project(
-        (if (canSemiJoin) Seq() else Seq(finalCountExpr)) ++ join.output, join)
+        Seq(finalCountExpr)
+          ++ join.output.filter(
+            att => (nodeAttributes contains att) || (aggregateAttributes contains att)), join)
 
       prevPlan = multiplication
       prevCountExpr = finalCountExpr
       isLeafNode = false
+      prevChildEdge = childEdge
+      prevSemijoined = canSemiJoin
     }
     (prevPlan, prevCountExpr.toAttribute, isLeafNode, prevSemijoined)
   }
