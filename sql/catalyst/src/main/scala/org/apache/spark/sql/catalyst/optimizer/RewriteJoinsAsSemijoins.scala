@@ -463,28 +463,46 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     val vertices = edge.vertices
     val primaryKeys = AttributeSet(keyRefs.map(ref => ref.last.references.head))
     val uniqueSets = uniqueConstraints.map(constraint => AttributeSet(constraint))
+    logWarning("unique sets: " + uniqueSets)
+    logWarning("output set: " + scanPlan.outputSet)
+    logWarning("subset: " + uniqueSets.exists(uniqueSet => uniqueSet subsetOf scanPlan.outputSet))
 
-    var prevCountExpr: NamedExpression = if (groupInLeaves) {
+    // Get the attributes as part of the join tree
+    val nodeAttributes = AttributeSet(vertices.map(v => edge.vertexToAttribute(v)))
+
+    // Check if grouping in leaves is enabled, and no primary keys are part of the leaf
+    // Also avoid grouping when the leaves contain output atts, since they are most likely
+    // randomly distributed and would lead to a high selectivity
+    val groupHere = groupInLeaves &&
+      ! nodeAttributes.exists(att => primaryKeys contains att) &&
+      ! scanPlan.output.exists(att => aggregateAttributes contains att) &&
+      ! uniqueSets.exists(uniqueSet => uniqueSet subsetOf scanPlan.outputSet)
+    logWarning("group here: " + groupHere)
+
+    var prevCountExpr: NamedExpression = if (groupHere) {
       Alias(Count(Literal(1L, LongType)).toAggregateExpression(), "c")()
     }
     else {
       Alias(Literal(1L, LongType), "c")()
     }
-    // Get the attributes as part of the join tree
-    val nodeAttributes = AttributeSet(vertices.map(v => edge.vertexToAttribute(v)))
+
+    logWarning("edge: " + edge)
+    logWarning("node attributes: " + nodeAttributes)
+    logWarning("filtered: " + scanPlan.output.filter(att => nodeAttributes contains att))
     // Only group counts in leaves if it is explicitly enabled and there are no known
     // primary keys in the leaf
-    var prevPlan: LogicalPlan = if (groupInLeaves
-      && !scanPlan.output.exists(att => primaryKeys.contains(att))
-      && !uniqueSets.exists(uniqueSet => uniqueSet subsetOf scanPlan.outputSet)) {
-      Aggregate(scanPlan.output, Seq(prevCountExpr) ++ scanPlan.output, scanPlan)
+    val outputAttributes = scanPlan.output.filter(att => (nodeAttributes contains att)
+      || (aggregateAttributes contains att))
+    var prevPlan: LogicalPlan = if (groupHere) {
+      Aggregate(outputAttributes, Seq(prevCountExpr) ++
+        outputAttributes, scanPlan)
     }
     else {
       // Make sure to project the output only to the attributes as part of the join tree
       // This can occur when we have a FKHint before the join nodes which leads to
       // Spark SQL not projecting away the attributes mentioned in the hints
       Project(
-        scanPlan.output.filter(att => nodeAttributes contains att) ++ Seq(prevCountExpr), scanPlan)
+        outputAttributes ++ Seq(prevCountExpr), scanPlan)
     }
     var isLeafNode = true
     var prevSemijoined = false
