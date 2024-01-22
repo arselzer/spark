@@ -397,6 +397,31 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
             .orElse { if (hintToShuffleReplicateNL(hint)) createCartesianProduct() else None }
             .getOrElse(createJoinWithoutHint())
         }
+      case j @ logical.CountJoin(left, right, joinType, condition, countLeft, countRight, hint) =>
+        j match {
+          case ExtractAggJoinEquiJoinKeys(joinType, leftKeys, rightKeys, nonEquiCond,
+          _, left, right, countLeft, countRight, hint) =>
+            def createShuffleHashJoin(onlyLookingAtHint: Boolean) = {
+              val buildSide = getShuffleHashJoinBuildSide(
+                left, right, joinType, hint, onlyLookingAtHint, conf)
+              checkHintBuildSide(onlyLookingAtHint, buildSide, joinType, hint, false)
+              buildSide.map {
+                buildSide =>
+                  Seq(joins.ShuffledHashCountJoinExec(
+                    leftKeys,
+                    rightKeys,
+                    joinType,
+                    buildSide,
+                    nonEquiCond,
+                    planLater(left),
+                    planLater(right),
+                    countLeft,
+                    countRight))
+              }
+            }
+
+            createShuffleHashJoin(true).get
+        }
 
       // --- Cases where this strategy does not apply ---------------------------------------------
       case _ => Nil

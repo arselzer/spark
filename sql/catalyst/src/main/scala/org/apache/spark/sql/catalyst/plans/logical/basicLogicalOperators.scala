@@ -659,6 +659,141 @@ case class Join(
     newLeft: LogicalPlan, newRight: LogicalPlan): Join = copy(left = newLeft, right = newRight)
 }
 
+case class CountJoin(
+                 left: LogicalPlan,
+                 right: LogicalPlan,
+                 joinType: JoinType,
+                 condition: Option[Expression],
+                 countLeft: Option[Expression],
+                 countRight: Option[Expression],
+                 hint: JoinHint)
+  extends BinaryNode with PredicateHelper {
+
+  override def maxRows: Option[Long] = {
+    joinType match {
+      case Inner | Cross | FullOuter | LeftOuter | RightOuter
+        if left.maxRows.isDefined && right.maxRows.isDefined =>
+        val leftMaxRows = BigInt(left.maxRows.get)
+        val rightMaxRows = BigInt(right.maxRows.get)
+        val minRows = joinType match {
+          case LeftOuter => leftMaxRows
+          case RightOuter => rightMaxRows
+          case FullOuter => leftMaxRows + rightMaxRows
+          case _ => BigInt(0)
+        }
+        val maxRows = (leftMaxRows * rightMaxRows).max(minRows)
+        if (maxRows.isValidLong) {
+          Some(maxRows.toLong)
+        } else {
+          None
+        }
+
+      case LeftSemi | LeftAnti =>
+        left.maxRows
+
+      case _ =>
+        None
+    }
+  }
+
+  override def output: Seq[Attribute] = {
+    joinType match {
+      case j: ExistenceJoin =>
+        left.output :+ j.exists
+      case LeftExistence(_) =>
+        left.output
+      case LeftOuter =>
+        left.output ++ right.output.map(_.withNullability(true))
+      case RightOuter =>
+        left.output.map(_.withNullability(true)) ++ right.output
+      case FullOuter =>
+        left.output.map(_.withNullability(true)) ++ right.output.map(_.withNullability(true))
+      case _ =>
+        left.output ++ right.output
+    }
+  }
+
+  override def metadataOutput: Seq[Attribute] = {
+    joinType match {
+      case ExistenceJoin(_) =>
+        left.metadataOutput
+      case LeftExistence(_) =>
+        left.metadataOutput
+      case _ =>
+        children.flatMap(_.metadataOutput)
+    }
+  }
+
+  override protected lazy val validConstraints: ExpressionSet = {
+    joinType match {
+      case _: InnerLike if condition.isDefined =>
+        left.constraints
+          .union(right.constraints)
+          .union(ExpressionSet(splitConjunctivePredicates(condition.get)))
+      case LeftSemi if condition.isDefined =>
+        left.constraints
+          .union(ExpressionSet(splitConjunctivePredicates(condition.get)))
+      case j: ExistenceJoin =>
+        left.constraints
+      case _: InnerLike =>
+        left.constraints.union(right.constraints)
+      case LeftExistence(_) =>
+        left.constraints
+      case LeftOuter =>
+        left.constraints
+      case RightOuter =>
+        right.constraints
+      case _ =>
+        ExpressionSet()
+    }
+  }
+
+  def duplicateResolved: Boolean = left.outputSet.intersect(right.outputSet).isEmpty
+
+  // Joins are only resolved if they don't introduce ambiguous expression ids.
+  // NaturalJoin should be ready for resolution only if everything else is resolved here
+  lazy val resolvedExceptNatural: Boolean = {
+    childrenResolved &&
+      expressions.forall(_.resolved) &&
+      duplicateResolved &&
+      condition.forall(_.dataType == BooleanType)
+  }
+
+  // if not a natural join, use `resolvedExceptNatural`. if it is a natural join or
+  // using join, we still need to eliminate natural or using before we mark it resolved.
+  override lazy val resolved: Boolean = joinType match {
+    case NaturalJoin(_) => false
+    case UsingJoin(_, _) => false
+    case _ => resolvedExceptNatural
+  }
+
+  override val nodePatterns : Seq[TreePattern] = {
+    var patterns = Seq(JOIN)
+    joinType match {
+      case _: InnerLike => patterns = patterns :+ INNER_LIKE_JOIN
+      case LeftOuter | FullOuter | RightOuter => patterns = patterns :+ OUTER_JOIN
+      case LeftSemiOrAnti(_) => patterns = patterns :+ LEFT_SEMI_OR_ANTI_JOIN
+      case NaturalJoin(_) | UsingJoin(_, _) => patterns = patterns :+ NATURAL_LIKE_JOIN
+      case _ =>
+    }
+    patterns
+  }
+
+  // Ignore hint for canonicalization
+  protected override def doCanonicalize(): LogicalPlan =
+    super.doCanonicalize().asInstanceOf[Join].copy(hint = JoinHint.NONE)
+
+  // Do not include an empty join hint in string description
+  protected override def stringArgs: Iterator[Any] = super.stringArgs.filter { e =>
+    (!e.isInstanceOf[JoinHint]
+      || e.asInstanceOf[JoinHint].leftHint.isDefined
+      || e.asInstanceOf[JoinHint].rightHint.isDefined)
+  }
+
+  override protected def withNewChildrenInternal(
+                                                  newLeft: LogicalPlan, newRight: LogicalPlan): Join = copy(left = newLeft, right = newRight)
+}
+
 /**
  * Insert query result into a directory.
  *

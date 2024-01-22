@@ -2606,6 +2606,13 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED =
+    buildConf("spark.sql.yannakakis.physicalCountJoinEnabled")
+      .doc("Apply a physical operator combining the join and aggregation steps")
+      .version("2.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
       .doc("Enables CBO for estimation of plan statistics when set true.")
@@ -4898,6 +4905,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def yannakakisEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_ENABLED)
 
   def yannakakisCountGroupInLeavesEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_COUNT_GROUP_LEAVES)
+
+  def yannakakisPhysicalCountEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 

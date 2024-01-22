@@ -102,6 +102,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
 
       val allAggAttributes = aggregateAttributes ++ groupAttributes
       val hg = new Hypergraph(items, conditions)
+      logWarning("hypergraph:\n" + hg.toString)
       val jointree = hg.flatGYO
 
       if (jointree == null) {
@@ -143,7 +144,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               logWarning("star counting aggregates: " + starCountingAggregates)
               val (yannakakisJoins, countingAttribute, _, _) =
                 root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
-                  conf.yannakakisCountGroupInLeavesEnabled)
+                  conf.yannakakisCountGroupInLeavesEnabled,
+                  usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled)
 
               val newCountingAggregates = starCountingAggregates
                 .map(agg => agg.transformDown {
@@ -163,7 +165,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               logWarning("percentile aggregates: " + percentileAggregates)
               val (yannakakisJoins, countingAttribute, _, lastJoinWasSemijoin) =
                 root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
-                  conf.yannakakisCountGroupInLeavesEnabled)
+                  conf.yannakakisCountGroupInLeavesEnabled,
+                  usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled)
 
               val newPercentileAggregates = percentileAggregates
                 .map(agg => agg.transformDown {
@@ -188,7 +191,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               logWarning("project exprs: " + projectExpressions)
               val (yannakakisJoins, countingAttribute, _, _) =
                 root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
-                  conf.yannakakisCountGroupInLeavesEnabled)
+                  conf.yannakakisCountGroupInLeavesEnabled,
+                  usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled)
 
               val newAverageAggregates = averageAggregates
                 .map(agg => agg.transformUp {
@@ -244,7 +248,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               logWarning("project exprs: " + projectExpressions)
               val (yannakakisJoins, countingAttribute, _, _) =
                 root.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints,
-                  conf.yannakakisCountGroupInLeavesEnabled)
+                  conf.yannakakisCountGroupInLeavesEnabled,
+                  usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled)
 
               val newSumAggregates = sumAggregates
                 .map(agg => agg.transformDown {
@@ -455,7 +460,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
   }
 
   def buildBottomUpJoinsCounting(aggregateAttributes: AttributeSet, keyRefs: Seq[Seq[Expression]],
-                                 uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean):
+                                 uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean,
+                                 usePhysicalCountJoin: Boolean = false):
   (LogicalPlan, NamedExpression, Boolean, Boolean) = {
 
     val edge = edges.head
@@ -463,6 +469,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     val vertices = edge.vertices
     val primaryKeys = AttributeSet(keyRefs.map(ref => ref.last.references.head))
     val uniqueSets = uniqueConstraints.map(constraint => AttributeSet(constraint))
+    logWarning("stats: " + scanPlan.stats)
+    logWarning("size: " + scanPlan.stats.sizeInBytes)
+    logWarning("rows: " + scanPlan.stats.rowCount.getOrElse("none"))
     logWarning("unique sets: " + uniqueSets)
     logWarning("output set: " + scanPlan.outputSet)
     logWarning("subset: " + uniqueSets.exists(uniqueSet => uniqueSet subsetOf scanPlan.outputSet))
@@ -824,6 +833,10 @@ class Hypergraph (private val items: Seq[LogicalPlan],
     }
 
     root
+  }
+  override def toString: String = {
+    edges.map(edge => s"""${edge.name}(${edge.vertices.map(v => v.replace("#", "_"))
+      .mkString(",")})""").mkString(",\n")
   }
 }
 

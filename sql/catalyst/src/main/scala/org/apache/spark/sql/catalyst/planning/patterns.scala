@@ -227,6 +227,62 @@ object ExtractEquiJoinKeys extends Logging with PredicateHelper {
   }
 }
 
+object ExtractAggJoinEquiJoinKeys extends Logging with PredicateHelper {
+  /** (joinType, leftKeys, rightKeys, otherCondition, conditionOnJoinKeys, leftChild,
+   * rightChild, joinHint).
+   */
+  // Note that `otherCondition` is NOT the original Join condition and it contains only
+  // the subset that is not handled by the 'leftKeys' to 'rightKeys' equijoin.
+  // 'conditionOnJoinKeys' is the subset of the original Join condition that corresponds to the
+  // 'leftKeys' to 'rightKeys' equijoin.
+  type ReturnType =
+    (JoinType, Seq[Expression], Seq[Expression],
+      Option[Expression], Option[Expression], LogicalPlan, LogicalPlan,
+      Option[Expression], Option[Expression], JoinHint)
+
+  def unapply(join: CountJoin): Option[ReturnType] = join match {
+    case CountJoin(left, right, joinType, condition, countLeft, countRight, hint) =>
+      logDebug(s"Considering join on: $condition")
+      // Find equi-join predicates that can be evaluated before the join, and thus can be used
+      // as join keys.
+      val predicates = condition.map(splitConjunctivePredicates).getOrElse(Nil)
+      val joinKeys = predicates.flatMap {
+        case EqualTo(l, r) if l.references.isEmpty || r.references.isEmpty => None
+        case EqualTo(l, r) if canEvaluate(l, left) && canEvaluate(r, right) => Some((l, r))
+        case EqualTo(l, r) if canEvaluate(l, right) && canEvaluate(r, left) => Some((r, l))
+        // Replace null with default value for joining key, then those rows with null in it could
+        // be joined together
+        case EqualNullSafe(l, r) if canEvaluate(l, left) && canEvaluate(r, right) =>
+          Seq((Coalesce(Seq(l, Literal.default(l.dataType))),
+            Coalesce(Seq(r, Literal.default(r.dataType)))),
+            (IsNull(l), IsNull(r))
+          )  // (coalesce(l, default) = coalesce(r, default)) and (isnull(l) = isnull(r))
+        case EqualNullSafe(l, r) if canEvaluate(l, right) && canEvaluate(r, left) =>
+          Seq((Coalesce(Seq(r, Literal.default(r.dataType))),
+            Coalesce(Seq(l, Literal.default(l.dataType)))),
+            (IsNull(r), IsNull(l))
+          )  // Same as above with left/right reversed.
+        case _ => None
+      }
+      val (predicatesOfJoinKeys, otherPredicates) = predicates.partition {
+        case EqualTo(l, r) if l.references.isEmpty || r.references.isEmpty => false
+        case Equality(l, r) =>
+          canEvaluate(l, left) && canEvaluate(r, right) ||
+            canEvaluate(l, right) && canEvaluate(r, left)
+        case _ => false
+      }
+
+      if (joinKeys.nonEmpty) {
+        val (leftKeys, rightKeys) = joinKeys.unzip
+        logDebug(s"leftKeys:$leftKeys | rightKeys:$rightKeys")
+        Some((joinType, leftKeys, rightKeys, otherPredicates.reduceOption(And),
+          predicatesOfJoinKeys.reduceOption(And), left, right, countLeft, countRight, hint))
+      } else {
+        None
+      }
+  }
+}
+
 /**
  * A pattern that collects the filter and inner joins.
  *
