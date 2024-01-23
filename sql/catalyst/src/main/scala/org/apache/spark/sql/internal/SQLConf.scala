@@ -4906,7 +4906,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def yannakakisCountGroupInLeavesEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_COUNT_GROUP_LEAVES)
 
-  def yannakakisPhysicalCountEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED)
+  def yannakakisPhysicalCountEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 

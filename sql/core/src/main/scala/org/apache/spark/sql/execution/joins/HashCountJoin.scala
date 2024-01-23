@@ -20,7 +20,7 @@ package org.apache.spark.sql.execution.joins
 import org.apache.spark.sql.catalyst.{InternalRow, SQLConfHelper}
 import org.apache.spark.sql.catalyst.analysis.CastSupport
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.BindReferences.{bindReference, bindReferences}
+import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans._
@@ -28,17 +28,17 @@ import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution.{CodegenSupport, ExplainUtils, RowIterator}
 import org.apache.spark.sql.execution.metric.SQLMetric
-import org.apache.spark.sql.types.{BooleanType, DecimalType, IntegralType, LongType, StructField, StructType}
+import org.apache.spark.sql.types.{BooleanType, IntegralType, LongType, StructField, StructType}
 
 /**
  * @param relationTerm variable name for HashedRelation
  * @param keyIsUnique  indicate whether keys of HashedRelation known to be unique in code-gen time
  * @param isEmpty indicate whether it known to be EmptyHashedRelation in code-gen time
  */
-private[joins] case class HashedRelationInfo(
-    relationTerm: String,
-    keyIsUnique: Boolean,
-    isEmpty: Boolean)
+// private[joins] case class HashedRelationInfo(
+//    relationTerm: String,
+//    keyIsUnique: Boolean,
+//    isEmpty: Boolean)
 
 trait HashCountJoin extends JoinCodegenSupport {
   def buildSide: BuildSide
@@ -388,11 +388,9 @@ trait HashCountJoin extends JoinCodegenSupport {
       countRight: Option[Expression]): Iterator[InternalRow] = {
 
     val joinedIter = joinType match {
+      // The join type is ignored
       case _ =>
         countJoin(streamedIter, hashed, countLeft, countRight)
-      case x =>
-        throw new IllegalArgumentException(
-          s"HashJoin should not take $x as the JoinType")
     }
 
     val resultProj = createResultProjection
@@ -759,7 +757,7 @@ trait HashCountJoin extends JoinCodegenSupport {
   protected def prepareRelation(ctx: CodegenContext): HashedRelationInfo
 }
 
-object HashJoin extends CastSupport with SQLConfHelper {
+object HashCountJoin extends CastSupport with SQLConfHelper {
 
   private def canRewriteAsLongType(keys: Seq[Expression]): Boolean = {
     // TODO: support BooleanType, DateType and TimestampType

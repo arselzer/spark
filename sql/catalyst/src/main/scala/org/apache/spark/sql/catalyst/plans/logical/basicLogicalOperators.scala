@@ -791,7 +791,8 @@ case class CountJoin(
   }
 
   override protected def withNewChildrenInternal(
-                                                  newLeft: LogicalPlan, newRight: LogicalPlan): Join = copy(left = newLeft, right = newRight)
+                                                  newLeft: LogicalPlan, newRight: LogicalPlan):
+  CountJoin = copy(left = newLeft, right = newRight)
 }
 
 /**
