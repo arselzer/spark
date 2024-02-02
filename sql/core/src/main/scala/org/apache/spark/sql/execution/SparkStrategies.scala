@@ -402,9 +402,12 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
           case ExtractAggJoinEquiJoinKeys(joinType, leftKeys, rightKeys, nonEquiCond,
           _, left, right, countLeft, countRight, hint) =>
             def createShuffleHashJoin(onlyLookingAtHint: Boolean) = {
-              val buildSide = getShuffleHashJoinBuildSide(
-                left, right, joinType, hint, onlyLookingAtHint, conf)
+//              val buildSide = getShuffleHashJoinBuildSide(
+//                left, right, joinType, hint, onlyLookingAtHint, conf)
+              val buildSide = Option(BuildRight)
+              logWarning("build side: " + buildSide)
               checkHintBuildSide(onlyLookingAtHint, buildSide, joinType, hint, false)
+              logWarning("mapping build side: " + buildSide)
               buildSide.map {
                 buildSide =>
                   Seq(joins.ShuffledHashCountJoinExec(
@@ -420,7 +423,7 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
               }
             }
 
-            createShuffleHashJoin(true).get
+            createShuffleHashJoin(false).get
         }
 
       // --- Cases where this strategy does not apply ---------------------------------------------

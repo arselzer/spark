@@ -524,7 +524,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
       val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, childWasSemijoined) =
-        c.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints, groupInLeaves)
+        c.buildBottomUpJoinsCounting(aggregateAttributes, keyRefs, uniqueConstraints, groupInLeaves,
+          usePhysicalCountJoin = usePhysicalCountJoin)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
@@ -556,8 +557,10 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         logWarning("prev child attributes: " + prevChildAttributes)
         logWarning("prev semi joined: " + prevSemijoined)
 
-        if ((prevSemijoined && primaryKeys.exists(att => nodeAttributes contains att))
-        || uniqueSets.exists(uniqueSet => AttributeSet(groupAttributes) subsetOf uniqueSet )) {
+        // Don't perform aggregation afterwards if a countjoin was performed
+        if (usePhysicalCountJoin
+          || (prevSemijoined && primaryKeys.exists(att => nodeAttributes contains att))
+          || uniqueSets.exists(uniqueSet => AttributeSet(groupAttributes) subsetOf uniqueSet )) {
           (prevPlan, prevCountExpr.toAttribute)
         }
         else {
@@ -572,8 +575,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         (bottomUpJoins, childCountExpr.toAttribute)
       }
       else {
-        if (countGroupRight.forall(att => primaryKeys contains att)
-        || uniqueSets.exists(uniqueSet => AttributeSet(countGroupRight) subsetOf uniqueSet )) {
+        if (usePhysicalCountJoin
+          || countGroupRight.forall(att => primaryKeys contains att)
+          || uniqueSets.exists(uniqueSet => AttributeSet(countGroupRight) subsetOf uniqueSet )) {
           (bottomUpJoins, childCountExpr.toAttribute)
         }
         else {
@@ -610,23 +614,40 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       logWarning("overlapping vertices: " + overlappingVertices
         .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex))))
       logWarning("can semi join: " + canSemiJoin)
+      logWarning("use physical count join: " + usePhysicalCountJoin)
 
-      val join = Join(leftPlan, rightPlan,
-        if (canSemiJoin) LeftSemi else Inner, Option(joinConditions), joinHint)
+      val join = if (usePhysicalCountJoin && !canSemiJoin) {
+        // Only apply the CountJoin operator when the option is explicitly
+        // enabled and no semi-join is performed.
+        CountJoin(leftPlan, rightPlan,
+          if (canSemiJoin) LeftSemi else Inner, Option(joinConditions),
+          Option(leftCountAttribute), Option(rightCountAttribute), joinHint)
+      } else {
+        Join(leftPlan, rightPlan,
+          if (canSemiJoin) LeftSemi else Inner, Option(joinConditions), joinHint)
+      }
       logWarning("join output: " + join.output)
       val finalCountExpr = if (canSemiJoin) {
+        // When semi-joining we only have one count attribute
         leftCountAttribute
       } else {
-        Alias(Multiply(
-          Cast(leftCountAttribute, rightCountAttribute.dataType),
-          rightCountAttribute), "c")()
+        if (usePhysicalCountJoin) {
+          // The summed-up and multiplied result is already in the right count attribute
+          rightCountAttribute
+        }
+        else {
+          // Multiply the left count with the right count
+          Alias(Multiply(
+            Cast(leftCountAttribute, rightCountAttribute.dataType),
+            rightCountAttribute), "c")()
+        }
       }
-      val multiplication = Project(
+      val finalProjection = Project(
         Seq(finalCountExpr)
           ++ join.output.filter(
             att => (nodeAttributes contains att) || (aggregateAttributes contains att)), join)
 
-      prevPlan = multiplication
+      prevPlan = finalProjection
       prevCountExpr = finalCountExpr
       isLeafNode = false
       prevChildEdge = childEdge

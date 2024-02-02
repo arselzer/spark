@@ -330,19 +330,51 @@ trait HashCountJoin extends JoinCodegenSupport {
 
     // See bindReference(countRight, streamedOutput)
     // TODO nicer way to get exprId?
-    val leftCountOrdinal = AttributeSeq(buildOutput)
+    val leftCountOrdinal = AttributeSeq(streamedOutput)
       .indexOf(countLeft.get.references.head.exprId)
-    val rightCountOrdinal = AttributeSeq(streamedOutput)
+    val rightCountOrdinal = AttributeSeq(buildOutput)
       .indexOf(countRight.get.references.head.exprId)
+//    logWarning("left attributes: " + AttributeSeq(streamedOutput))
+//    logWarning("count left: " + countLeft)
+//    logWarning("left ordinal: " + leftCountOrdinal)
+//    logWarning("right attributes: " + AttributeSeq(buildOutput))
+//    logWarning("count right: " + countRight)
+//    logWarning("right ordinal: " + rightCountOrdinal)
 
     if (hashedRelation == EmptyHashedRelation) {
       Iterator.empty
     } else if (hashedRelation.keyIsUnique) {
-      streamIter.filter { current =>
-        val key = joinKeys(current)
-        lazy val matched = hashedRelation.getValue(key)
-        !key.anyNull && matched != null &&
-          (condition.isEmpty || boundCondition(joinedRow(current, matched)))
+//      streamIter.filter { current =>
+//        val key = joinKeys(current)
+//        lazy val matched = hashedRelation.getValue(key)
+//        !key.anyNull && matched != null &&
+//          (condition.isEmpty || boundCondition(joinedRow(current, matched)))
+//      }
+      streamIter.flatMap { srow =>
+        joinedRow.withLeft(srow)
+        val matches = hashedRelation.get(joinKeys(srow))
+        if (matches != null) {
+          //          logWarning("left row: " + srow)
+          val rightCountSum = matches.map(joinedRow.withRight).filter(boundCondition)
+            .map(row => {
+              //              logWarning("right row: " + row + ", value: " +
+              //                row.getRight.getLong(rightCountOrdinal))
+              row.getRight.getLong(rightCountOrdinal)
+            }).sum
+          //          logWarning("right count sum: " + rightCountSum)
+          val schema = StructType(StructField("c", LongType) :: Nil)
+          val sumRow = new SpecificInternalRow(schema)
+          //          logWarning("sumRow: " + sumRow)
+          val leftCount = srow.getLong(leftCountOrdinal)
+          //          logWarning("leftCount: " + leftCount)
+          sumRow.setLong(0, rightCountSum * leftCount)
+          //          logWarning("sumRow: " + sumRow)
+          joinedRow.withRight(sumRow)
+          //          logWarning("produced row: " + joinedRow)
+          Seq(joinedRow)
+        } else {
+          Seq.empty
+        }
       }
     } else {
 //      streamIter.filter { current =>
@@ -363,15 +395,23 @@ trait HashCountJoin extends JoinCodegenSupport {
         joinedRow.withLeft(srow)
         val matches = hashedRelation.get(joinKeys(srow))
         if (matches != null) {
-          val leftCountSum = matches.map(joinedRow.withRight).filter(boundCondition)
+//          logWarning("left row: " + srow)
+          val rightCountSum = matches.map(joinedRow.withRight).filter(boundCondition)
             .map(row => {
-              row.getLong(rightCountOrdinal)
+//              logWarning("right row: " + row + ", value: " +
+//                row.getRight.getLong(rightCountOrdinal))
+              row.getRight.getLong(rightCountOrdinal)
             }).sum
+//          logWarning("right count sum: " + rightCountSum)
           val schema = StructType(StructField("c", LongType) :: Nil)
           val sumRow = new SpecificInternalRow(schema)
+//          logWarning("sumRow: " + sumRow)
           val leftCount = srow.getLong(leftCountOrdinal)
-          sumRow.setLong(0, leftCountSum * leftCount)
+//          logWarning("leftCount: " + leftCount)
+          sumRow.setLong(0, rightCountSum * leftCount)
+//          logWarning("sumRow: " + sumRow)
           joinedRow.withRight(sumRow)
+//          logWarning("produced row: " + joinedRow)
           Seq(joinedRow)
         } else {
           Seq.empty
@@ -387,13 +427,15 @@ trait HashCountJoin extends JoinCodegenSupport {
       countLeft: Option[Expression],
       countRight: Option[Expression]): Iterator[InternalRow] = {
 
-    val joinedIter = joinType match {
-      // The join type is ignored
-      case _ =>
-        countJoin(streamedIter, hashed, countLeft, countRight)
-    }
+    val joinedIter = countJoin(streamedIter, hashed, countLeft, countRight)
 
-    val resultProj = createResultProjection
+    logWarning("left output: " + left.output)
+    logWarning("right output: " + right.output)
+    val output = left.output ++ Seq(countRight.get.references.head)
+    logWarning("output: " + output)
+
+    val resultProj = UnsafeProjection.create(output, output)
+    // val resultProj = createResultProjection
     joinedIter.map { r =>
       numOutputRows += 1
       resultProj(r)
