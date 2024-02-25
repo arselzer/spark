@@ -227,7 +227,7 @@ object ExtractEquiJoinKeys extends Logging with PredicateHelper {
   }
 }
 
-object ExtractAggJoinEquiJoinKeys extends Logging with PredicateHelper {
+object ExtractCountJoinEquiJoinKeys extends Logging with PredicateHelper {
   /** (joinType, leftKeys, rightKeys, otherCondition, conditionOnJoinKeys, leftChild,
    * rightChild, joinHint).
    */

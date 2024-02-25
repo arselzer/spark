@@ -397,11 +397,14 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
             .orElse { if (hintToShuffleReplicateNL(hint)) createCartesianProduct() else None }
             .getOrElse(createJoinWithoutHint())
         }
+
+      // Selecting a CountJoin
+
       case j @ logical.CountJoin(left, right, joinType, condition, countLeft, countRight, hint) =>
         j match {
-          case ExtractAggJoinEquiJoinKeys(joinType, leftKeys, rightKeys, nonEquiCond,
+          case ExtractCountJoinEquiJoinKeys(joinType, leftKeys, rightKeys, nonEquiCond,
           _, left, right, countLeft, countRight, hint) =>
-            def createShuffleHashJoin(onlyLookingAtHint: Boolean) = {
+            def createShuffleHashCountJoin(onlyLookingAtHint: Boolean) = {
 //              val buildSide = getShuffleHashJoinBuildSide(
 //                left, right, joinType, hint, onlyLookingAtHint, conf)
               val buildSide = Option(BuildRight)
@@ -422,8 +425,48 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
                     countRight))
               }
             }
+            def createBroadcastHashCountJoin(onlyLookingAtHint: Boolean) = {
+              //              val buildSide = getShuffleHashJoinBuildSide(
+              //                left, right, joinType, hint, onlyLookingAtHint, conf)
+              val buildSide = Option(BuildRight)
+              logWarning("build side: " + buildSide)
+              checkHintBuildSide(onlyLookingAtHint, buildSide, joinType, hint, false)
+              logWarning("mapping build side: " + buildSide)
+              buildSide.map {
+                buildSide =>
+                  Seq(joins.BroadcastHashCountJoinExec(
+                    leftKeys,
+                    rightKeys,
+                    joinType,
+                    buildSide,
+                    nonEquiCond,
+                    planLater(left),
+                    planLater(right),
+                    countLeft,
+                    countRight))
+              }
+            }
 
-            createShuffleHashJoin(false).get
+            def createSortMergeCountJoin() = {
+              if (RowOrdering.isOrderable(leftKeys)) {
+                Some(Seq(joins.SortMergeCountJoinExec(
+                  leftKeys,
+                  rightKeys,
+                  joinType,
+                  nonEquiCond,
+                  planLater(left),
+                  planLater(right),
+                  countLeft,
+                  countRight)))
+              } else {
+                None
+              }
+            }
+
+
+            createShuffleHashCountJoin(false).get
+            createBroadcastHashCountJoin(false).get
+            createSortMergeCountJoin().get
         }
 
       // --- Cases where this strategy does not apply ---------------------------------------------
