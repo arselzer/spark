@@ -74,16 +74,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     }
     val groupingExpressions = namedGroupingExpressions.map(_._2)
     val groupExpressionMap = namedGroupingExpressions.toMap
-    val aggregateAttributes = resultExpressions.map(expr => expr.references)
-      .reduce((a1, a2) => a1 ++ a2)
-    val groupAttributes = if (groupingExpressions.isEmpty) {
-      AttributeSet.empty
-    }
-    else {
-      groupingExpressions
-        .map(g => g.references)
-        .reduce((g1, g2) => g1 ++ g2)
-    }
 
     val aliasProjections = projectList.filter {
       case Alias(child, name) => true
@@ -93,13 +83,15 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     val groupAliasProjections = aliasProjections.filter {
       expr => groupingExpressions.exists(ge => ge.references.contains(expr.toAttribute))
     }
-
     val groupAliasAttributes = groupAliasProjections.flatMap(expr => expr.references)
+    val groupAliasMap =
+      groupAliasProjections.map(a => a.asInstanceOf[Alias])
+        .map(a => (a.toAttribute.exprId, a.child))
+        .toMap
 
     val aggAliasProjections = aliasProjections.filter {
       expr => aggregateExpressions.exists(ae => ae.references.contains(expr.toAttribute))
     }
-
     val aggAliasMap
     = aggAliasProjections.map(a => a.asInstanceOf[Alias])
       .map(a => (a.toAttribute.exprId, a.child))
@@ -108,10 +100,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     val aggregateExpressionsWithAliasesReplaced = aggregateExpressions
       .map(ae => ae.transformDown {
         case expr: Attribute =>
-          logWarning("expr: " + expr)
-          logWarning("contains: " + aggAliasMap.contains(expr.exprId))
-          logWarning("map: " + aggAliasMap)
-          logWarning("output: " + aggAliasMap.get(expr.exprId))
           if (aggAliasMap.get(expr.exprId).nonEmpty) {
             aggAliasMap(expr.exprId)
          }
@@ -131,6 +119,31 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }
       }.asInstanceOf[NamedExpression])
 
+    val aggregateAttributes = resultExpressionsWithAliasesReplaced.map(expr => expr.references)
+      .reduce((a1, a2) => a1 ++ a2)
+    val groupAttributes = if (groupingExpressions.isEmpty) {
+      AttributeSet.empty
+    }
+    else {
+      // Get the directly referenced attributes and the attributes indirectly referenced
+      // by the projection before the aggregation
+      groupingExpressions
+        .map(g => g.references)
+        .map(atts => {
+          AttributeSet(atts.toSeq.map(att => {
+            if (groupAliasMap.contains(att.exprId)) {
+              groupAliasMap(att.exprId)
+            }
+            else {
+              att
+            }
+          }))
+        })
+        .reduce((g1, g2) => g1 ++ g2)
+    }
+
+    logWarning("groupAttributes: " + groupAttributes)
+    logWarning("aggregateAttributes: " + aggregateAttributes)
     logWarning("groupAliasProjections: " + groupAliasProjections)
     logWarning("groupAliasAttributes: " + groupAliasAttributes)
     logWarning("aggAliasProjections: " + aggAliasProjections)
@@ -183,14 +196,28 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         val nodeContainingAllAttributes = jointree
           .findNodeContainingAttributes(aggregateAttributes ++ groupAttributes)
         if (nodeContainingAllAttributes == null) {
+          // The query is not guarded according to the original definition
+          // (one node contains all attributes in the query)
           logWarning("not guarded! there is no node containing all agg and group attributes")
           logWarning("time difference: " + (System.nanoTime() - startTime))
 
-          var root = jointree
           val nodeContainingGroupAttributes = jointree.findNodeContainingAttributes(groupAttributes)
+          var root = jointree
+
+          val unguardedAggAttributes = aggregateExpressionsWithAliasesReplaced.map(expr => {
+            val containingNode = jointree.findNodeContainingAttributes(expr.references)
+            if (containingNode == null) {
+              expr.references
+            }
+            else {
+              AttributeSet.empty
+            }
+          }).reduce((a1, a2) => a1 ++ a2)
+
+          logWarning("unguardedAggAttributes: " + unguardedAggAttributes)
 
           var piecewiseGuarded = false
-          if (nodeContainingGroupAttributes != null) {
+          if (nodeContainingGroupAttributes != null && unguardedAggAttributes.isEmpty) {
             piecewiseGuarded = true
             logWarning("piecewise-guarded!")
             root = nodeContainingGroupAttributes.reroot
@@ -214,9 +241,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               conf.yannakakisCountGroupInLeavesEnabled,
               usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled)
 
-//          logWarning("lastAggMap: " + lastAggMap)
-//          logWarning("lastSumMap: " + lastSumMap)
+          logWarning("lastAggMap: " + lastAggMap)
+          logWarning("lastSumMap: " + lastSumMap)
+          logWarning("resultExpressionsWithAliasesReplaced: " +
+            resultExpressionsWithAliasesReplaced)
 
+          // Adapt the result expressions to make use of the frequency attribute
           val rewrittenResultExpressions = resultExpressionsWithAliasesReplaced.map {
             expr =>
               expr.transformDown {
@@ -285,20 +315,18 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                 }.getOrElse(expression)
             }.asInstanceOf[NamedExpression]
           }
-//          logWarning("rewritten result expressions: " + rewrittenResultExpressions)
+          logWarning("rewrittenResultExpressions: " + rewrittenResultExpressions)
 
           val newAgg = Aggregate(groupingExpressions,
             rewrittenResultExpressions,
             Project(yannakakisJoins.output ++ groupAliasProjections, yannakakisJoins))
-//          val newAgg = Aggregate(groupingExpressions,
-//            newCountingAggregates ++ rewrittenResultExpressions ++ projectExpressions,
-//            yannakakisJoins)
           val queryClass = if (piecewiseGuarded) "piecewise-guarded" else "unguarded"
           logWarning(f"new aggregate ($queryClass): " + newAgg)
           logWarning("time difference: " + (System.nanoTime() - startTime))
           newAgg
         }
         else {
+          // The query is guarded
           val root = nodeContainingAllAttributes.reroot
           logWarning("applicable query (joins=" + (items.size - 1) + ")")
 
@@ -316,6 +344,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             newAgg
           }
           else {
+            // Guarded but not 0MA
             val (yannakakisJoins, countingAttribute, _, _) =
               root.buildBottomUpJoinsCounting(aggregateAttributes,
                 groupingExpressions,
@@ -701,17 +730,13 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       // Currently unused (can be used to e.g., force hash/merge joins)
       val joinHint = JoinHint(Option.empty, Option.empty)
 
-      // Each keyref [fk, pk] represents a reference from a foreign key fk to a primary key pk
-      val canSemiJoin: Boolean = overlappingVertices
-        .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
-        // Check if the fk is contained in the parent node attributes
-        .forall(atts => keyRefs.exists(ref => ref.head.references.head.exprId == atts._1.exprId
-          // and if the pk is contained in the child node attributes
-        && ref.last.references.head.exprId == atts._2.exprId))
-
       val newRightCount = Alias(Literal(1L, LongType), "c")()
 
-      val join = if (usePhysicalCountJoin && !canSemiJoin) {
+      val applicableGroupAttributes = groupingExpressions.filter(
+        groupExpr => {groupExpr.references.subsetOf(rightPlan.outputSet)}
+      )
+
+      val join = if (usePhysicalCountJoin) {
         var applicableAggExpressions = {
           new mutable.MutableList[AggregateExpression]()
         }
@@ -825,7 +850,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
           }
         }
 
+        logWarning("lastAggMap: " + lastAggMap)
         aggExpressions.foreach(agg => {
+          logWarning("aggExpression: " + agg)
           agg.aggregateFunction match {
             case Sum(_, _) =>
               sumOrCountCase(agg)
@@ -834,7 +861,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // Non-SUM aggregates (MIN/MAX)
             case _ =>
               if (lastAggMap.contains(agg.resultAttribute)) {
-                // The aggregate function has already been applied further down the tree
+                // The aggregate has already been applied further down the tree
                 // and we have to aggregate over it again
                 val lastAgg = lastAggMap(agg.resultAttribute)
 
@@ -849,29 +876,53 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 }
               }
               else {
-                // This is the first time the aggregate function is applied.
-                // Therefore, store the first aggregation in the map
-                if (agg.references.subsetOf(rightPlan.outputSet)) {
-                  lastAggMap.put(agg.resultAttribute, agg)
-                  applicableAggExpressions = applicableAggExpressions :+ agg
+                // First occurrence of the aggregate
+                // First check if it is NOT the case that we are only joining without aggregation
+                if (!(applicableGroupAttributes.nonEmpty && parent == null)) {
+                  // This is the first time the aggregate function is applied.
+                  // Therefore, store the first aggregation in the map
+                  if (agg.references.subsetOf(rightPlan.outputSet)) {
+                    lastAggMap.put(agg.resultAttribute, agg)
+                    applicableAggExpressions = applicableAggExpressions :+ agg
+                  }
                 }
               }
           }
         })
-//        logWarning("applicable agg expressions: " + applicableAggExpressions)
-
-        val applicableGroupAttributes = groupingExpressions.filter(
-          groupExpr => {groupExpr.references.subsetOf(rightPlan.outputSet)}
-        )
-//        logWarning("applicable group atts: " + applicableGroupAttributes)
+        logWarning("lastAggMap: " + lastAggMap)
 
         val right = rightPlan
 
-        val countJoin = CountJoin(leftPlan, right,
-          if (canSemiJoin) LeftSemi else Inner, Option(joinConditions),
-          Option(if (isLeafNode) prevCountExpr else leftCountAttribute),
-          Option(if (rightPlanIsLeaf) newRightCount else rightCountAttribute),
-          applicableAggExpressions, applicableGroupAttributes, joinHint)
+        logWarning("leftPlan.output: " + leftPlan.output)
+        logWarning("applicableAggExpressions: " + applicableAggExpressions)
+        logWarning("applicableGroupAttributes: " + applicableGroupAttributes)
+        logWarning("isLeafNode: " + isLeafNode + ", rightPlanIsLeaf: " + rightPlanIsLeaf)
+        logWarning("prevCountExpr: " + prevCountExpr)
+        logWarning("leftCountAttribute: " + leftCountAttribute)
+        logWarning("newRightCount: " + newRightCount)
+        logWarning("rightCountAttribute: " + rightCountAttribute)
+        val countJoin = if (applicableGroupAttributes.isEmpty) {
+          // No grouping
+          CountJoin(leftPlan, right,
+            Inner, Option(joinConditions),
+            Option(if (isLeafNode) prevCountExpr else leftCountAttribute),
+            Option(if (rightPlanIsLeaf) newRightCount else rightCountAttribute),
+            applicableAggExpressions, applicableGroupAttributes, joinHint)
+        }
+        else {
+          // Grouping
+          if (parent != null) {
+            Aggregate(leftPlan.output ++ applicableGroupAttributes,
+              applicableAggExpressions.map(ae => Alias(ae, "agg")()) ++ leftPlan.output
+                ++ applicableGroupAttributes,
+              Join(leftPlan, right, Inner, Option(joinConditions), joinHint))
+          }
+          else {
+            // At the root of the tree, do not aggregate because it would be redundant
+            Join(leftPlan, right, Inner, Option(joinConditions), joinHint)
+          }
+        }
+        logWarning("countJoin: " + countJoin)
 
         if (multiplySumExpressions.isEmpty) {
           countJoin
@@ -881,20 +932,22 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         }
       } else {
         Join(leftPlan, rightPlan,
-          if (canSemiJoin) LeftSemi else Inner, Option(joinConditions), joinHint)
+          Inner, Option(joinConditions), joinHint)
       }
 //      logWarning("join output: " + join.output)
-      val finalCountExpr = if (canSemiJoin) {
-        // When semi-joining we only have one count attribute
-        leftCountAttribute
-      } else {
-        if (usePhysicalCountJoin) {
+      val finalCountExpr = if (usePhysicalCountJoin) {
           // The summed-up and multiplied result is already in the right count attribute
           if (rightPlanIsLeaf) {
             newRightCount
           }
           else {
-            rightCountAttribute
+            if (applicableGroupAttributes.isEmpty) {
+              rightCountAttribute
+            }
+            else {
+              // Grouping -> join
+              leftCountAttribute
+            }
           }
         }
         else {
@@ -903,7 +956,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             Cast(leftCountAttribute, rightCountAttribute.dataType),
             rightCountAttribute), "c")()
         }
-      }
+      logWarning("finalCountExpr: " + finalCountExpr)
 //      logWarning("join output: " + join.output)
       val finalProjection = join
 
@@ -911,7 +964,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       prevCountExpr = finalCountExpr
       isLeafNode = false
       prevChildEdge = childEdge
-      prevSemijoined = canSemiJoin
+      prevSemijoined = false
     }
     (prevPlan, prevCountExpr.toAttribute, isLeafNode, prevSemijoined)
   }
@@ -942,10 +995,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     val nodeAttributes = edges
       .map(e => e.planReference.outputSet)
       .reduce((e1, e2) => e1 ++ e2)
-//    logWarning("aggAttributes: " + aggAttributes)
-//    logWarning("nodeAttributes: " + nodeAttributes)
     if (aggAttributes subsetOf nodeAttributes) {
-//      logWarning("found subset in:\n" + this)
       this
     } else {
       for (c <- children) {
