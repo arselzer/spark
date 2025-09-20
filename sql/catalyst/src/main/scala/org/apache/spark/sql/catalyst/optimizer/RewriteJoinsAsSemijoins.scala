@@ -911,7 +911,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         }
         else {
           // Grouping
-          if (parent != null) {
+          // if (parent != null) {
+          if (false) {
             Aggregate(leftPlan.output ++ applicableGroupAttributes,
               applicableAggExpressions.map(ae => Alias(ae, "agg")()) ++ leftPlan.output
                 ++ applicableGroupAttributes,
