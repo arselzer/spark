@@ -878,14 +878,14 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               else {
                 // First occurrence of the aggregate
                 // First check if it is NOT the case that we are only joining without aggregation
-                if (!(applicableGroupAttributes.nonEmpty && parent == null)) {
+                // if (!(applicableGroupAttributes.nonEmpty && parent == null)) {
                   // This is the first time the aggregate function is applied.
                   // Therefore, store the first aggregation in the map
                   if (agg.references.subsetOf(rightPlan.outputSet)) {
                     lastAggMap.put(agg.resultAttribute, agg)
                     applicableAggExpressions = applicableAggExpressions :+ agg
                   }
-                }
+                // }
               }
           }
         })
@@ -901,28 +901,27 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         logWarning("leftCountAttribute: " + leftCountAttribute)
         logWarning("newRightCount: " + newRightCount)
         logWarning("rightCountAttribute: " + rightCountAttribute)
-        val countJoin = if (applicableGroupAttributes.isEmpty) {
+        val countJoin = // if (applicableGroupAttributes.isEmpty) {
           // No grouping
           CountJoin(leftPlan, right,
             Inner, Option(joinConditions),
             Option(if (isLeafNode) prevCountExpr else leftCountAttribute),
             Option(if (rightPlanIsLeaf) newRightCount else rightCountAttribute),
             applicableAggExpressions, applicableGroupAttributes, joinHint)
-        }
-        else {
-          // Grouping
-          // if (parent != null) {
-          if (false) {
-            Aggregate(leftPlan.output ++ applicableGroupAttributes,
-              applicableAggExpressions.map(ae => Alias(ae, "agg")()) ++ leftPlan.output
-                ++ applicableGroupAttributes,
-              Join(leftPlan, right, Inner, Option(joinConditions), joinHint))
-          }
-          else {
-            // At the root of the tree, do not aggregate because it would be redundant
-            Join(leftPlan, right, Inner, Option(joinConditions), joinHint)
-          }
-        }
+//        }
+//        else {
+//          // Grouping
+//          if (parent != null) {
+//            Aggregate(leftPlan.output ++ applicableGroupAttributes,
+//              applicableAggExpressions.map(ae => Alias(ae, "agg")()) ++ leftPlan.output
+//                ++ applicableGroupAttributes,
+//              Join(leftPlan, right, Inner, Option(joinConditions), joinHint))
+//          }
+//          else {
+//            // At the root of the tree, do not aggregate because it would be redundant
+//            Join(leftPlan, right, Inner, Option(joinConditions), joinHint)
+//          }
+//        }
         logWarning("countJoin: " + countJoin)
 
         if (multiplySumExpressions.isEmpty) {
