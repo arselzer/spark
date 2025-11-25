@@ -251,19 +251,22 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             expr =>
               expr.transformDown {
                 case ae: AggregateExpression =>
+                  logWarning("aggregate expression: " + ae)
                   val resultAtt = equivalentAggregateExpressions.getExprState(ae).map(_.expr)
                     .getOrElse(ae).asInstanceOf[AggregateExpression].resultAttribute
+                  logWarning("resultAtt: " + resultAtt)
                   ae.aggregateFunction match {
                     case a: Count =>
-                      if (lastSumMap.contains(resultAtt)) {
-                        val lastSumAtt = lastSumMap(resultAtt)
-                        Sum(lastSumAtt).toAggregateExpression()
-                      }
-                      else {
+                      // TODO temp change
+//                      if (lastSumMap.contains(resultAtt)) {
+//                        val lastSumAtt = lastSumMap(resultAtt)
+//                        Sum(lastSumAtt).toAggregateExpression()
+//                      }
+//                      else {
                         Sum(Multiply(
                           a.children.head, Cast(countingAttribute, a.children.head.dataType)))
                           .toAggregateExpression()
-                      }
+//                      }
                     case _ =>
                       // The final aggregation buffer's attributes will be
                       // `finalAggregationAttributes`,
@@ -762,7 +765,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         }
 
         def sumOrCountCase(agg: AggregateExpression) = {
+          logWarning("sumOrCountCase")
           if (lastSumMap.contains(agg.resultAttribute)) {
+            logWarning("lastSumMap contains " + agg.resultAttribute)
             val lastSumAtt = lastSumMap(agg.resultAttribute)
 
             if (rightPlan.outputSet.contains(lastSumAtt)) {
@@ -796,7 +801,12 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //      /     \
               //    Y(a,c)     Z(c)
 
-              val countRightAgg = Count(Literal(1L)).toAggregateExpression()
+              val countRightAgg = if (rightPlanIsLeaf) {
+                Count(Literal(1L)).toAggregateExpression()
+              }
+              else {
+                Sum(rightCountAttribute).toAggregateExpression()
+              }
               applicableAggExpressions = applicableAggExpressions :+ countRightAgg
 
               val newSum = Alias(createMultiplication(lastSumAtt,
@@ -807,9 +817,11 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             }
           }
           else {
+            logWarning("lastSumMap does not contain " + agg.resultAttribute)
             // SUM/COUNT aggregate has not yet occurred somewhere in the tree -
             // check if it starts here
             if (agg.references.subsetOf(rightPlan.outputSet)) {
+              logWarning("agg.references.subsetOf(rightPlan.outputSet)")
 
               // logWarning("is subset")
               //         |
@@ -941,13 +953,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             newRightCount
           }
           else {
-            if (applicableGroupAttributes.isEmpty) {
-              rightCountAttribute
-            }
-            else {
-              // Grouping -> join
-              leftCountAttribute
-            }
+            rightCountAttribute
           }
         }
         else {

@@ -425,16 +425,17 @@ trait HashCountJoin extends JoinCodegenSupport {
     val aggResultAttributes = aggregatesRight.map(_.resultAttribute)
 
     val aggProjection = UnsafeProjection.create(
-      aggResultAttributes ++ groupRight,
+      aggResultAttributes ++ groupRight.map(_.toAttribute),
       aggResultAttributes ++ groupRight.map(_.toAttribute))
 
     val countAggGroupProjection = UnsafeProjection.create(
-      Seq(countRight.get) ++ aggResultAttributes ++ groupRight,
+      Seq(countRight.get.toAttribute) ++ aggResultAttributes ++ groupRight.map(_.toAttribute),
       Seq(countRight.get.toAttribute)
         ++ aggResultAttributes ++ groupRight.map(_.toAttribute))
 
     val resultProjection = UnsafeProjection.create(
-      left.output ++ Seq(countRight.get) ++ aggResultAttributes ++ groupRight,
+      left.output ++ Seq(countRight.get.toAttribute) ++ aggResultAttributes
+        ++ groupRight.map(_.toAttribute),
       left.output ++ Seq(countRight.get.toAttribute)
         ++ aggResultAttributes ++ groupRight.map(_.toAttribute))
 

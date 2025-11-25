@@ -261,7 +261,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
     }
 
     def forceApplyShuffledHashJoin(conf: SQLConf): Boolean = {
-      Utils.isTesting &&
+      // TODO temporarily disabled
+       Utils.isTesting ||
         conf.getConfString("spark.sql.join.forceApplyShuffledHashJoin", "false") == "true"
     }
 

@@ -319,12 +319,14 @@ class SortMergeCountJoinEvaluatorFactory(
               aggResultAttributes++ groupRight.map(_.toAttribute))
 
             protected val countAggGroupProjection = UnsafeProjection.create(
-              Seq(countRight.get) ++ aggResultAttributes ++ groupRight,
+              Seq(countRight.get.toAttribute) ++ aggResultAttributes ++
+                groupRight.map(_.toAttribute),
               Seq(countRight.get.toAttribute)
                 ++ aggResultAttributes ++ groupRight.map(_.toAttribute))
 
             protected val resultProjection = UnsafeProjection.create(
-              left.output ++ Seq(countRight.get) ++ aggResultAttributes ++ groupRight,
+              left.output ++ Seq(countRight.get.toAttribute) ++ aggResultAttributes
+                ++ groupRight.map(_.toAttribute),
               left.output ++ Seq(countRight.get.toAttribute)
                 ++ aggResultAttributes ++ groupRight.map(_.toAttribute))
 
@@ -336,11 +338,7 @@ class SortMergeCountJoinEvaluatorFactory(
 //              ++ aggResultAttributes ++ groupRight.map(_.toAttribute)).map(_.dataType))
 
             override def getRow: InternalRow = {
-//              logWarning("getRow (doaggregation = " + doAggregation +
-//                ", dogrouping = " + doGrouping)
-//              logWarning("partition: " + partitionIndex)
-//              logWarning("currentLeftRow: " + currentLeftRow)
-//              logWarning("rightCountSum: " + rightCountSum)
+
               val leftCount = if (leftCountOrdinal != -1) {
                 currentLeftRow.getLong(leftCountOrdinal)
               }
@@ -348,6 +346,17 @@ class SortMergeCountJoinEvaluatorFactory(
                 // If there is no left count attribute (leaf node)
                 1
               }
+
+//              if (numOutputRows.value < 32) {
+//                logWarning("row " + numOutputRows.value)
+//                logWarning("left output: " + left.output)
+//                logWarning("getRow (doaggregation = " + doAggregation +
+//                  ", dogrouping = " + doGrouping)
+//                logWarning("partition: " + partitionIndex)
+//                logWarning("currentLeftRow: " + currentLeftRow)
+//                logWarning("rightCountSum: " + rightCountSum)
+//                logWarning("leftCount: " + leftCount)
+//              }
 
               if (doGrouping) {
                 val (groupingKey, buf) = bufferIterator.next()
@@ -387,12 +396,18 @@ class SortMergeCountJoinEvaluatorFactory(
                 sumRow.setLong(0, rightCountSum * leftCount)
                 if (doAggregation) {
                   joinRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggregateResult)))
-//                  logWarning("output: " + resultProjection(joinRow))
+//                  if (numOutputRows.value < 32) {
+//                    logWarning("count: " +  rightCountSum * leftCount)
+//                                      logWarning("output: " + resultProjection(joinRow))
+//                  }
                   resultProjection(joinRow)
                 }
                 else {
                   joinRow.withRight(sumRow)
-//                  logWarning("output: " + resultProjection(joinRow))
+//                  if (numOutputRows.value < 32) {
+//                    logWarning("count: " +  rightCountSum * leftCount)
+//                                      logWarning("output: " + resultProjection(joinRow))
+//                  }
                   resultProjection(joinRow)
                 }
               }
