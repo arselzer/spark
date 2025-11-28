@@ -31,6 +31,13 @@ import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DecimalType.DoubleDecimal
 
 object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
+  // Set to true to enable debug logging for the GroupAggJoin optimization
+  val DEBUG_LOGGING = true
+
+  private def debugLog(msg: => String): Unit = {
+    if (DEBUG_LOGGING) logWarning(msg)
+  }
+
   /** As in [[PhysicalAggregation]] the aggregate  expressions are extracted from the
    * outputExpressions ([[NamedExpression]]. Then these are replaced in the output expressions
    * by new references.
@@ -40,7 +47,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                   join: Join, keyRefs: Seq[Seq[Expression]],
                   uniqueConstraints: Seq[Seq[Expression]]) : LogicalPlan = {
     val startTime = System.nanoTime()
-    logWarning("applying rewriting to join: " + agg)
+    debugLog("applying rewriting to join: " + agg)
     // Extract the join items (including any filters, etc.)
     val (items, conditions) = extractInnerJoins(join)
 
@@ -145,14 +152,14 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         .reduce((g1, g2) => g1 ++ g2)
     }
 
-    logWarning("groupAttributes: " + groupAttributes)
-    logWarning("aggregateAttributes: " + aggregateAttributes)
-    logWarning("groupAliasProjections: " + groupAliasProjections)
-    logWarning("groupAliasAttributes: " + groupAliasAttributes)
-    logWarning("aggAliasProjections: " + aggAliasProjections)
-    logWarning("alias map: " + aggAliasMap)
-    logWarning("aggregate exprs with aliases replaced: " + aggregateExpressionsWithAliasesReplaced)
-    logWarning("result exprs with aliases replaced: " + resultExpressionsWithAliasesReplaced)
+    debugLog("groupAttributes: " + groupAttributes)
+    debugLog("aggregateAttributes: " + aggregateAttributes)
+    debugLog("groupAliasProjections: " + groupAliasProjections)
+    debugLog("groupAliasAttributes: " + groupAliasAttributes)
+    debugLog("aggAliasProjections: " + aggAliasProjections)
+    debugLog("alias map: " + aggAliasMap)
+    debugLog("aggregate exprs with aliases replaced: " + aggregateExpressionsWithAliasesReplaced)
+    debugLog("result exprs with aliases replaced: " + resultExpressionsWithAliasesReplaced)
 
     // 0MA queries can be evaluated purely by bottom-up semi joins
     // Currently, they are limited to Min and Max queries
@@ -180,7 +187,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       && countingAggregates.isEmpty
       && sumAggregates.isEmpty
       && averageAggregates.isEmpty) {
-      logWarning("query is not applicable (0MA, counting, percentile, sum)")
+      debugLog("query is not applicable (0MA, counting, percentile, sum)")
       agg
     }
     else {
@@ -188,12 +195,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       val jointree = hg.flatGYO
 
       if (jointree == null) {
-        logWarning("join is cyclic")
-        logWarning("time difference: " + (System.nanoTime() - startTime))
+        debugLog("join is cyclic")
+        debugLog("time difference: " + (System.nanoTime() - startTime))
         agg
       }
       else {
-        logWarning("join tree: \n" + jointree)
+        debugLog("join tree: \n" + jointree)
         // First check if there is a single tree node, i.e., relation that contains all attributes
         // contained in the GROUP BY clause and agg expressions
         val nodeContainingAllAttributes = jointree
@@ -201,8 +208,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         if (nodeContainingAllAttributes == null) {
           // The query is not guarded according to the original definition
           // (one node contains all attributes in the query)
-          logWarning("not guarded! there is no node containing all agg and group attributes")
-          logWarning("time difference: " + (System.nanoTime() - startTime))
+          debugLog("not guarded! there is no node containing all agg and group attributes")
+          debugLog("time difference: " + (System.nanoTime() - startTime))
 
           val nodeContainingGroupAttributes = jointree.findNodeContainingAttributes(groupAttributes)
           var root = jointree
@@ -217,23 +224,30 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             }
           }).reduce((a1, a2) => a1 ++ a2)
 
-          logWarning("unguardedAggAttributes: " + unguardedAggAttributes)
+          debugLog("unguardedAggAttributes: " + unguardedAggAttributes)
 
           var piecewiseGuarded = false
           if (nodeContainingGroupAttributes != null && unguardedAggAttributes.isEmpty) {
             piecewiseGuarded = true
-            logWarning("piecewise-guarded!")
+            debugLog("piecewise-guarded!")
             root = nodeContainingGroupAttributes.reroot
             // Choose the root containing the group attributes, if one exists
             // If none contains all of them, choose any join tree
           }
           else {
             if (!conf.yannakakisUnguardedEnabled) {
-              logWarning("unguarded. plan is not changed")
+              debugLog("unguarded. plan is not changed")
+              return agg
+            }
+            // Check if there are cross-relation filters AND cross-relation product aggregates.
+            // This combination is problematic because the counts computed at early joins
+            // don't account for the cross-relation filter. Fall back to non-optimized execution.
+            if (hg.crossRelationFilters.nonEmpty && unguardedAggAttributes.nonEmpty) {
+              debugLog("unguarded with cross-relation filters. plan is not changed")
               return agg
             }
           }
-          logWarning("applicable query (joins=" + (items.size - 1) + ")")
+          debugLog("applicable query (joins=" + (items.size - 1) + ")")
 
           val (yannakakisJoins, countingAttribute, _, _) =
             root.buildBottomUpJoinsCounting(aggregateAttributes,
@@ -242,11 +256,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               lastAggMap, lastSumMap, nextMultiplicationMap, pendingProductSumSet,
               keyRefs, uniqueConstraints,
               conf.yannakakisCountGroupInLeavesEnabled,
-              usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled)
+              usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
+              crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*))
 
-          logWarning("lastAggMap: " + lastAggMap)
-          logWarning("lastSumMap: " + lastSumMap)
-          logWarning("resultExpressionsWithAliasesReplaced: " +
+          debugLog("lastAggMap: " + lastAggMap)
+          debugLog("lastSumMap: " + lastSumMap)
+          debugLog("resultExpressionsWithAliasesReplaced: " +
             resultExpressionsWithAliasesReplaced)
 
           // Adapt the result expressions to make use of the frequency attribute
@@ -254,10 +269,10 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             expr =>
               expr.transformDown {
                 case ae: AggregateExpression =>
-                  logWarning("aggregate expression: " + ae)
+                  debugLog("aggregate expression: " + ae)
                   val resultAtt = equivalentAggregateExpressions.getExprState(ae).map(_.expr)
                     .getOrElse(ae).asInstanceOf[AggregateExpression].resultAttribute
-                  logWarning("resultAtt: " + resultAtt)
+                  debugLog("resultAtt: " + resultAtt)
                   ae.aggregateFunction match {
                     case a: Count =>
                       // TODO temp change
@@ -321,20 +336,20 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                 }.getOrElse(expression)
             }.asInstanceOf[NamedExpression]
           }
-          logWarning("rewrittenResultExpressions: " + rewrittenResultExpressions)
+          debugLog("rewrittenResultExpressions: " + rewrittenResultExpressions)
 
           val newAgg = Aggregate(groupingExpressions,
             rewrittenResultExpressions,
             Project(yannakakisJoins.output ++ groupAliasProjections, yannakakisJoins))
           val queryClass = if (piecewiseGuarded) "piecewise-guarded" else "unguarded"
           logWarning(f"new aggregate ($queryClass): " + newAgg)
-          logWarning("time difference: " + (System.nanoTime() - startTime))
+          debugLog("time difference: " + (System.nanoTime() - startTime))
           newAgg
         }
         else {
           // The query is guarded
           val root = nodeContainingAllAttributes.reroot
-          logWarning("applicable query (joins=" + (items.size - 1) + ")")
+          debugLog("applicable query (joins=" + (items.size - 1) + ")")
 
           if (countingAggregates.isEmpty
             && percentileAggregates.isEmpty
@@ -346,7 +361,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             val newAgg = Aggregate(groupingExpressions, resultExpressions,
               yannakakisJoins)
             logWarning("new aggregate (0MA): " + newAgg)
-            logWarning("time difference: " + (System.nanoTime() - startTime))
+            debugLog("time difference: " + (System.nanoTime() - startTime))
             newAgg
           }
           else {
@@ -357,7 +372,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                 aggregateExpressions, lastAggMap, lastSumMap, nextMultiplicationMap,
                 pendingProductSumSet, keyRefs, uniqueConstraints,
                 conf.yannakakisCountGroupInLeavesEnabled,
-                usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled)
+                usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
+                crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*))
 
             val rewrittenResultExpressions = resultExpressions.map {
               expr =>
@@ -415,7 +431,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               rewrittenResultExpressions, yannakakisJoins)
 
             logWarning("new aggregate (guarded): " + newAgg)
-            logWarning("time difference: " + (System.nanoTime() - startTime))
+            debugLog("time difference: " + (System.nanoTime() - startTime))
             newAgg
           }
         }
@@ -452,7 +468,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
             join, keyRefs, uniqueConstraints)
         case agg@Aggregate(_, _, _) =>
-          logWarning("not applicable to aggregate: " + agg)
+          debugLog("not applicable to aggregate: " + agg)
           agg
       }
     }
@@ -588,6 +604,11 @@ class HGEdge(val vertices: Set[String], val name: String, val planReference: Log
 }
 class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNode)
   extends Logging {
+  // Helper for debug logging
+  private def dbg(msg: => String): Unit = {
+    if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) logWarning(msg)
+  }
+
   def buildBottomUpJoins: LogicalPlan = {
     val edge = edges.head
     val scanPlan = edge.planReference
@@ -618,7 +639,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                                  pendingProductSumSet: mutable.HashSet[Attribute],
                                  keyRefs: Seq[Seq[Expression]],
                                  uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean,
-                                 usePhysicalCountJoin: Boolean = false):
+                                 usePhysicalCountJoin: Boolean = false,
+                                 crossRelationFilters: mutable.Set[Expression] =
+                                   mutable.Set.empty):
   (LogicalPlan, NamedExpression, Boolean, Boolean) = {
     // scalastyle:on argcount
 
@@ -676,7 +699,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         c.buildBottomUpJoinsCounting(aggregateAttributes,
           groupingExpressions, aggExpressions, lastAggMap, lastSumMap,
           nextMultiplicationMap, pendingProductSumSet, keyRefs, uniqueConstraints,
-          groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin)
+          groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin,
+          crossRelationFilters = crossRelationFilters)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
@@ -692,8 +716,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         (prevPlan, prevCountExpr.toAttribute)
       }
       else {
-        logWarning("prevPlan: " + prevPlan)
-        logWarning("output: " + prevPlan.output)
+        dbg("prevPlan: " + prevPlan)
+        dbg("output: " + prevPlan.output)
         val outputAggregateAttributes = prevPlan.outputSet intersect aggregateAttributes
         val groupAttributes = countGroupLeft ++ outputAggregateAttributes
         val prevChildAttributes = AttributeSet(
@@ -731,19 +755,102 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         }
       }
 
-      val joinConditions = overlappingVertices
+      val equalityConditions = overlappingVertices
         .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
         .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
         .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
+
+      // Check for cross-relation filters that can be applied at this join
+      // A filter is applicable when all its referenced attributes are available
+      val joinOutputSet = leftPlan.outputSet ++ rightPlan.outputSet
+      val applicableFilters = crossRelationFilters.filter(f =>
+        f.references.subsetOf(joinOutputSet))
+      // Remove applied filters so they're not applied again at higher levels
+      crossRelationFilters --= applicableFilters
+
+      val joinConditions = if (applicableFilters.nonEmpty) {
+        dbg(s"Applying cross-relation filters at this join: $applicableFilters")
+        applicableFilters.foldLeft(equalityConditions)((cond, filter) => And(cond, filter))
+      } else {
+        equalityConditions
+      }
 
       // Currently unused (can be used to e.g., force hash/merge joins)
       val joinHint = JoinHint(Option.empty, Option.empty)
 
       val newRightCount = Alias(Literal(1L, LongType), "c")()
 
-      val applicableGroupAttributes = groupingExpressions.filter(
+      var applicableGroupAttributes = groupingExpressions.filter(
         groupExpr => {groupExpr.references.subsetOf(rightPlan.outputSet)}
       )
+
+      // For product aggregates (SUM(A*B) where A and B are from different relations),
+      // we need to carry attributes through the tree until both are available.
+      // Add right-side product attributes to grouping if the product can't be computed yet.
+      val combinedOutputSet = leftPlan.outputSet ++ rightPlan.outputSet
+      aggExpressions.foreach(agg => {
+        agg.aggregateFunction match {
+          case Sum(_, _) =>
+            val aggRefs = agg.references
+            // Check if this is a product aggregate spanning multiple relations
+            val refsOnLeft = aggRefs.filter(a => leftPlan.outputSet.contains(a))
+            val refsOnRight = aggRefs.filter(a => rightPlan.outputSet.contains(a))
+            val isProductAggHere = refsOnLeft.nonEmpty && refsOnRight.nonEmpty &&
+              aggRefs.subsetOf(combinedOutputSet)
+            val refsNotYetAvailable = aggRefs.filter(a => !combinedOutputSet.contains(a))
+
+            if (!isProductAggHere && refsNotYetAvailable.nonEmpty) {
+              // Not all refs available yet - add right-side refs to grouping
+              // to carry them through for a product computed later
+              refsOnRight.foreach(att => {
+                val alreadyGrouped = applicableGroupAttributes.exists(
+                  g => g.references.contains(att))
+                if (!alreadyGrouped) {
+                  val namedAtt = att.asInstanceOf[NamedExpression]
+                  applicableGroupAttributes = applicableGroupAttributes :+ namedAtt
+                  dbg(s"Added $att to grouping for product agg (carry through)")
+                }
+              })
+            } else if (isProductAggHere && !aggRefs.exists(a =>
+                groupingExpressions.exists(g => g.references.contains(a)))) {
+              // Product can be computed here, but refs are NOT in global GROUP BY
+              // We need to add right-side refs to grouping so the product expression
+              // can reference them in the CountJoin aggregate
+              refsOnRight.foreach(att => {
+                val alreadyGrouped = applicableGroupAttributes.exists(
+                  g => g.references.contains(att))
+                if (!alreadyGrouped) {
+                  val namedAtt = att.asInstanceOf[NamedExpression]
+                  applicableGroupAttributes = applicableGroupAttributes :+ namedAtt
+                  dbg(s"Added $att to grouping for product agg (for aggregate)")
+                }
+              })
+            }
+          case _ =>
+        }
+      })
+
+      // For cross-relation filters, we need to carry the referenced attributes through
+      // the tree until all refs are available and the filter can be applied.
+      // Similar to product aggregates, add right-side filter refs to grouping.
+      crossRelationFilters.foreach(filter => {
+        val filterRefs = filter.references
+        val refsOnRight = filterRefs.filter(a => rightPlan.outputSet.contains(a))
+        val refsNotYetAvailable = filterRefs.filter(a => !combinedOutputSet.contains(a))
+
+        // If not all refs are available yet, carry the right-side refs through
+        if (refsNotYetAvailable.nonEmpty) {
+          refsOnRight.foreach(att => {
+            val alreadyGrouped = applicableGroupAttributes.exists(
+              g => g.references.contains(att))
+            if (!alreadyGrouped) {
+              val namedAtt = att.asInstanceOf[NamedExpression]
+              applicableGroupAttributes = applicableGroupAttributes :+ namedAtt
+              dbg(s"Added $att to grouping for cross-relation filter (carry through)")
+            }
+          })
+        }
+      })
 
       val join = if (usePhysicalCountJoin) {
         var applicableAggExpressions = {
@@ -771,9 +878,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         }
 
         def sumOrCountCase(agg: AggregateExpression) = {
-          logWarning("sumOrCountCase")
+          dbg("sumOrCountCase")
           if (lastSumMap.contains(agg.resultAttribute)) {
-            logWarning("lastSumMap contains " + agg.resultAttribute)
+            dbg("lastSumMap contains " + agg.resultAttribute)
             val lastSumAtt = lastSumMap(agg.resultAttribute)
 
             if (rightPlan.outputSet.contains(lastSumAtt)) {
@@ -803,7 +910,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // If this was a pending product, it's now been SUMmed - no longer pending
               if (isPendingProduct) {
                 pendingProductSumSet.remove(agg.resultAttribute)
-                logWarning(s"SUMmed pending product on right: $lastSumAtt")
+                dbg(s"SUMmed pending product on right: $lastSumAtt")
               }
             }
 
@@ -838,7 +945,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 multiplySumExpressions = multiplySumExpressions :+ newSum
                 lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
                 // Keep it as pending - it still needs final aggregation
-                logWarning(s"Propagating pending product on left: $lastSumAtt")
+                dbg(s"Propagating pending product on left: $lastSumAtt")
               }
               else {
                 // Already aggregated sum - just multiply by right count
@@ -859,11 +966,11 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             }
           }
           else {
-            logWarning("lastSumMap does not contain " + agg.resultAttribute)
+            dbg("lastSumMap does not contain " + agg.resultAttribute)
             // SUM/COUNT aggregate has not yet occurred somewhere in the tree -
             // check if it starts here
             if (agg.references.subsetOf(rightPlan.outputSet)) {
-              logWarning("agg.references.subsetOf(rightPlan.outputSet)")
+              dbg("agg.references.subsetOf(rightPlan.outputSet)")
 
               // logWarning("is subset")
               //         |
@@ -903,36 +1010,37 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             }
             // Check if the aggregate references span both left and right plans
             // This handles SUM(A*B) where A is from left and B is from right
+            // Also handles SUM(A*B*C) where attributes come from 3+ relations
+            // Important: ALL refs must be available now (subsetOf check)
             else if (agg.references.subsetOf(leftPlan.outputSet ++ rightPlan.outputSet)
               && agg.references.exists(a => leftPlan.outputSet.contains(a))
               && agg.references.exists(a => rightPlan.outputSet.contains(a))) {
-              logWarning("agg.references span both left and right plans (product aggregate)")
 
-              logWarning(s"isLeafNode: $isLeafNode, rightPlanIsLeaf: $rightPlanIsLeaf")
-              logWarning(s"leftCount: $leftCountAttribute, rightCount: $rightCountAttribute")
-              logWarning(s"applicableGroupAttributes: $applicableGroupAttributes")
+              val refsOnLeft = agg.references.filter(a => leftPlan.outputSet.contains(a))
+              val refsOnRight = agg.references.filter(a => rightPlan.outputSet.contains(a))
 
-              // Check if any product refs from right side are grouped at THIS join
-              val rightRefs = agg.references.filter(a => rightPlan.outputSet.contains(a))
-              val rightRefsGroupedHere = rightRefs.exists(a =>
+              dbg("agg.references span both left and right plans (product aggregate)")
+              dbg(s"refsOnLeft: $refsOnLeft, refsOnRight: $refsOnRight")
+
+              dbg(s"isLeafNode: $isLeafNode, rightPlanIsLeaf: $rightPlanIsLeaf")
+              dbg(s"leftCount: $leftCountAttribute, rightCount: $rightCountAttribute")
+              dbg(s"applicableGroupAttributes: $applicableGroupAttributes")
+
+              // Check if right-side product attributes are grouped at THIS join
+              val rightRefsGroupedHere = refsOnRight.exists(a =>
                 applicableGroupAttributes.exists(g => g.references.contains(a)))
-              logWarning(s"rightRefsGroupedHere: $rightRefsGroupedHere")
+
+              dbg(s"rightRefsGroupedHere: $rightRefsGroupedHere")
 
               // Extract the inner expression of the Sum (e.g., role_id * info_type_id)
               val sumChild = agg.aggregateFunction.children.head
 
-              // Build the product expression: A*B * leftCount * rightCount
-              // Each row in the join output represents leftCount * rightCount combinations
+              // Use pending product approach - attributes are carried via grouping
+              // (either from global GROUP BY or added dynamically for product aggs)
               var productExpr: Expression = sumChild
 
-              // For the right count:
-              // - If right is grouped at this join, use the SUM(rightCount) from CountJoin
-              // - Otherwise use the raw rightCount
-              // Note: We'll add an aggregate expression to get the summed count
               if (!rightPlanIsLeaf) {
                 if (rightRefsGroupedHere) {
-                  // When right side is grouped, we need SUM(rightCount) which the
-                  // CountJoin will compute. Add it to applicableAggExpressions.
                   val sumRightCountAgg = Sum(rightCountAttribute).toAggregateExpression()
                   applicableAggExpressions = applicableAggExpressions :+ sumRightCountAgg
                   productExpr = createMultiplication(productExpr,
@@ -942,7 +1050,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 }
               }
 
-              // Multiply by left count if left is not a leaf
               if (!isLeafNode && leftPlan.outputSet.contains(leftCountAttribute)) {
                 productExpr = createMultiplication(productExpr, leftCountAttribute)
               }
@@ -950,18 +1057,16 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               val productAlias = Alias(productExpr, "sum")()
               multiplySumExpressions = multiplySumExpressions :+ productAlias
 
-              // Track in lastSumMap so subsequent joins will multiply by counts
               lastSumMap.put(agg.resultAttribute, productAlias.toAttribute)
-              // Mark as pending product - this is a per-row value, not an aggregated sum
               pendingProductSumSet.add(agg.resultAttribute)
-              logWarning(s"Added pending product for ${agg.resultAttribute}: $productExpr")
+              dbg(s"Added pending product: $productExpr")
             }
           }
         }
 
-        logWarning("lastAggMap: " + lastAggMap)
+        dbg("lastAggMap: " + lastAggMap)
         aggExpressions.foreach(agg => {
-          logWarning("aggExpression: " + agg)
+          dbg("aggExpression: " + agg)
           agg.aggregateFunction match {
             case Sum(_, _) =>
               sumOrCountCase(agg)
@@ -998,18 +1103,18 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               }
           }
         })
-        logWarning("lastAggMap: " + lastAggMap)
+        dbg("lastAggMap: " + lastAggMap)
 
         val right = rightPlan
 
-        logWarning("leftPlan.output: " + leftPlan.output)
-        logWarning("applicableAggExpressions: " + applicableAggExpressions)
-        logWarning("applicableGroupAttributes: " + applicableGroupAttributes)
-        logWarning("isLeafNode: " + isLeafNode + ", rightPlanIsLeaf: " + rightPlanIsLeaf)
-        logWarning("prevCountExpr: " + prevCountExpr)
-        logWarning("leftCountAttribute: " + leftCountAttribute)
-        logWarning("newRightCount: " + newRightCount)
-        logWarning("rightCountAttribute: " + rightCountAttribute)
+        dbg("leftPlan.output: " + leftPlan.output)
+        dbg("applicableAggExpressions: " + applicableAggExpressions)
+        dbg("applicableGroupAttributes: " + applicableGroupAttributes)
+        dbg("isLeafNode: " + isLeafNode + ", rightPlanIsLeaf: " + rightPlanIsLeaf)
+        dbg("prevCountExpr: " + prevCountExpr)
+        dbg("leftCountAttribute: " + leftCountAttribute)
+        dbg("newRightCount: " + newRightCount)
+        dbg("rightCountAttribute: " + rightCountAttribute)
         val countJoin = // if (applicableGroupAttributes.isEmpty) {
           // No grouping
           CountJoin(leftPlan, right,
@@ -1031,7 +1136,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 //            Join(leftPlan, right, Inner, Option(joinConditions), joinHint)
 //          }
 //        }
-        logWarning("countJoin: " + countJoin)
+        dbg("countJoin: " + countJoin)
 
         if (multiplySumExpressions.isEmpty) {
           countJoin
@@ -1059,7 +1164,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             Cast(leftCountAttribute, rightCountAttribute.dataType),
             rightCountAttribute), "c")()
         }
-      logWarning("finalCountExpr: " + finalCountExpr)
+      dbg("finalCountExpr: " + finalCountExpr)
 //      logWarning("join output: " + join.output)
       val finalProjection = join
 
@@ -1082,7 +1187,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val root = newCurrent
       while (current.parent != null) {
         val p = current.parent
-        logWarning("p: " + p)
+        dbg("p: " + p)
         val newChild = p.copy(newChildren = p.children - current, newParent = null)
 //        logWarning("new child: " + newChild)
         newCurrent.children += newChild
@@ -1136,8 +1241,14 @@ class Hypergraph (private val items: Seq[LogicalPlan],
 
   private var equivalenceClasses: Set[Set[Attribute]] = Set.empty
 
+  // Track non-equality conditions that span multiple relations (cross-relation filters)
+  // These need to be applied at the appropriate join point
+  var crossRelationFilters: Seq[Expression] = Seq.empty
+
   for (cond <- conditions) {
-    // logWarning("condition: " + cond)
+    if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) {
+      logWarning("condition: " + cond + ", refs: " + cond.references)
+    }
     cond match {
       case EqualTo(lhs, rhs) =>
         // logWarning("equality condition: " + lhs.references + " , " + rhs.references)
@@ -1145,8 +1256,21 @@ class Hypergraph (private val items: Seq[LogicalPlan],
         val rAtt = rhs.references.head
         equivalenceClasses += Set(lAtt, rAtt)
       case other =>
-//        logWarning("other")
+        // Non-equality conditions that reference multiple attributes from different relations
+        // need to be tracked and applied at the appropriate join point
+        if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) {
+          logWarning(s"Non-equality condition: $other, refs size: ${other.references.size}")
+        }
+        if (other.references.size > 1) {
+          crossRelationFilters = crossRelationFilters :+ other
+          if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) {
+            logWarning(s"Added cross-relation filter: $other")
+          }
+        }
     }
+  }
+  if (RewriteJoinsAsSemijoins.DEBUG_LOGGING && crossRelationFilters.nonEmpty) {
+    logWarning(s"Total cross-relation filters: $crossRelationFilters")
   }
 
   // Compute the equivalence classes

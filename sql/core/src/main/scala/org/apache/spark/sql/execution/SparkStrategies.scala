@@ -562,16 +562,10 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
             }
 
             def createCountJoinWithoutHint() = {
-              if (aggsRight.nonEmpty) {
-                createSortMergeCountJoin().get
-                // temp fix because there is a bug in the count hash join with grouping
-              }
-              else {
-                createBroadcastHashCountJoin(false)
-                  .orElse(createShuffleHashCountJoin(false))
-                  .orElse(createSortMergeCountJoin())
-                  .get
-              }
+              createBroadcastHashCountJoin(false)
+                .orElse(createShuffleHashCountJoin(false))
+                .orElse(createSortMergeCountJoin())
+                .get
             }
 
             if (hint.isEmpty) {
