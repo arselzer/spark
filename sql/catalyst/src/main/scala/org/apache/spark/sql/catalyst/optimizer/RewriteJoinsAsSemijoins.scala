@@ -903,6 +903,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //      /   \
               //    Y(c)      Z(a)
               //
+              val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
+
               // SUM then multiply by left count
               val newAgg = Sum(lastSumAtt).toAggregateExpression()
               applicableAggExpressions = applicableAggExpressions :+ newAgg
@@ -917,6 +919,12 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               else {
                 lastSumMap.put(agg.resultAttribute, newAgg.resultAttribute)
               }
+
+              // If this was a pending product, it's now been SUMmed - no longer pending
+              if (isPendingProduct) {
+                pendingProductSumSet.remove(agg.resultAttribute)
+                dbg(s"SUMmed pending product on right: $lastSumAtt")
+              }
             }
 
             if (leftPlan.outputSet.contains(lastSumAtt)) {
@@ -927,20 +935,40 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //      /     \
               //    Y(a,c)     Z(c)
 
-              // Already aggregated sum - just multiply by right count
-              val countRightAgg = if (rightPlanIsLeaf) {
-                Count(Literal(1L)).toAggregateExpression()
-              }
-              else {
-                Sum(rightCountAttribute).toAggregateExpression()
-              }
-              applicableAggExpressions = applicableAggExpressions :+ countRightAgg
+              val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
 
-              val newSum = Alias(createMultiplication(lastSumAtt,
-                countRightAgg.resultAttribute), "sum")()
+              if (isPendingProduct) {
+                // Pending product on left side - multiply by right count
+                val countRightAgg = if (rightPlanIsLeaf) {
+                  Count(Literal(1L)).toAggregateExpression()
+                } else {
+                  Sum(rightCountAttribute).toAggregateExpression()
+                }
+                applicableAggExpressions = applicableAggExpressions :+ countRightAgg
 
-              multiplySumExpressions = multiplySumExpressions :+ newSum
-              lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
+                val newSum = Alias(createMultiplication(lastSumAtt,
+                  countRightAgg.resultAttribute), "sum")()
+
+                multiplySumExpressions = multiplySumExpressions :+ newSum
+                lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
+                dbg(s"Pending product propagating on left: $lastSumAtt")
+                // Keep it as pending - it still needs final aggregation
+              } else {
+                // Already aggregated sum - just multiply by right count
+                val countRightAgg = if (rightPlanIsLeaf) {
+                  Count(Literal(1L)).toAggregateExpression()
+                }
+                else {
+                  Sum(rightCountAttribute).toAggregateExpression()
+                }
+                applicableAggExpressions = applicableAggExpressions :+ countRightAgg
+
+                val newSum = Alias(createMultiplication(lastSumAtt,
+                  countRightAgg.resultAttribute), "sum")()
+
+                multiplySumExpressions = multiplySumExpressions :+ newSum
+                lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
+              }
             }
           }
           else {
@@ -986,16 +1014,67 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 lastSumMap.put(agg.resultAttribute, newAgg.resultAttribute)
               }
             }
-            // Product aggregates (SUM(A*B) etc.) are now handled at the final aggregate.
-            // The attributes are carried through via grouping (lines 814-840).
-            // We don't create pending product expressions here - just let the
-            // attributes flow through and compute the product at the end.
-            // This simplifies the logic and avoids grouping interference issues.
+            // Check if the aggregate references span both left and right plans
+            // This handles SUM(A*B) where A is from left and B is from right
             else if (agg.references.subsetOf(leftPlan.outputSet ++ rightPlan.outputSet)
               && agg.references.exists(a => leftPlan.outputSet.contains(a))
               && agg.references.exists(a => rightPlan.outputSet.contains(a))) {
-              dbg(s"Product aggregate ${agg} - deferring to final aggregate")
-              // Don't add to lastSumMap - will be handled at final aggregate
+
+              val refsOnLeft = agg.references.filter(a => leftPlan.outputSet.contains(a))
+              val refsOnRight = agg.references.filter(a => rightPlan.outputSet.contains(a))
+
+              dbg("agg.references span both left and right plans (product aggregate)")
+              dbg(s"refsOnLeft: $refsOnLeft, refsOnRight: $refsOnRight")
+
+              // Count how many attributes are in the product (excluding count attributes)
+              // 2-attribute products can be computed early
+              // 3+ attribute products are deferred to avoid grouping interference
+              val productAttrs = agg.references.filter(a =>
+                !a.name.startsWith("c#") && a.name != "c")
+              val numProductAttrs = productAttrs.size
+
+              dbg(s"Product has $numProductAttrs attributes: $productAttrs")
+
+              if (numProductAttrs <= 2) {
+                // 2-attribute product: compute early at this join
+                dbg(s"Computing 2-attr product early: ${agg}")
+
+                // Extract the inner expression of the Sum (e.g., role_id * info_type_id)
+                val sumChild = agg.aggregateFunction.children.head
+
+                // Check if right-side product attributes are grouped at THIS join
+                val rightRefsGroupedHere = refsOnRight.exists(a =>
+                  applicableGroupAttributes.exists(g => g.references.contains(a)))
+
+                var productExpr: Expression = sumChild
+
+                if (!rightPlanIsLeaf) {
+                  if (rightRefsGroupedHere) {
+                    val sumRightCountAgg = Sum(rightCountAttribute).toAggregateExpression()
+                    applicableAggExpressions = applicableAggExpressions :+ sumRightCountAgg
+                    productExpr = createMultiplication(productExpr,
+                      sumRightCountAgg.resultAttribute)
+                  } else {
+                    productExpr = createMultiplication(productExpr, rightCountAttribute)
+                  }
+                }
+
+                if (!isLeafNode && leftPlan.outputSet.contains(leftCountAttribute)) {
+                  productExpr = createMultiplication(productExpr, leftCountAttribute)
+                }
+
+                val productAlias = Alias(productExpr, "sum")()
+                multiplySumExpressions = multiplySumExpressions :+ productAlias
+
+                lastSumMap.put(agg.resultAttribute, productAlias.toAttribute)
+                pendingProductSumSet.add(agg.resultAttribute)
+                pendingProductGrouping.put(agg.resultAttribute, applicableGroupAttributes.toSeq)
+                dbg(s"Added pending 2-attr product: $productExpr")
+              } else {
+                // 3+ attribute product: defer to final aggregate
+                dbg(s"Deferring 3+ attr product to final aggregate: ${agg}")
+                // Don't add to lastSumMap - will be handled at final aggregate
+              }
             }
           }
         }
