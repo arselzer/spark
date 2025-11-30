@@ -2620,6 +2620,13 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val YANNAKAKIS_DEFER_PRODUCTS_ENABLED =
+    buildConf("spark.sql.yannakakis.deferProductsEnabled")
+      .doc("Defer all product aggregates to final aggregate instead of computing early")
+      .version("2.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
       .doc("Enables CBO for estimation of plan statistics when set true.")
@@ -4918,6 +4925,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def yannakakisUnguardedEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_UNGUARDED_ENABLED)
+
+  def yannakakisDeferProductsEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_DEFER_PRODUCTS_ENABLED)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 

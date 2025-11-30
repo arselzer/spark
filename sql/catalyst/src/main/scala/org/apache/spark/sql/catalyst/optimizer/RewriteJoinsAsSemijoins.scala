@@ -27,6 +27,7 @@ import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DecimalType.DoubleDecimal
 
@@ -905,6 +906,20 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //
               val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
 
+              // Check if current grouping differs from when product was created
+              // This affects how we handle the multiplication by leftCount
+              val originalGrouping = if (isPendingProduct) {
+                pendingProductGrouping.getOrElse(agg.resultAttribute, Seq.empty)
+              } else Seq.empty
+              val originalGroupingSet = originalGrouping.flatMap(_.references).toSet
+              val currentGroupingSet = applicableGroupAttributes.flatMap(_.references).toSet
+              val hasExtraGrouping = isPendingProduct &&
+                (currentGroupingSet != originalGroupingSet)
+
+              dbg(s"RIGHT propagation: agg=$agg isPending=$isPendingProduct")
+              dbg(s"  originalGrouping=$originalGroupingSet currentGrouping=$currentGroupingSet")
+              dbg(s"  hasExtraGrouping=$hasExtraGrouping")
+
               // SUM then multiply by left count
               val newAgg = Sum(lastSumAtt).toAggregateExpression()
               applicableAggExpressions = applicableAggExpressions :+ newAgg
@@ -920,10 +935,17 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 lastSumMap.put(agg.resultAttribute, newAgg.resultAttribute)
               }
 
-              // If this was a pending product, it's now been SUMmed - no longer pending
+              // If this was a pending product with extra grouping, keep it pending
+              // so the final SUM aggregates the per-group values correctly.
+              // If no extra grouping, it's been fully SUMmed and is no longer pending.
               if (isPendingProduct) {
-                pendingProductSumSet.remove(agg.resultAttribute)
-                dbg(s"SUMmed pending product on right: $lastSumAtt")
+                if (hasExtraGrouping) {
+                  dbg(s"Pending product (extra grouping) on right, keeping pending: $lastSumAtt")
+                  // Don't remove from pendingProductSumSet - final SUM will aggregate
+                } else {
+                  pendingProductSumSet.remove(agg.resultAttribute)
+                  dbg(s"SUMmed pending product on right: $lastSumAtt")
+                }
               }
             }
 
@@ -937,22 +959,59 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
               val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
 
+              // Check if current grouping is compatible with when product was created
+              // For safe propagation, current grouping must be a SUPERSET of original grouping.
+              // - If superset: counts are per finer groups, summing still works
+              // - If NOT superset: counts are grouped by DIFFERENT attributes, math breaks
+              val originalGrouping = if (isPendingProduct) {
+                pendingProductGrouping.getOrElse(agg.resultAttribute, Seq.empty)
+              } else Seq.empty
+              val originalGroupingSet = originalGrouping.flatMap(_.references).toSet
+              val currentGroupingSet = applicableGroupAttributes.flatMap(_.references).toSet
+              // hasIncompatibleGrouping: current grouping has DIFFERENT attrs than original.
+              // - If currentGrouping is empty: compatible (total count, no splitting)
+              // - If currentGrouping is superset of original: compatible (finer grouping)
+              // - If currentGrouping has different attrs: INCOMPATIBLE
+              val hasIncompatibleGrouping = isPendingProduct &&
+                currentGroupingSet.nonEmpty &&
+                !originalGroupingSet.subsetOf(currentGroupingSet)
+
+              dbg(s"LEFT propagation: agg=$agg isPending=$isPendingProduct")
+              dbg(s"  originalGrouping=$originalGroupingSet currentGrouping=$currentGroupingSet")
+              dbg(s"  hasIncompatibleGrouping=$hasIncompatibleGrouping")
+
               if (isPendingProduct) {
-                // Pending product on left side - multiply by right count
-                val countRightAgg = if (rightPlanIsLeaf) {
-                  Count(Literal(1L)).toAggregateExpression()
+                if (hasIncompatibleGrouping) {
+                  // Current grouping is incompatible (doesn't contain original grouping).
+                  // Counts are grouped by DIFFERENT attrs than the product was computed with.
+                  // E.g., product per (role_id, imdb_id) but counts per (company_type_id).
+                  // We CANNOT safely multiply product * count - they don't align.
+                  //
+                  // Strategy: REMOVE from lastSumMap so the final aggregate will treat
+                  // this as a raw expression and multiply by final count:
+                  // SUM(product * final_count).
+                  dbg(s"Pending product (incompatible grouping) removing: $lastSumAtt")
+                  dbg(s"  Will defer to final aggregate with count multiplication")
+                  lastSumMap.remove(agg.resultAttribute)
+                  pendingProductSumSet.remove(agg.resultAttribute)
+                  pendingProductGrouping.remove(agg.resultAttribute)
                 } else {
-                  Sum(rightCountAttribute).toAggregateExpression()
+                  // No extra grouping - normal propagation
+                  val countRightAgg = if (rightPlanIsLeaf) {
+                    Count(Literal(1L)).toAggregateExpression()
+                  } else {
+                    Sum(rightCountAttribute).toAggregateExpression()
+                  }
+                  applicableAggExpressions = applicableAggExpressions :+ countRightAgg
+
+                  val newSum = Alias(createMultiplication(lastSumAtt,
+                    countRightAgg.resultAttribute), "sum")()
+
+                  multiplySumExpressions = multiplySumExpressions :+ newSum
+                  lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
+                  dbg(s"Pending product propagating on left: $lastSumAtt")
+                  // Keep it as pending - it still needs final aggregation
                 }
-                applicableAggExpressions = applicableAggExpressions :+ countRightAgg
-
-                val newSum = Alias(createMultiplication(lastSumAtt,
-                  countRightAgg.resultAttribute), "sum")()
-
-                multiplySumExpressions = multiplySumExpressions :+ newSum
-                lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
-                dbg(s"Pending product propagating on left: $lastSumAtt")
-                // Keep it as pending - it still needs final aggregation
               } else {
                 // Already aggregated sum - just multiply by right count
                 val countRightAgg = if (rightPlanIsLeaf) {
@@ -1035,7 +1094,21 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
               dbg(s"Product has $numProductAttrs attributes: $productAttrs")
 
-              if (numProductAttrs <= 2) {
+              // Products can be computed early if the grouping is ONLY for this product's attrs.
+              // If there's "foreign" grouping (attrs for OTHER products), the counts become
+              // incompatible and we need to handle it during propagation.
+              //
+              // But we CAN still compute early - the propagation logic will detect
+              // incompatible grouping and defer multiplication appropriately.
+              //
+              // The only case to avoid: right-side attr NOT in grouping (uncovered) which
+              // means the attr varies within groups causing incorrect products.
+              val rightAttrsNotInGrouping = refsOnRight.filterNot(a =>
+                applicableGroupAttributes.exists(g => g.references.contains(a)))
+              val hasUncoveredRightAttr = rightAttrsNotInGrouping.nonEmpty
+
+              if (!SQLConf.get.yannakakisDeferProductsEnabled && numProductAttrs <= 2
+                && !hasUncoveredRightAttr) {
                 // 2-attribute product: compute early at this join
                 dbg(s"Computing 2-attr product early: ${agg}")
 
@@ -1048,17 +1121,21 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
                 var productExpr: Expression = sumChild
 
+                // Multiply by right count (handling grouping appropriately)
                 if (!rightPlanIsLeaf) {
                   if (rightRefsGroupedHere) {
+                    // Right attrs are grouped: use SUM(rightCount) to aggregate
                     val sumRightCountAgg = Sum(rightCountAttribute).toAggregateExpression()
                     applicableAggExpressions = applicableAggExpressions :+ sumRightCountAgg
                     productExpr = createMultiplication(productExpr,
                       sumRightCountAgg.resultAttribute)
                   } else {
+                    // Right attrs not grouped: use rightCount directly
                     productExpr = createMultiplication(productExpr, rightCountAttribute)
                   }
                 }
 
+                // Multiply by left count if the left plan has accumulated counts
                 if (!isLeafNode && leftPlan.outputSet.contains(leftCountAttribute)) {
                   productExpr = createMultiplication(productExpr, leftCountAttribute)
                 }
@@ -1071,8 +1148,12 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 pendingProductGrouping.put(agg.resultAttribute, applicableGroupAttributes.toSeq)
                 dbg(s"Added pending 2-attr product: $productExpr")
               } else {
-                // 3+ attribute product: defer to final aggregate
-                dbg(s"Deferring 3+ attr product to final aggregate: ${agg}")
+                // Defer to final aggregate: either 3+ attrs or uncovered right attr
+                if (hasUncoveredRightAttr) {
+                  dbg(s"Deferring product (uncovered right attr: $rightAttrsNotInGrouping): ${agg}")
+                } else {
+                  dbg(s"Deferring 3+ attr product to final aggregate: ${agg}")
+                }
                 // Don't add to lastSumMap - will be handled at final aggregate
               }
             }
