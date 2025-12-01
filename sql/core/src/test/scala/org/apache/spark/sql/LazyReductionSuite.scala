@@ -1208,4 +1208,288 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     }
     // scalastyle:on println
   }
+
+  /**
+   * Test 5-way linear join chain with products from different table pairs.
+   * This tests that products are computed as early as possible in the join tree.
+   *
+   * Join pattern: A -- B -- C -- D -- E (linear chain)
+   * Products: SUM(A.val * B.val) and SUM(D.val * E.val)
+   *
+   * The A*B product should be computed at the A-B join.
+   * The D*E product should be computed at the D-E join.
+   * These should NOT wait until all joins are complete.
+   */
+  test("5-way linear join with products at different positions") {
+    val tableA = Seq(
+      (1, 10),
+      (2, 20)
+    ).toDF("id", "a_val")
+
+    val tableB = Seq(
+      (1, 100),
+      (2, 200)
+    ).toDF("a_id", "b_val")
+
+    val tableC = Seq(
+      (1, 1000),
+      (2, 2000)
+    ).toDF("b_id", "c_val")
+
+    val tableD = Seq(
+      (1, 3),
+      (2, 4)
+    ).toDF("c_id", "d_val")
+
+    val tableE = Seq(
+      (1, 5),
+      (2, 6)
+    ).toDF("d_id", "e_val")
+
+    tableA.createOrReplaceTempView("tableA")
+    tableB.createOrReplaceTempView("tableB")
+    tableC.createOrReplaceTempView("tableC")
+    tableD.createOrReplaceTempView("tableD")
+    tableE.createOrReplaceTempView("tableE")
+
+    val query = """
+      SELECT SUM(tableA.a_val * tableB.b_val) AS ab_product,
+             SUM(tableD.d_val * tableE.e_val) AS de_product
+      FROM tableA
+      JOIN tableB ON tableA.id = tableB.a_id
+      JOIN tableC ON tableB.a_id = tableC.b_id
+      JOIN tableD ON tableC.b_id = tableD.c_id
+      JOIN tableE ON tableD.c_id = tableE.d_id
+    """
+
+    // Expected:
+    // Row 1: A.val=10, B.val=100, D.val=3, E.val=5 -> A*B=1000, D*E=15
+    // Row 2: A.val=20, B.val=200, D.val=4, E.val=6 -> A*B=4000, D*E=24
+    // SUM(A*B) = 1000 + 4000 = 5000
+    // SUM(D*E) = 15 + 24 = 39
+    val expectedResult = Row(5000L, 39L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      println("\n=== BASELINE - 5-way linear join ===")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+    ) {
+      println("\n=== YANNAKAKIS (lazy OFF) - 5-way linear join ===")
+      val df = sql(query)
+      df.explain(true)
+      checkAnswer(df, expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+    ) {
+      println("\n=== YANNAKAKIS (lazy ON) - 5-way linear join ===")
+      val df = sql(query)
+      df.explain(true)
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  /**
+   * Test star schema join pattern with a central fact table joined to multiple dimensions.
+   * This is common in data warehouse queries.
+   *
+   * Join pattern:
+   *        dim1
+   *          \
+   *   dim2 -- fact -- dim3
+   *          /
+   *        dim4
+   *
+   * Product: SUM(fact.amount * dim1.multiplier * dim3.weight)
+   */
+  test("star schema join with multi-table product") {
+    val fact = Seq(
+      (1, 1, 1, 1, 100),  // dim1_id=1, dim2_id=1, dim3_id=1, dim4_id=1, amount=100
+      (1, 2, 1, 2, 200),
+      (2, 1, 2, 1, 300)
+    ).toDF("dim1_id", "dim2_id", "dim3_id", "dim4_id", "amount")
+
+    val dim1 = Seq(
+      (1, 2),   // id=1, multiplier=2
+      (2, 3)    // id=2, multiplier=3
+    ).toDF("id", "multiplier")
+
+    val dim2 = Seq(
+      (1, "A"),
+      (2, "B")
+    ).toDF("id", "name")
+
+    val dim3 = Seq(
+      (1, 10),  // id=1, weight=10
+      (2, 20)   // id=2, weight=20
+    ).toDF("id", "weight")
+
+    val dim4 = Seq(
+      (1, "X"),
+      (2, "Y")
+    ).toDF("id", "category")
+
+    fact.createOrReplaceTempView("fact")
+    dim1.createOrReplaceTempView("dim1")
+    dim2.createOrReplaceTempView("dim2")
+    dim3.createOrReplaceTempView("dim3")
+    dim4.createOrReplaceTempView("dim4")
+
+    val query = """
+      SELECT SUM(fact.amount * dim1.multiplier * dim3.weight) AS weighted_sum
+      FROM fact
+      JOIN dim1 ON fact.dim1_id = dim1.id
+      JOIN dim2 ON fact.dim2_id = dim2.id
+      JOIN dim3 ON fact.dim3_id = dim3.id
+      JOIN dim4 ON fact.dim4_id = dim4.id
+    """
+
+    // Expected:
+    // Row 1: amount=100, multiplier=2, weight=10 -> 100*2*10 = 2000
+    // Row 2: amount=200, multiplier=2, weight=10 -> 200*2*10 = 4000
+    // Row 3: amount=300, multiplier=3, weight=20 -> 300*3*20 = 18000
+    // SUM = 2000 + 4000 + 18000 = 24000
+    val expectedResult = Row(24000L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      println("\n=== BASELINE - star schema join ===")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+    ) {
+      println("\n=== YANNAKAKIS (lazy OFF) - star schema join ===")
+      val df = sql(query)
+      df.explain(true)
+      checkAnswer(df, expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+    ) {
+      println("\n=== YANNAKAKIS (lazy ON) - star schema join ===")
+      val df = sql(query)
+      df.explain(true)
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  /**
+   * Test with high fan-out at multiple join levels to stress test
+   * early multiplication correctness.
+   *
+   * Each table has multiple matching rows, creating exponential row growth.
+   * Products must be computed correctly despite the fan-out.
+   */
+  test("cascading fan-out with multiple products") {
+    // Central table
+    val central = Seq(
+      (1, 10),
+      (2, 20)
+    ).toDF("id", "c_val")
+
+    // Each table has 3 rows per central id (creating 3x fan-out each)
+    val left1 = Seq(
+      (1, 1), (1, 2), (1, 3),
+      (2, 4), (2, 5), (2, 6)
+    ).toDF("c_id", "l1_val")
+
+    val left2 = Seq(
+      (1, 10), (1, 20),
+      (2, 30), (2, 40)
+    ).toDF("c_id", "l2_val")
+
+    val right1 = Seq(
+      (1, 100), (1, 200),
+      (2, 300), (2, 400)
+    ).toDF("c_id", "r1_val")
+
+    central.createOrReplaceTempView("central")
+    left1.createOrReplaceTempView("left1")
+    left2.createOrReplaceTempView("left2")
+    right1.createOrReplaceTempView("right1")
+
+    val query = """
+      SELECT SUM(central.c_val * left1.l1_val) AS product1,
+             SUM(left2.l2_val * right1.r1_val) AS product2,
+             COUNT(*) AS row_count
+      FROM central
+      JOIN left1 ON central.id = left1.c_id
+      JOIN left2 ON central.id = left2.c_id
+      JOIN right1 ON central.id = right1.c_id
+    """
+
+    // Fan-out calculation:
+    // central id=1: 3 left1 * 2 left2 * 2 right1 = 12 rows
+    // central id=2: 3 left1 * 2 left2 * 2 right1 = 12 rows
+    // Total: 24 rows
+
+    // product1 = SUM(c_val * l1_val):
+    //   id=1: c_val=10, l1_val in {1,2,3}, repeated 4 times (2 left2 * 2 right1)
+    //         = 4*(10*1 + 10*2 + 10*3) = 4*60 = 240
+    //   id=2: c_val=20, l1_val in {4,5,6}, repeated 4 times
+    //         = 4*(20*4 + 20*5 + 20*6) = 4*300 = 1200
+    //   Total: 240 + 1200 = 1440
+
+    // product2 = SUM(l2_val * r1_val):
+    //   id=1: l2_val in {10,20}, r1_val in {100,200}, each combo repeated 3 times (left1)
+    //         = 3*(10*100 + 10*200 + 20*100 + 20*200) = 3*7000 = 21000
+    //   id=2: l2_val in {30,40}, r1_val in {300,400}, each combo repeated 3 times
+    //         = 3*(30*300 + 30*400 + 40*300 + 40*400) = 3*51000 = 153000
+    //   Total: 21000 + 153000 = 174000
+
+    val expectedResult = Row(1440L, 174000L, 24L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      println("\n=== BASELINE - cascading fan-out ===")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+    ) {
+      println("\n=== YANNAKAKIS (lazy OFF) - cascading fan-out ===")
+      val df = sql(query)
+      df.explain(true)
+      checkAnswer(df, expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+    ) {
+      println("\n=== YANNAKAKIS (lazy ON) - cascading fan-out ===")
+      val df = sql(query)
+      df.explain(true)
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
 }

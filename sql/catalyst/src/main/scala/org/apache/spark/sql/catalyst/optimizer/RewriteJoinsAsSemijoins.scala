@@ -73,9 +73,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     // Track which lastSumMap entries are raw product expressions (not yet aggregated)
     // These need to be SUMmed at the next join, unlike already-aggregated values
     val pendingProductSumSet = new mutable.HashSet[Attribute]()
-    // Track the grouping attributes each pending product was created with.
-    // When propagating, we need to ensure count aggregations respect this grouping.
-    val pendingProductGrouping = new mutable.HashMap[Attribute, Seq[NamedExpression]]()
     // Track products that need reduction (lazy reduction mode).
     // Maps product resultAttribute -> grouping attributes to reduce over.
     // These products had incompatible grouping but were preserved instead of deferred.
@@ -257,12 +254,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }
           debugLog("applicable query (joins=" + (items.size - 1) + ")")
 
-          val (yannakakisJoins, countingAttribute, _, _, _) =
+          val (yannakakisJoins, countingAttribute, _, _) =
             root.buildBottomUpJoinsCounting(aggregateAttributes,
               groupingExpressions ++ groupAliasAttributes,
               aggregateExpressionsWithAliasesReplaced,
               lastAggMap, lastSumMap, nextMultiplicationMap, pendingProductSumSet,
-              pendingProductGrouping, lazyReductionProducts, keyRefs, uniqueConstraints,
+              lazyReductionProducts, keyRefs, uniqueConstraints,
               conf.yannakakisCountGroupInLeavesEnabled,
               usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
               crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*))
@@ -459,11 +456,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }
           else {
             // Guarded but not 0MA
-            val (yannakakisJoins, countingAttribute, _, _, _) =
+            val (yannakakisJoins, countingAttribute, _, _) =
               root.buildBottomUpJoinsCounting(aggregateAttributes,
                 groupingExpressions,
                 aggregateExpressions, lastAggMap, lastSumMap, nextMultiplicationMap,
-                pendingProductSumSet, pendingProductGrouping, lazyReductionProducts,
+                pendingProductSumSet, lazyReductionProducts,
                 keyRefs, uniqueConstraints,
                 conf.yannakakisCountGroupInLeavesEnabled,
                 usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
@@ -757,15 +754,13 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                                  lastSumMap: mutable.HashMap[Attribute, Attribute],
                                  nextMultiplicationMap: mutable.HashMap[Attribute, Expression],
                                  pendingProductSumSet: mutable.HashSet[Attribute],
-                                 pendingProductGrouping: mutable.HashMap[Attribute,
-                                   Seq[NamedExpression]],
                                  lazyReductionProducts: mutable.HashMap[Attribute, Set[Attribute]],
                                  keyRefs: Seq[Seq[Expression]],
                                  uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean,
                                  usePhysicalCountJoin: Boolean = false,
                                  crossRelationFilters: mutable.Set[Expression] =
                                    mutable.Set.empty):
-  (LogicalPlan, NamedExpression, Boolean, Boolean, Seq[NamedExpression]) = {
+  (LogicalPlan, NamedExpression, Boolean, Boolean) = {
     // scalastyle:on argcount
 
     val edge = edges.head
@@ -812,17 +807,16 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     }
     var isLeafNode = true
     var prevSemijoined = false
-    var accumulatedGrouping: Seq[NamedExpression] = Seq.empty
 
     var prevChildEdge: HGEdge = edge
     for (c <- children) {
       val childEdge = c.edges.head
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
-      val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, childWasSemijoined, childGrouping) =
+      val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, childWasSemijoined) =
         c.buildBottomUpJoinsCounting(aggregateAttributes,
           groupingExpressions, aggExpressions, lastAggMap, lastSumMap,
-          nextMultiplicationMap, pendingProductSumSet, pendingProductGrouping,
+          nextMultiplicationMap, pendingProductSumSet,
           lazyReductionProducts, keyRefs, uniqueConstraints,
           groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin,
           crossRelationFilters = crossRelationFilters)
@@ -908,37 +902,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       var applicableGroupAttributes = groupingExpressions.filter(
         groupExpr => {groupExpr.references.subsetOf(rightPlan.outputSet)}
       )
-
-      // Merge grouping from previous iterations (accumulatedGrouping) into current.
-      // This ensures that grouping attributes needed for products computed in earlier
-      // joins are preserved through later joins.
-      dbg(s"accumulatedGrouping from prev iterations: $accumulatedGrouping")
-      dbg(s"rightPlan.outputSet: ${rightPlan.outputSet}")
-      accumulatedGrouping.foreach(g => {
-        val alreadyGrouped = applicableGroupAttributes.exists(
-          existing => existing.references == g.references)
-        // The accumulated grouping is from prev iterations where it was in rightPlan.
-        // Now those attrs are in leftPlan (after the join). We need to check if
-        // equivalent attrs exist in rightPlan (for propagation).
-        val availableInRight = g.references.subsetOf(rightPlan.outputSet)
-        dbg(s"  checking $g: alreadyGrouped=$alreadyGrouped availableInRight=$availableInRight")
-        if (!alreadyGrouped && availableInRight) {
-          applicableGroupAttributes = applicableGroupAttributes :+ g
-          dbg(s"Added accumulated grouping to current: $g")
-        }
-      })
-
-      // Also merge child's grouping (from recursive calls - for nested trees)
-      dbg(s"childGrouping from child: $childGrouping")
-      childGrouping.foreach(g => {
-        val alreadyGrouped = applicableGroupAttributes.exists(
-          existing => existing.references == g.references)
-        val availableInRight = g.references.subsetOf(rightPlan.outputSet)
-        if (!alreadyGrouped && availableInRight) {
-          applicableGroupAttributes = applicableGroupAttributes :+ g
-          dbg(s"Added child grouping to current: $g")
-        }
-      })
 
       // Capture the grouping state BEFORE adding attributes for new products.
       // This is used for pending product propagation - pending products should use
@@ -1056,20 +1019,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //    Y(c)      Z(a)
               //
               val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
-
-              // Check if current grouping differs from when product was created
-              // This affects how we handle the multiplication by leftCount
-              val originalGrouping = if (isPendingProduct) {
-                pendingProductGrouping.getOrElse(agg.resultAttribute, Seq.empty)
-              } else Seq.empty
-              val originalGroupingSet = originalGrouping.flatMap(_.references).toSet
-              val currentGroupingSet = applicableGroupAttributes.flatMap(_.references).toSet
-              val hasExtraGrouping = isPendingProduct &&
-                (currentGroupingSet != originalGroupingSet)
-
               dbg(s"RIGHT propagation: agg=$agg isPending=$isPendingProduct")
-              dbg(s"  originalGrouping=$originalGroupingSet currentGrouping=$currentGroupingSet")
-              dbg(s"  hasExtraGrouping=$hasExtraGrouping")
 
               // SUM then multiply by left count
               val newAgg = Sum(lastSumAtt).toAggregateExpression()
@@ -1086,17 +1036,11 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 lastSumMap.put(agg.resultAttribute, newAgg.resultAttribute)
               }
 
-              // If this was a pending product with extra grouping, keep it pending
-              // so the final SUM aggregates the per-group values correctly.
-              // If no extra grouping, it's been fully SUMmed and is no longer pending.
+              // When a pending product is SUMmed on the right side, it's aggregated
+              // and no longer pending (final aggregate will just SUM these sums)
               if (isPendingProduct) {
-                if (hasExtraGrouping) {
-                  dbg(s"Pending product (extra grouping) on right, keeping pending: $lastSumAtt")
-                  // Don't remove from pendingProductSumSet - final SUM will aggregate
-                } else {
-                  pendingProductSumSet.remove(agg.resultAttribute)
-                  dbg(s"SUMmed pending product on right: $lastSumAtt")
-                }
+                pendingProductSumSet.remove(agg.resultAttribute)
+                dbg(s"SUMmed pending product on right: $lastSumAtt")
               }
             }
 
@@ -1108,94 +1052,21 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //      /     \
               //    Y(a,c)     Z(c)
 
-              val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
-
-              // Check if current grouping is compatible with when product was created
-              // For safe propagation, current grouping must be a SUPERSET of original grouping.
-              // - If superset: counts are per finer groups, summing still works
-              // - If NOT superset: counts are grouped by DIFFERENT attributes, math breaks
-              val originalGrouping = if (isPendingProduct) {
-                pendingProductGrouping.getOrElse(agg.resultAttribute, Seq.empty)
-              } else Seq.empty
-              val originalGroupingSet = originalGrouping.flatMap(_.references).toSet
-              val currentGroupingSet = applicableGroupAttributes.flatMap(_.references).toSet
-              // hasIncompatibleGrouping: current grouping has DIFFERENT attrs than original.
-              // - If currentGrouping is empty: compatible (total count, no splitting)
-              // - If currentGrouping is superset of original: compatible (finer grouping)
-              // - If currentGrouping has different attrs: INCOMPATIBLE
-              val hasIncompatibleGrouping = isPendingProduct &&
-                currentGroupingSet.nonEmpty &&
-                !originalGroupingSet.subsetOf(currentGroupingSet)
-
-              dbg(s"LEFT propagation: agg=$agg isPending=$isPendingProduct")
-              dbg(s"  originalGrouping=$originalGroupingSet currentGrouping=$currentGroupingSet")
-              dbg(s"  hasIncompatibleGrouping=$hasIncompatibleGrouping")
-
-              if (isPendingProduct) {
-                if (hasIncompatibleGrouping) {
-                  // Current grouping is incompatible (doesn't contain original grouping).
-                  // Counts are grouped by DIFFERENT attrs than the product was computed with.
-                  // E.g., product per (role_id, company_type_id) but now grouping by info_type_id.
-                  //
-                  // Even though we can't aggregate (SUM) the product here, we MUST still
-                  // multiply by the fan-out count from the right side. Each left row carrying
-                  // the product value will match with N right rows, and each match contributes
-                  // to the final sum.
-                  //
-                  // Example: sum#214 = company_type_id * role_id * mc_count
-                  // When joining with MI (grouped by info_type_id), each left row matches
-                  // with mi_count MI rows. The product value should be multiplied by mi_count.
-                  dbg(s"Pending product (incompatible grouping): $lastSumAtt")
-                  dbg(s"  Original grouping: $originalGroupingSet")
-                  dbg(s"  Current grouping: $currentGroupingSet (incompatible)")
-                  dbg(s"  Multiplying by right count for fan-out")
-
-                  val countRightAgg = if (rightPlanIsLeaf) {
-                    Count(Literal(1L)).toAggregateExpression()
-                  } else {
-                    Sum(rightCountAttribute).toAggregateExpression()
-                  }
-                  applicableAggExpressions = applicableAggExpressions :+ countRightAgg
-
-                  val newSum = Alias(createMultiplication(lastSumAtt,
-                    countRightAgg.resultAttribute), "sum")()
-
-                  multiplySumExpressions = multiplySumExpressions :+ newSum
-                  lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
-                  // Keep it as pending - it still needs final aggregation
-                } else {
-                  // No extra grouping - normal propagation
-                  val countRightAgg = if (rightPlanIsLeaf) {
-                    Count(Literal(1L)).toAggregateExpression()
-                  } else {
-                    Sum(rightCountAttribute).toAggregateExpression()
-                  }
-                  applicableAggExpressions = applicableAggExpressions :+ countRightAgg
-
-                  val newSum = Alias(createMultiplication(lastSumAtt,
-                    countRightAgg.resultAttribute), "sum")()
-
-                  multiplySumExpressions = multiplySumExpressions :+ newSum
-                  lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
-                  dbg(s"Pending product propagating on left: $lastSumAtt")
-                  // Keep it as pending - it still needs final aggregation
-                }
+              // Multiply by right count - same logic for all cases
+              // (pending products, aggregated sums, any grouping)
+              val countRightAgg = if (rightPlanIsLeaf) {
+                Count(Literal(1L)).toAggregateExpression()
               } else {
-                // Already aggregated sum - just multiply by right count
-                val countRightAgg = if (rightPlanIsLeaf) {
-                  Count(Literal(1L)).toAggregateExpression()
-                }
-                else {
-                  Sum(rightCountAttribute).toAggregateExpression()
-                }
-                applicableAggExpressions = applicableAggExpressions :+ countRightAgg
-
-                val newSum = Alias(createMultiplication(lastSumAtt,
-                  countRightAgg.resultAttribute), "sum")()
-
-                multiplySumExpressions = multiplySumExpressions :+ newSum
-                lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
+                Sum(rightCountAttribute).toAggregateExpression()
               }
+              applicableAggExpressions = applicableAggExpressions :+ countRightAgg
+
+              val newSum = Alias(createMultiplication(lastSumAtt,
+                countRightAgg.resultAttribute), "sum")()
+
+              multiplySumExpressions = multiplySumExpressions :+ newSum
+              lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
+              dbg(s"LEFT propagation: $lastSumAtt * rightCount")
             }
           }
           else {
@@ -1359,17 +1230,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 // Only store non-aggregate grouping attributes (filter out count expressions)
                 // Aggregate expressions like count(1) have empty .references and shouldn't
                 // be stored as grouping attributes for lazy reduction.
-                // Filter out both Alias(AggregateExpression) and AggregateExpression directly
-                val nonAggGrouping = applicableGroupAttributes.filter { attr =>
-                  val isAggExpr = attr.isInstanceOf[AggregateExpression]
-                  val isAliasedAgg = attr.isInstanceOf[Alias] &&
-                    attr.asInstanceOf[Alias].child.isInstanceOf[AggregateExpression]
-                  !isAggExpr && !isAliasedAgg
-                }
-                pendingProductGrouping.put(agg.resultAttribute, nonAggGrouping.toSeq)
                 dbg(s"Added pending 2-attr product: $productExpr")
                 dbg(s"  productAlias=${productAlias.toAttribute}")
-                dbg(s"  nonAggGrouping=${nonAggGrouping.map(_.toString)}")
               } else {
                 // Defer to final aggregate: 3+ attrs, uncovered left attr, or uncovered right attr
                 if (hasUncoveredLeftAttr) {
@@ -1496,9 +1358,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       isLeafNode = false
       prevChildEdge = childEdge
       prevSemijoined = false
-      accumulatedGrouping = applicableGroupAttributes.toSeq
     }
-    (prevPlan, prevCountExpr.toAttribute, isLeafNode, prevSemijoined, accumulatedGrouping)
+    (prevPlan, prevCountExpr.toAttribute, isLeafNode, prevSemijoined)
   }
   def reroot: HTNode = {
     if (parent == null) {
