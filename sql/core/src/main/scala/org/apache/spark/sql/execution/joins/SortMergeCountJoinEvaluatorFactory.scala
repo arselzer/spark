@@ -46,8 +46,16 @@ class SortMergeCountJoinEvaluatorFactory(
     spillThreshold: Int,
     numOutputRows: SQLMetric,
     spillSize: SQLMetric,
-    onlyBufferFirstMatchedRow: Boolean)
+    onlyBufferFirstMatchedRow: Boolean,
+    opId: String)
     extends PartitionEvaluatorFactory[InternalRow, InternalRow] with Logging {
+
+  // Toggle to enable detailed debug logging for CountJoin operations
+  private val DEBUG_COUNTJOIN = false
+
+  private def dbg(msg: => String): Unit = {
+    if (DEBUG_COUNTJOIN) logWarning(s"[Op$opId] $msg")
+  }
   override def createEvaluator(): PartitionEvaluator[InternalRow, InternalRow] =
     new SortMergeCountJoinEvaluator
 
@@ -226,17 +234,10 @@ class SortMergeCountJoinEvaluatorFactory(
                     val rightMatchesIterator = currentRightMatches.generateIterator()
 
                     rightCountSum = 0L
-//                    logWarning("rightMatches length: " + currentRightMatches.length)
-//                    logWarning("rightMatchesIterator has next: " + rightMatchesIterator.hasNext)
                     while (rightMatchesIterator.hasNext) {
                       val rightRow = rightMatchesIterator.next()
                       joinRow(currentLeftRow, rightRow)
-//                      logWarning("rightRow: " + rightRow)
-//                      logWarning("joinRow: " + joinRow)
-//                      logWarning("boundCondition: " + boundCondition)
-//                      logWarning("condition: " + condition)
                       if (boundCondition(joinRow)) {
-//                        val rightCount = rightRow.getLong(rightCountOrdinal)
                         val rightCount = if (rightCountOrdinal != -1) {
                           rightRow.getLong(rightCountOrdinal)
                         }
@@ -249,8 +250,6 @@ class SortMergeCountJoinEvaluatorFactory(
                             // We need to create a copy of the grouping key because rightRow changes
                             val groupingKey = groupingProjection(rightRow).copy()
                             var sum: Long = 0
-
-//                            logWarning("rightrow: " + rightRow)
 //                            logWarning("bufferMap: " + bufferMap + " groupingKey: " + groupingKey)
 //                            logWarning("contains: " + bufferMap.containsKey(groupingKey))
                             if (bufferMap.containsKey(groupingKey)) {
@@ -281,15 +280,8 @@ class SortMergeCountJoinEvaluatorFactory(
                             }
                           }
 
-//                          logWarning("bufferMap before update: " + bufferMap
-//                            + ", buffer: " + buffer)
                           aggRow(buffer, rightRow)
-//                          logWarning("aggregates: " + aggregatesRight)
-//                          logWarning("buffer schema: " + aggregatesRight.map(_.dataType))
-//                          logWarning("aggRow: " + aggRow)
-//                          logWarning("buffer: " + buffer)
                           updateProjection.target(buffer)(aggRow)
-//                          logWarning("bufferMap after update: " + bufferMap)
                         }
                         numOutputRows += 1
                       }
@@ -351,7 +343,7 @@ class SortMergeCountJoinEvaluatorFactory(
 //                logWarning("row " + numOutputRows.value)
 //                logWarning("left output: " + left.output)
 //                logWarning("getRow (doaggregation = " + doAggregation +
-//                  ", dogrouping = " + doGrouping)
+//                  ", dogrouping = " + doGrouping + ")")
 //                logWarning("partition: " + partitionIndex)
 //                logWarning("currentLeftRow: " + currentLeftRow)
 //                logWarning("rightCountSum: " + rightCountSum)
@@ -360,37 +352,21 @@ class SortMergeCountJoinEvaluatorFactory(
 
               if (doGrouping) {
                 val (groupingKey, buf) = bufferIterator.next()
-//                logWarning("grouping key: " + groupingKey + ", buffer: " + buf)
                 val sum = sumMap.get(groupingKey)
                 expressionAggEvalProjection(buf)
-
-//                logWarning("buffer: " + buf)
-//                logWarning("aggregateResult: " + aggregateResult)
 
                 val sumRow = new SpecificInternalRow(sumRowSchema)
                 sumRow.setLong(0, sum * leftCount)
 
                 val aggResult = aggProjection(joinedRow3(aggregateResult, groupingKey))
                 joinRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggResult)))
-//                logWarning("output: " + resultProjection(joinRow))
-
-//                logWarning("resultProjection: " + resultProjection(joinRow))
-
-                val outputAtts = left.output ++ Seq(countRight.get.toAttribute) ++
-                  aggResultAttributes ++ groupRight.map(_.toAttribute)
-
-                def printRow(ur: UnsafeRow): Unit = {
-                  for ((att, i) <- outputAtts.zipWithIndex) {
-                    logWarning("idx " + i + ": " + ur.get(i, att.dataType))
-                  }
-                }
-
-//                printRow(resultProjection(joinRow))
 
                 resultProjection(joinRow)
               }
               else {
-//                logWarning("no grouping buffer: " + buffer)
+//                if (numOutputRows.value < 32) {
+//                  logWarning("no grouping buffer: " + buffer)
+//                }
                 expressionAggEvalProjection(buffer)
                 val sumRow = new SpecificInternalRow(sumRowSchema)
                 sumRow.setLong(0, rightCountSum * leftCount)
@@ -398,7 +374,8 @@ class SortMergeCountJoinEvaluatorFactory(
                   joinRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggregateResult)))
 //                  if (numOutputRows.value < 32) {
 //                    logWarning("count: " +  rightCountSum * leftCount)
-//                                      logWarning("output: " + resultProjection(joinRow))
+//                    logWarning("aggregateResult: " + aggregateResult)
+//                    logWarning("output: " + resultProjection(joinRow))
 //                  }
                   resultProjection(joinRow)
                 }
@@ -406,7 +383,7 @@ class SortMergeCountJoinEvaluatorFactory(
                   joinRow.withRight(sumRow)
 //                  if (numOutputRows.value < 32) {
 //                    logWarning("count: " +  rightCountSum * leftCount)
-//                                      logWarning("output: " + resultProjection(joinRow))
+//                    logWarning("output: " + resultProjection(joinRow))
 //                  }
                   resultProjection(joinRow)
                 }

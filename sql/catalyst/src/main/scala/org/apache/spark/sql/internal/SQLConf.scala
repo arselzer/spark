@@ -2627,6 +2627,15 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val YANNAKAKIS_LAZY_REDUCTION_ENABLED =
+    buildConf("spark.sql.yannakakis.lazyReductionEnabled")
+      .doc("When enabled, pending products preserve their original grouping through " +
+        "the join tree and are reduced via an inserted Aggregate node instead of " +
+        "being deferred to the final aggregate.")
+      .version("2.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
       .doc("Enables CBO for estimation of plan statistics when set true.")
@@ -4928,6 +4937,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def yannakakisDeferProductsEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_DEFER_PRODUCTS_ENABLED)
+
+  def yannakakisLazyReductionEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 

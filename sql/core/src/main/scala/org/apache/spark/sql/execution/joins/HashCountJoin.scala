@@ -44,6 +44,16 @@ import org.apache.spark.sql.types.{BooleanType, IntegralType, LongType, StructFi
 //    isEmpty: Boolean)
 
 trait HashCountJoin extends JoinCodegenSupport {
+  // Toggle to enable detailed debug logging for CountJoin operations
+  private val DEBUG_COUNTJOIN = false
+
+  // Unique ID for this operator instance (for debugging)
+  private lazy val opId: String = ExplainUtils.getOpId(this)
+
+  private def dbg(msg: => String): Unit = {
+    if (DEBUG_COUNTJOIN) logWarning(s"[Op$opId] $msg")
+  }
+
   def buildSide: BuildSide
 
   override def simpleStringWithNodeId(): String = {
@@ -336,8 +346,6 @@ trait HashCountJoin extends JoinCodegenSupport {
     val joinKeys = streamSideKeyGenerator()
     val joinedRow = new JoinedRow
 
-//    logWarning("join output: " + output)
-
     val leftCountOrdinal = if (countLeft.get.references.nonEmpty) {
       AttributeSeq(streamedOutput)
         .indexOf(countLeft.get.references.head.exprId)
@@ -442,16 +450,13 @@ trait HashCountJoin extends JoinCodegenSupport {
 //    logWarning("agg buffer atts: " + bufferSchema.mkString("Array(", ", ", ")"))
 //    logWarning("agg results: " + aggResultAttributes)
 //    logWarning("evaluate expressions: " + evalExpressions.mkString("Array(", ", ", ")"))
-//    logWarning("output types: " + (left.output ++
-//      Seq(countRight.get.toAttribute)
-//      ++ aggResultAttributes ++ groupRight.map(_.toAttribute)).map(_.dataType))
-
     if (hashedRelation == EmptyHashedRelation) {
       Iterator.empty
     } else {
       streamIter.flatMap { srow =>
         joinedRow.withLeft(srow)
-        val matches = hashedRelation.get(joinKeys(srow))
+        val joinKey = joinKeys(srow)
+        val matches = hashedRelation.get(joinKey)
 
         // Could merge these into a single buffer/map
         val sumMap = new mutable.LinkedHashMap[UnsafeRow, Long]
@@ -470,7 +475,7 @@ trait HashCountJoin extends JoinCodegenSupport {
             buffer = newBuffer()
             expressionAggInitialProjection.target(buffer)(EmptyRow)
           }
-//          logWarning("buffermap before: " + bufferMap)
+          var matchCount = 0
           val rightCountSum = matches.map(joinedRow.withRight)
             .filter(boundCondition)
             .map(row => {
@@ -483,6 +488,9 @@ trait HashCountJoin extends JoinCodegenSupport {
               else {
                 1
               }
+
+              matchCount += 1
+
               if (doAggregation || doGrouping) {
                 if (doGrouping) {
                   val groupingKey = groupingProjection(row.getRight).copy()
@@ -503,14 +511,13 @@ trait HashCountJoin extends JoinCodegenSupport {
                 }
 
                 aggRow(buffer, row.getRight)
-//                logWarning("aggRow: " + aggRow + ", buffer: " + buffer)
                 updateProjection.target(buffer)(aggRow)
-//                logWarning("buffer after projection: " + buffer)
               }
               // Return right count
               rightCount
             }
           ).sum
+
 
 //          logWarning("buffermap after: " + bufferMap)
           if (doGrouping) {
@@ -522,8 +529,9 @@ trait HashCountJoin extends JoinCodegenSupport {
 
               val aggResult = aggProjection(joinedRow3(aggregateResult, groupingKey))
               joinedRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggResult)))
-//                logWarning("produced row: " + resultProjection(joinedRow))
-              resultProjection(joinedRow)
+              // CRITICAL: UnsafeProjection reuses its output row, so we must copy
+              // when producing multiple rows for the same left input
+              resultProjection(joinedRow).copy()
             }).toSeq
           }
           else {
@@ -537,7 +545,6 @@ trait HashCountJoin extends JoinCodegenSupport {
             else {
               joinedRow.withRight(sumRow)
             }
-//            logWarning("produced row: " + resultProjection(joinedRow))
             Seq(resultProjection(joinedRow))
           }
         } else {
@@ -614,7 +621,7 @@ trait HashCountJoin extends JoinCodegenSupport {
 
     val output = left.output ++ Seq(countRight.get.toAttribute) ++
       aggregatesRight.map(_.resultAttribute) ++ groupRight.map(_.toAttribute)
-    logWarning("output: " + output)
+//    logWarning("output: " + output)
 
     val resultProj = UnsafeProjection.create(output, output)
     // val resultProj = createResultProjection

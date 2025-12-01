@@ -129,6 +129,7 @@ case class SortMergeCountJoinExec(
     val spillSize = longMetric("spillSize")
     val spillThreshold = getSpillThreshold
     val inMemoryThreshold = getInMemoryThreshold
+    val opId = ExplainUtils.getOpId(this)
     val evaluatorFactory = new SortMergeCountJoinEvaluatorFactory(
       leftKeys,
       rightKeys,
@@ -145,7 +146,8 @@ case class SortMergeCountJoinExec(
       spillThreshold,
       numOutputRows,
       spillSize,
-      onlyBufferFirstMatchedRow
+      onlyBufferFirstMatchedRow,
+      opId
     )
     if (conf.usePartitionEvaluator) {
       left.execute().zipPartitionsWithEvaluator(right.execute(), evaluatorFactory)
