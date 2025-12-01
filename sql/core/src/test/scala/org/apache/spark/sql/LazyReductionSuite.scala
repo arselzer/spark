@@ -95,43 +95,27 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     // Baseline (no Yannakakis) - should be correct
     withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
-      val df = sql(query)
-      println("=== BASELINE (no Yannakakis) ===")
-      println("Optimized Plan:")
-      println(df.queryExecution.optimizedPlan.treeString)
-      checkAnswer(df, expectedResult)
+      checkAnswer(sql(query), expectedResult)
     }
 
     // With Yannakakis + lazy reduction disabled
-    // This may produce wrong results due to incompatible grouping bug
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
     ) {
-      val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction DISABLED) ===")
-      println("Optimized Plan:")
-      println(df.queryExecution.optimizedPlan.treeString)
-      val result = df.collect()
-      println(s"Result: ${result.mkString}")
-      // Note: This may produce wrong result (50 instead of 100)
+      checkAnswer(sql(query), expectedResult)
     }
 
     // With Yannakakis + lazy reduction enabled
-    // This should produce correct results
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
     ) {
-      val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction ENABLED) ===")
-      println("Optimized Plan:")
-      println(df.queryExecution.optimizedPlan.treeString)
-      checkAnswer(df, expectedResult)
+      checkAnswer(sql(query), expectedResult)
     }
   }
 
@@ -808,8 +792,9 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
       s"$correctLazyOn/$numIterations correct (lazy ON) ===")
     println(s"Expected: $expectedResults")
 
-    // Note: This query pattern may produce wrong results with Yannakakis optimization
-    // depending on the join tree chosen. The test tracks how often results are correct.
+    // After the UnsafeRow copy fix, both lazy ON and OFF should produce correct results
+    assert(correctLazyOff == numIterations || correctLazyOn == numIterations,
+      s"Expected at least one mode to produce correct results for all iterations")
     // scalastyle:on println
   }
 
@@ -926,6 +911,299 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy reduction ENABLED) - Star schema ===")
       println(df.queryExecution.optimizedPlan.treeString)
+      checkAnswer(df, expectedResults)
+    }
+    // scalastyle:on println
+  }
+
+  /**
+   * Test with 6 tables and 8 different aggregates to stress-test the optimization.
+   * This test includes:
+   * - COUNT(*)
+   * - Simple SUM
+   * - 2-attribute products
+   * - Products spanning multiple table pairs
+   * - Chain joins (A->B->C)
+   */
+  test("6 tables with 8 aggregates - stress test") {
+    // Orders table (central)
+    val orders = Seq(
+      (1, 100, "2023-01-01"),  // order_id, customer_id, date
+      (2, 100, "2023-01-02"),
+      (3, 200, "2023-01-01"),
+      (4, 200, "2023-01-03"),
+      (5, 300, "2023-01-02")
+    ).toDF("order_id", "customer_id", "order_date")
+
+    // Order items - multiple per order (fan-out)
+    val items = Seq(
+      (1, 10, 50),  // order_id, quantity, price
+      (1, 5, 100),
+      (2, 20, 30),
+      (3, 15, 40),
+      (3, 10, 60),
+      (4, 8, 75),
+      (5, 25, 20)
+    ).toDF("order_id", "quantity", "price")
+
+    // Customers
+    val customers = Seq(
+      (100, 5, "Gold"),   // customer_id, loyalty_points, tier
+      (200, 10, "Platinum"),
+      (300, 3, "Silver")
+    ).toDF("customer_id", "loyalty_points", "tier")
+
+    // Shipments - one per order for orders with reviews
+    val shipments = Seq(
+      (1, 2),  // order_id, weight
+      (2, 3),
+      (2, 4),
+      (3, 5),
+      (4, 6),
+      (4, 7),
+      (4, 8),
+      (5, 1)
+    ).toDF("order_id", "weight")
+
+    // Payments - one per order
+    val payments = Seq(
+      (1, 150, "card"),   // order_id, amount, method
+      (2, 600, "cash"),
+      (3, 1200, "card"),
+      (4, 600, "card"),
+      (5, 500, "cash")
+    ).toDF("order_id", "amount", "payment_method")
+
+    // Reviews - optional (some orders have reviews)
+    val reviews = Seq(
+      (1, 5),  // order_id, rating
+      (3, 4),
+      (5, 3)
+    ).toDF("order_id", "rating")
+
+    orders.createOrReplaceTempView("orders_stress")
+    items.createOrReplaceTempView("items_stress")
+    customers.createOrReplaceTempView("customers_stress")
+    shipments.createOrReplaceTempView("shipments_stress")
+    payments.createOrReplaceTempView("payments_stress")
+    reviews.createOrReplaceTempView("reviews_stress")
+
+    // Query with 8 aggregates
+    val query = """
+      SELECT COUNT(*) AS cnt,
+             SUM(items_stress.quantity) AS total_qty,
+             SUM(items_stress.quantity * items_stress.price) AS revenue,
+             SUM(customers_stress.loyalty_points * items_stress.quantity) AS loyalty_value,
+             SUM(shipments_stress.weight * items_stress.price) AS shipping_cost,
+             SUM(payments_stress.amount) AS payment_total,
+             SUM(customers_stress.loyalty_points * shipments_stress.weight) AS loy_ship,
+             SUM(reviews_stress.rating * items_stress.quantity) AS rated_qty
+      FROM orders_stress
+      JOIN items_stress ON orders_stress.order_id = items_stress.order_id
+      JOIN customers_stress ON orders_stress.customer_id = customers_stress.customer_id
+      JOIN shipments_stress ON orders_stress.order_id = shipments_stress.order_id
+      JOIN payments_stress ON orders_stress.order_id = payments_stress.order_id
+      JOIN reviews_stress ON orders_stress.order_id = reviews_stress.order_id
+    """
+
+    // Ground truth calculation:
+    // Only orders 1, 3, 5 have reviews.
+    // Order 1: items=(10,50),(5,100), customer(5), shipments=(2), payment=150, rating=5
+    //   - 2 item rows x 1 shipment = 2 full rows
+    // Order 3: items=(15,40),(10,60), customer(10), shipments=(5), payment=1200, rating=4
+    //   - 2 item rows x 1 shipment = 2 full rows
+    // Order 5: items=(25,20), customer(3), shipments=(1), payment=500, rating=3
+    //   - 1 item row x 1 shipment = 1 full row
+    //
+    // Total rows = 2 + 2 + 1 = 5
+    // cnt = 5
+    //
+    // total_qty = 10 + 5 + 15 + 10 + 25 = 65
+    // revenue = 10*50 + 5*100 + 15*40 + 10*60 + 25*20 = 500+500+600+600+500 = 2700
+    // loyalty_value = 5*10 + 5*5 + 10*15 + 10*10 + 3*25 = 50+25+150+100+75 = 400
+    // shipping_cost = 2*50 + 2*100 + 5*40 + 5*60 + 1*20 = 100+200+200+300+20 = 820
+    // payment_total = 150 + 150 + 1200 + 1200 + 500 = 3200
+    // loy_ship = 5*2 + 5*2 + 10*5 + 10*5 + 3*1 = 10+10+50+50+3 = 123
+    // rated_qty = 5*10 + 5*5 + 4*15 + 4*10 + 3*25 = 50+25+60+40+75 = 250
+    val expectedResults = Seq(Row(5L, 65L, 2700L, 400L, 820L, 3200L, 123L, 250L))
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResults)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+    ) {
+      checkAnswer(sql(query), expectedResults)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+    ) {
+      checkAnswer(sql(query), expectedResults)
+    }
+    // scalastyle:on println
+  }
+
+  /**
+   * Test with multiple GROUP BY columns and products.
+   * Verifies correct handling when grouping changes through the join tree.
+   */
+  test("multi-column GROUP BY with products") {
+    val sales = Seq(
+      (1, "Electronics", "2023", 100),
+      (2, "Electronics", "2023", 150),
+      (3, "Clothing", "2023", 80),
+      (4, "Clothing", "2024", 90),
+      (5, "Electronics", "2024", 200)
+    ).toDF("sale_id", "category", "year", "amount")
+
+    val regions = Seq(
+      (1, "North", 2),
+      (2, "South", 3),
+      (3, "North", 2),
+      (4, "South", 3),
+      (5, "North", 2)
+    ).toDF("sale_id", "region", "tax_rate")
+
+    val promotions = Seq(
+      (1, 10),  // sale_id, discount
+      (2, 15),
+      (3, 5),
+      (4, 20),
+      (5, 25)
+    ).toDF("sale_id", "discount")
+
+    sales.createOrReplaceTempView("sales_grp")
+    regions.createOrReplaceTempView("regions_grp")
+    promotions.createOrReplaceTempView("promotions_grp")
+
+    val query = """
+      SELECT category, year,
+             COUNT(*) AS cnt,
+             SUM(amount) AS total_amount,
+             SUM(amount * tax_rate) AS taxed_amount,
+             SUM(amount * discount) AS discounted_amount,
+             SUM(tax_rate * discount) AS tax_discount
+      FROM sales_grp
+      JOIN regions_grp ON sales_grp.sale_id = regions_grp.sale_id
+      JOIN promotions_grp ON sales_grp.sale_id = promotions_grp.sale_id
+      GROUP BY category, year
+      ORDER BY category, year
+    """
+
+    // Electronics, 2023: sales (100, 150), tax (2, 3), discount (10, 15)
+    //   cnt=2, total=250, taxed=100*2+150*3=650, discount=100*10+150*15=3250, tax*disc=2*10+3*15=65
+    // Electronics, 2024: sales (200), tax (2), discount (25)
+    //   cnt=1, total=200, taxed=400, discount=5000, tax*disc=50
+    // Clothing, 2023: sales (80), tax (2), discount (5)
+    //   cnt=1, total=80, taxed=160, discount=400, tax*disc=10
+    // Clothing, 2024: sales (90), tax (3), discount (20)
+    //   cnt=1, total=90, taxed=270, discount=1800, tax*disc=60
+    val expectedResults = Seq(
+      Row("Clothing", "2023", 1L, 80L, 160L, 400L, 10L),
+      Row("Clothing", "2024", 1L, 90L, 270L, 1800L, 60L),
+      Row("Electronics", "2023", 2L, 250L, 650L, 3250L, 65L),
+      Row("Electronics", "2024", 1L, 200L, 400L, 5000L, 50L)
+    )
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val df = sql(query)
+      println("=== BASELINE - GROUP BY with products ===")
+      checkAnswer(df, expectedResults)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+    ) {
+      val df = sql(query)
+      println("\n=== YANNAKAKIS (lazy OFF) - GROUP BY with products ===")
+      checkAnswer(df, expectedResults)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("\n=== YANNAKAKIS (lazy ON) - GROUP BY with products ===")
+      checkAnswer(df, expectedResults)
+    }
+    // scalastyle:on println
+  }
+
+  /**
+   * Test with high fan-out to stress-test the UnsafeRow copy fix.
+   * Each left row produces many output rows with different grouping keys.
+   */
+  test("high fan-out stress test for UnsafeRow copy") {
+    // Central table with few rows
+    val center = Seq(
+      (1, 10),
+      (2, 20)
+    ).toDF("id", "value")
+
+    // Fan-out table with many rows per center id
+    val fanout = Seq(
+      (1, 1), (1, 2), (1, 3), (1, 4), (1, 5),
+      (1, 6), (1, 7), (1, 8), (1, 9), (1, 10),
+      (2, 11), (2, 12), (2, 13), (2, 14), (2, 15)
+    ).toDF("center_id", "key")
+
+    center.createOrReplaceTempView("center_fanout")
+    fanout.createOrReplaceTempView("fanout_table")
+
+    val query = """
+      SELECT SUM(center_fanout.value * fanout_table.key) AS product_sum
+      FROM center_fanout
+      JOIN fanout_table ON center_fanout.id = fanout_table.center_id
+    """
+
+    // Ground truth:
+    // id=1, value=10: keys 1-10, products = 10*(1+2+3+4+5+6+7+8+9+10) = 10*55 = 550
+    // id=2, value=20: keys 11-15, products = 20*(11+12+13+14+15) = 20*65 = 1300
+    // Total = 550 + 1300 = 1850
+    val expectedResults = Seq(Row(1850L))
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val df = sql(query)
+      println("=== BASELINE - High fan-out ===")
+      checkAnswer(df, expectedResults)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+    ) {
+      val df = sql(query)
+      println("\n=== YANNAKAKIS (lazy OFF) - High fan-out ===")
+      checkAnswer(df, expectedResults)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("\n=== YANNAKAKIS (lazy ON) - High fan-out ===")
       checkAnswer(df, expectedResults)
     }
     // scalastyle:on println

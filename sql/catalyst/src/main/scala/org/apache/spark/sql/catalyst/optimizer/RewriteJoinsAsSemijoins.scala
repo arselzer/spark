@@ -1204,6 +1204,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             // check if it starts here
             if (agg.references.subsetOf(rightPlan.outputSet)) {
               dbg("agg.references.subsetOf(rightPlan.outputSet)")
+              dbg(s"  Single-column SUM on right: ${agg.aggregateFunction.children.head}")
+              dbg(s"  agg.references: ${agg.references}")
+              dbg(s"  rightPlanIsLeaf: $rightPlanIsLeaf")
 
               // logWarning("is subset")
               //         |
@@ -1217,28 +1220,43 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //             /    \
               //           R(a)   S(c)
 
-              val newAgg = if (rightPlanIsLeaf) {
-                agg
+              // Check if the SUM's child is entirely within the grouping attributes.
+              // If so, SUM(x) grouped by x = x, which is wrong - we'd lose the aggregation.
+              // In this case, defer to final aggregate where proper count multiplication
+              // will be applied.
+              val sumChild = agg.aggregateFunction.children.head
+              val sumChildRefs = sumChild.references
+              val sumChildInGrouping = sumChildRefs.nonEmpty && sumChildRefs.forall(r =>
+                applicableGroupAttributes.exists(g => g.references.contains(r)))
+
+              if (sumChildInGrouping) {
+                dbg(s"Skipping SUM at CountJoin - child $sumChild is in grouping, would be trivial")
+                // Don't add to applicableAggExpressions - it will be computed at final aggregate
+                // with count multiplication
               } else {
-                agg.transformUp {
-                  case a: AggregateFunction =>
-                    a.withNewChildren(Seq(createMultiplication(a.children.head,
-                      rightCountAttribute)))
-                }.asInstanceOf[AggregateExpression]
-              }
+                val newAgg = if (rightPlanIsLeaf) {
+                  agg
+                } else {
+                  agg.transformUp {
+                    case a: AggregateFunction =>
+                      a.withNewChildren(Seq(createMultiplication(a.children.head,
+                        rightCountAttribute)))
+                  }.asInstanceOf[AggregateExpression]
+                }
 
-              applicableAggExpressions = applicableAggExpressions :+ newAgg
+                applicableAggExpressions = applicableAggExpressions :+ newAgg
 
-              // Left plan is not a leaf
-              if (leftPlan.outputSet.contains(leftCountAttribute)) {
-                val newSum = Alias(createMultiplication(newAgg.resultAttribute,
-                  leftCountAttribute), "sum")()
-                multiplySumExpressions = multiplySumExpressions :+ newSum
+                // Left plan is not a leaf
+                if (leftPlan.outputSet.contains(leftCountAttribute)) {
+                  val newSum = Alias(createMultiplication(newAgg.resultAttribute,
+                    leftCountAttribute), "sum")()
+                  multiplySumExpressions = multiplySumExpressions :+ newSum
 
-                lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
-              }
-              else {
-                lastSumMap.put(agg.resultAttribute, newAgg.resultAttribute)
+                  lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
+                }
+                else {
+                  lastSumMap.put(agg.resultAttribute, newAgg.resultAttribute)
+                }
               }
             }
             // Check if the aggregate references span both left and right plans
