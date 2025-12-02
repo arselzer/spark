@@ -1143,14 +1143,34 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // introduced at different points. We must defer products when this conflict exists.
               val productAttrsSet = refsOnLeft ++ refsOnRight
 
-              // Check if there are OTHER product aggregates with attrs not in this product
-              val otherProductsHaveConflictingAttrs = aggExpressions.exists { otherAgg =>
+              // Check if other products will add conflicting grouping at THIS or FUTURE joins.
+              // Key insight: if there are OTHER uncommitted products that still need
+              // attributes not yet available (not in combinedOutputSet), those products
+              // will add grouping at future joins that could affect our count.
+              //
+              // Safe to compute when: all other uncommitted products have ALL their attrs
+              // already in the combined output (so they won't add new grouping later).
+              val otherProductsHaveUnseenAttrs = aggExpressions.exists { otherAgg =>
                 otherAgg.aggregateFunction match {
                   case Sum(child, _) if otherAgg != agg =>
                     val otherRefs = child.references.filter(a =>
                       !a.name.startsWith("c#") && a.name != "c")
-                    // Conflict: other product has attr(s) not in this product
-                    otherRefs.exists(a => !productAttrsSet.contains(a))
+                    // Is this other product already computed?
+                    val otherAlreadyComputed = lastSumMap.contains(otherAgg.resultAttribute)
+                    if (otherAlreadyComputed) {
+                      false // Already computed, won't add new grouping
+                    } else {
+                      // Does this uncommitted product have attrs not yet available?
+                      val otherHasUnseenAttrs = otherRefs.exists(a =>
+                        !combinedOutputSet.contains(a))
+                      // Does this product have non-overlapping attrs with ours?
+                      val otherAttrs = otherRefs
+                      val thisAttrs = productAttrsSet
+                      val hasNonOverlap = otherAttrs.exists(a => !thisAttrs.contains(a)) ||
+                        thisAttrs.exists(a => !otherAttrs.contains(a))
+                      // Conflict if: other has unseen attrs AND has non-overlapping attrs
+                      otherHasUnseenAttrs && hasNonOverlap
+                    }
                   case _ => false
                 }
               }
@@ -1160,14 +1180,14 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 !grp.references.subsetOf(productAttrsSet)
               }
 
-              val hasConflict = hasForeignGrouping || otherProductsHaveConflictingAttrs
+              val hasConflict = hasForeignGrouping || otherProductsHaveUnseenAttrs
               // If there's a conflict, defer product unless this is a leaf join.
               // For conflicting products, we can safely compute at leaf joins because
               // there's no grouping yet. After that, we must defer to final agg.
               val mustDeferForGrouping = hasConflict && !isLeafNode
 
               dbg(s"Conflict check for ${agg}: hasForeign=$hasForeignGrouping " +
-                s"otherConflict=$otherProductsHaveConflictingAttrs isLeaf=$isLeafNode " +
+                s"otherUnseen=$otherProductsHaveUnseenAttrs isLeaf=$isLeafNode " +
                 s"mustDefer=$mustDeferForGrouping forceDefer=$forceProductDeferral")
 
               if (!SQLConf.get.yannakakisDeferProductsEnabled && !hasUncoveredRightAttr &&

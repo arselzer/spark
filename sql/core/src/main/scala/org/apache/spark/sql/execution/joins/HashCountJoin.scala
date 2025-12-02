@@ -45,7 +45,7 @@ import org.apache.spark.sql.types.{BooleanType, IntegralType, LongType, StructFi
 
 trait HashCountJoin extends JoinCodegenSupport {
   // Toggle to enable detailed debug logging for CountJoin operations
-  private val DEBUG_COUNTJOIN = true
+  private val DEBUG_COUNTJOIN = false
 
   // Unique ID for this operator instance (for debugging)
   private lazy val opId: String = ExplainUtils.getOpId(this)
