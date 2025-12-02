@@ -51,7 +51,7 @@ class SortMergeCountJoinEvaluatorFactory(
     extends PartitionEvaluatorFactory[InternalRow, InternalRow] with Logging {
 
   // Toggle to enable detailed debug logging for CountJoin operations
-  private val DEBUG_COUNTJOIN = true
+  private val DEBUG_COUNTJOIN = false
 
   private def dbg(msg: => String): Unit = {
     if (DEBUG_COUNTJOIN) logWarning(s"[Op$opId] $msg")
