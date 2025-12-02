@@ -33,7 +33,7 @@ import org.apache.spark.sql.types.DecimalType.DoubleDecimal
 
 object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   // Set to true to enable debug logging for the GroupAggJoin optimization
-  val DEBUG_LOGGING = false
+  val DEBUG_LOGGING = true
 
   private def debugLog(msg: => String): Unit = {
     if (DEBUG_LOGGING) logWarning(msg)
@@ -248,6 +248,31 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               return agg
             }
           }
+
+          // Check for conflicting product aggregates
+          // If there are multiple SUM(a*b) aggregates with non-overlapping attributes,
+          // we must defer all products to the final aggregate to avoid incorrect counts.
+          val productAggRefs = aggregateExpressionsWithAliasesReplaced.flatMap { agg =>
+            agg.aggregateFunction match {
+              case Sum(child, _) if child.references.nonEmpty =>
+                val refs = child.references.filter(a =>
+                  !a.name.startsWith("c#") && a.name != "c")
+                if (refs.size >= 2) Some(refs) else None
+              case _ => None
+            }
+          }
+          val hasConflictingProducts = productAggRefs.size >= 2 && {
+            // Check if any two products have non-overlapping attribute sets
+            productAggRefs.combinations(2).exists { case Seq(refs1, refs2) =>
+              val overlap = refs1.intersect(refs2)
+              overlap.isEmpty || (refs1 -- overlap).nonEmpty ||
+                (refs2 -- overlap).nonEmpty
+            }
+          }
+          if (hasConflictingProducts) {
+            debugLog("conflicting product aggregates - will defer all products")
+          }
+
           debugLog("applicable query (joins=" + (items.size - 1) + ")")
 
           val (yannakakisJoins, countingAttribute, _, _) =
@@ -258,7 +283,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               keyRefs, uniqueConstraints,
               conf.yannakakisCountGroupInLeavesEnabled,
               usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
-              crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*))
+              crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
+              forceProductDeferral = hasConflictingProducts)
 
           debugLog("lastAggMap: " + lastAggMap)
           debugLog("lastSumMap: " + lastSumMap)
@@ -375,7 +401,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                 keyRefs, uniqueConstraints,
                 conf.yannakakisCountGroupInLeavesEnabled,
                 usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
-                crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*))
+                crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
+                forceProductDeferral = false)
 
             val rewrittenResultExpressions = resultExpressions.map {
               expr =>
@@ -643,7 +670,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                                  uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean,
                                  usePhysicalCountJoin: Boolean = false,
                                  crossRelationFilters: mutable.Set[Expression] =
-                                   mutable.Set.empty):
+                                   mutable.Set.empty,
+                                 forceProductDeferral: Boolean = false):
   (LogicalPlan, NamedExpression, Boolean, Boolean) = {
     // scalastyle:on argcount
 
@@ -703,7 +731,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
           nextMultiplicationMap, pendingProductSumSet,
           keyRefs, uniqueConstraints,
           groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin,
-          crossRelationFilters = crossRelationFilters)
+          crossRelationFilters = crossRelationFilters,
+          forceProductDeferral = forceProductDeferral)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
@@ -795,7 +824,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
       // For product aggregates (SUM(A*B) where A and B are from different relations),
       // we need to carry attributes through the tree until both are available.
-      // Add right-side product attributes to grouping if the product can't be computed yet.
+      // Add right-side product attributes to grouping if the product can't be computed yet,
+      // or if forceProductDeferral is true (we're deferring even when we could compute).
       val combinedOutputSet = leftPlan.outputSet ++ rightPlan.outputSet
       aggExpressions.foreach(agg => {
         agg.aggregateFunction match {
@@ -808,9 +838,18 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               aggRefs.subsetOf(combinedOutputSet)
             val refsNotYetAvailable = aggRefs.filter(a => !combinedOutputSet.contains(a))
 
-            if (!isProductAggHere && refsNotYetAvailable.nonEmpty) {
-              // Not all refs available yet - add right-side refs to grouping
-              // to carry them through for a product computed later
+            // Check if this is a product aggregate (multiple non-count attrs)
+            val productAttrs = aggRefs.filter(a =>
+              !a.name.startsWith("c#") && a.name != "c")
+            val isProductAgg = productAttrs.size >= 2
+
+            // When forceProductDeferral is true, we need to carry ALL product attributes
+            // through to the final aggregate, even for products that could be computed here
+            val needsCarryThrough = (!isProductAggHere && refsNotYetAvailable.nonEmpty) ||
+              (forceProductDeferral && isProductAgg && refsOnRight.nonEmpty)
+
+            if (needsCarryThrough) {
+              // Add right-side refs to grouping to carry them through
               refsOnRight.foreach(att => {
                 val alreadyGrouped = applicableGroupAttributes.exists(
                   g => g.references.contains(att))
@@ -889,11 +928,28 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         }
 
         def sumOrCountCase(agg: AggregateExpression) = {
-          dbg("sumOrCountCase")
+          dbg(s"sumOrCountCase agg=${agg.aggregateFunction}")
+          dbg(s"  resultAttr=${agg.resultAttribute}")
+          val keyStr = lastSumMap.keys.map(k =>
+            s"${k.name}#${k.exprId.id}").mkString(",")
+          dbg(s"  lastSumMap.keys=$keyStr")
+          val pendStr = pendingProductSumSet.map(k =>
+            s"${k.name}#${k.exprId.id}").mkString(",")
+          dbg(s"  pendingProductSumSet=$pendStr")
           if (lastSumMap.contains(agg.resultAttribute)) {
             dbg("lastSumMap contains " + agg.resultAttribute)
             val lastSumAtt = lastSumMap(agg.resultAttribute)
+            dbg(s"  lastSumAtt=$lastSumAtt")
 
+            val rOut = rightPlan.outputSet.map(a =>
+              s"${a.name}#${a.exprId.id}").mkString(",")
+            dbg(s"  rightOut=$rOut")
+            val lOut = leftPlan.outputSet.map(a =>
+              s"${a.name}#${a.exprId.id}").mkString(",")
+            dbg(s"  leftOut=$lOut")
+            val inRight = rightPlan.outputSet.contains(lastSumAtt)
+            val inLeft = leftPlan.outputSet.contains(lastSumAtt)
+            dbg(s"  inRight=$inRight inLeft=$inLeft")
             if (rightPlan.outputSet.contains(lastSumAtt)) {
               //         |
               //       Project(ac<-a*c)
@@ -903,7 +959,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //    Y(c)      Z(a)
               //
               val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
-              dbg(s"RIGHT propagation: agg=$agg isPending=$isPendingProduct")
+              dbg(s"RIGHT propagation isPending=$isPendingProduct")
+              val hasLeftCount = leftPlan.outputSet.contains(leftCountAttribute)
+              dbg(s"  leftCount=$leftCountAttribute hasLeftCount=$hasLeftCount")
 
               // SUM then multiply by left count
               val newAgg = Sum(lastSumAtt).toAggregateExpression()
@@ -939,8 +997,10 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // Multiply by right count - same logic for all cases
               // (pending products, aggregated sums, any grouping)
               val countRightAgg = if (rightPlanIsLeaf) {
+                dbg(s"LEFT propagation: using COUNT(1) for leaf right")
                 Count(Literal(1L)).toAggregateExpression()
               } else {
+                dbg(s"LEFT propagation: using SUM($rightCountAttribute) for non-leaf right")
                 Sum(rightCountAttribute).toAggregateExpression()
               }
               applicableAggExpressions = applicableAggExpressions :+ countRightAgg
@@ -949,8 +1009,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 countRightAgg.resultAttribute), "sum")()
 
               multiplySumExpressions = multiplySumExpressions :+ newSum
+              dbg(s"LEFT propagation: $lastSumAtt * count -> $newSum")
               lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
-              dbg(s"LEFT propagation: $lastSumAtt * rightCount")
+              dbg(s"  updated lastSumMap -> ${newSum.toAttribute}")
             }
           }
           else {
@@ -984,10 +1045,19 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               val sumChildInGrouping = sumChildRefs.nonEmpty && sumChildRefs.forall(r =>
                 applicableGroupAttributes.exists(g => g.references.contains(r)))
 
+              // Check if this is a product aggregate (SUM with multiple non-count attrs)
+              val productAttrsInAgg = agg.references.filter(a =>
+                !a.name.startsWith("c#") && a.name != "c")
+              val isProductAgg = productAttrsInAgg.size >= 2
+
               if (sumChildInGrouping) {
                 dbg(s"Skipping SUM at CountJoin - child $sumChild is in grouping, would be trivial")
                 // Don't add to applicableAggExpressions - it will be computed at final aggregate
                 // with count multiplication
+              } else if (forceProductDeferral && isProductAgg) {
+                // Product deferral is forced and this is a product aggregate -
+                // skip computing it here, will be handled at final aggregate
+                dbg(s"Skipping product SUM due to forceProductDeferral: $agg")
               } else {
                 val newAgg = if (rightPlanIsLeaf) {
                   agg
@@ -1059,7 +1129,49 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // Left-side attrs don't need to be in grouping because CountJoin processes
               // each left row individually, so left-side values are naturally preserved.
               // Only right-side attrs need to be covered by grouping.
-              if (!SQLConf.get.yannakakisDeferProductsEnabled && !hasUncoveredRightAttr) {
+              //
+              // GLOBAL CHECK: If there are multiple product aggregates with non-overlapping
+              // attributes, there's potential for cross-branch grouping conflicts.
+              // For example:
+              // - sum(production_year * role_id) has attrs {production_year, role_id}
+              // - sum((company_type_id * role_id) * kind_id) has
+              //   {company_type_id, role_id, kind_id}
+              //
+              // When company_type_id is used for grouping (for the second product), it
+              // affects the counts for the first product (which doesn't include company_type_id).
+              // The join tree ordering is non-deterministic, so the grouping might be
+              // introduced at different points. We must defer products when this conflict exists.
+              val productAttrsSet = refsOnLeft ++ refsOnRight
+
+              // Check if there are OTHER product aggregates with attrs not in this product
+              val otherProductsHaveConflictingAttrs = aggExpressions.exists { otherAgg =>
+                otherAgg.aggregateFunction match {
+                  case Sum(child, _) if otherAgg != agg =>
+                    val otherRefs = child.references.filter(a =>
+                      !a.name.startsWith("c#") && a.name != "c")
+                    // Conflict: other product has attr(s) not in this product
+                    otherRefs.exists(a => !productAttrsSet.contains(a))
+                  case _ => false
+                }
+              }
+
+              // Also check current grouping for foreign attributes
+              val hasForeignGrouping = applicableGroupAttributes.exists { grp =>
+                !grp.references.subsetOf(productAttrsSet)
+              }
+
+              val hasConflict = hasForeignGrouping || otherProductsHaveConflictingAttrs
+              // If there's a conflict, defer product unless this is a leaf join.
+              // For conflicting products, we can safely compute at leaf joins because
+              // there's no grouping yet. After that, we must defer to final agg.
+              val mustDeferForGrouping = hasConflict && !isLeafNode
+
+              dbg(s"Conflict check for ${agg}: hasForeign=$hasForeignGrouping " +
+                s"otherConflict=$otherProductsHaveConflictingAttrs isLeaf=$isLeafNode " +
+                s"mustDefer=$mustDeferForGrouping forceDefer=$forceProductDeferral")
+
+              if (!SQLConf.get.yannakakisDeferProductsEnabled && !hasUncoveredRightAttr &&
+                  !mustDeferForGrouping && !forceProductDeferral) {
                 // Compute product early at this join (works for any number of attributes)
                 dbg(s"Computing product early ($numProductAttrs attrs): ${agg}")
                 dbg(s"  refsOnLeft=$refsOnLeft refsOnRight=$refsOnRight")
@@ -1115,7 +1227,13 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 dbg(s"  productAlias=${productAlias.toAttribute}")
               } else {
                 // Defer to final aggregate: uncovered right attr (right attr not in grouping)
-                dbg(s"Deferring product (uncovered right attr: $rightAttrsNotInGrouping): ${agg}")
+                // or foreign grouping that needs proper count aggregation
+                if (mustDeferForGrouping) {
+                  dbg(s"Deferring product (foreign grouping, left has counts): ${agg}")
+                  dbg(s"  groupAttrs=$applicableGroupAttributes productAttrs=$productAttrsSet")
+                } else {
+                  dbg(s"Deferring product (uncovered right attr: $rightAttrsNotInGrouping): ${agg}")
+                }
                 // Don't add to lastSumMap - will be handled at final aggregate
               }
             }

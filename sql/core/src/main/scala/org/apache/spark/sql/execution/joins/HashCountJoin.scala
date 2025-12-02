@@ -45,7 +45,7 @@ import org.apache.spark.sql.types.{BooleanType, IntegralType, LongType, StructFi
 
 trait HashCountJoin extends JoinCodegenSupport {
   // Toggle to enable detailed debug logging for CountJoin operations
-  private val DEBUG_COUNTJOIN = false
+  private val DEBUG_COUNTJOIN = true
 
   // Unique ID for this operator instance (for debugging)
   private lazy val opId: String = ExplainUtils.getOpId(this)
@@ -450,6 +450,9 @@ trait HashCountJoin extends JoinCodegenSupport {
 //    logWarning("agg buffer atts: " + bufferSchema.mkString("Array(", ", ", ")"))
 //    logWarning("agg results: " + aggResultAttributes)
 //    logWarning("evaluate expressions: " + evalExpressions.mkString("Array(", ", ", ")"))
+    dbg(s"countJoin started: leftCountOrd=$leftCountOrdinal rightCountOrd=$rightCountOrdinal " +
+      s"doAgg=$doAggregation doGroup=$doGrouping")
+
     if (hashedRelation == EmptyHashedRelation) {
       Iterator.empty
     } else {
@@ -490,6 +493,7 @@ trait HashCountJoin extends JoinCodegenSupport {
               }
 
               matchCount += 1
+              dbg(s"  Processing match $matchCount: rightCount=$rightCount")
 
               if (doAggregation || doGrouping) {
                 if (doGrouping) {
@@ -518,7 +522,8 @@ trait HashCountJoin extends JoinCodegenSupport {
             }
           ).sum
 
-
+          dbg(s"  leftCount=$leftCount, rightCountSum=$rightCountSum, matchCount=$matchCount, " +
+            s"product=${rightCountSum * leftCount}")
 //          logWarning("buffermap after: " + bufferMap)
           if (doGrouping) {
             (bufferMap map {
@@ -541,11 +546,16 @@ trait HashCountJoin extends JoinCodegenSupport {
             if (doAggregation) {
               expressionAggEvalProjection(buffer)
               joinedRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggregateResult)))
+              dbg(s"  Output (with agg): count=${rightCountSum * leftCount}, " +
+                s"aggResult=${aggregateResult}")
             }
             else {
               joinedRow.withRight(sumRow)
+              dbg(s"  Output (no agg): count=${rightCountSum * leftCount}")
             }
-            Seq(resultProjection(joinedRow))
+            val result = resultProjection(joinedRow)
+            dbg(s"  Final result row: $result")
+            Seq(result)
           }
         } else {
           Seq.empty

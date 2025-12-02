@@ -51,7 +51,7 @@ class SortMergeCountJoinEvaluatorFactory(
     extends PartitionEvaluatorFactory[InternalRow, InternalRow] with Logging {
 
   // Toggle to enable detailed debug logging for CountJoin operations
-  private val DEBUG_COUNTJOIN = false
+  private val DEBUG_COUNTJOIN = true
 
   private def dbg(msg: => String): Unit = {
     if (DEBUG_COUNTJOIN) logWarning(s"[Op$opId] $msg")
@@ -339,16 +339,15 @@ class SortMergeCountJoinEvaluatorFactory(
                 1
               }
 
-//              if (numOutputRows.value < 32) {
-//                logWarning("row " + numOutputRows.value)
-//                logWarning("left output: " + left.output)
-//                logWarning("getRow (doaggregation = " + doAggregation +
-//                  ", dogrouping = " + doGrouping + ")")
-//                logWarning("partition: " + partitionIndex)
-//                logWarning("currentLeftRow: " + currentLeftRow)
-//                logWarning("rightCountSum: " + rightCountSum)
-//                logWarning("leftCount: " + leftCount)
-//              }
+              if (numOutputRows.value < 32) {
+                dbg("row " + numOutputRows.value)
+                dbg("getRow (doaggregation = " + doAggregation +
+                  ", dogrouping = " + doGrouping + ")")
+                dbg("partition: " + partitionIndex)
+                dbg("currentLeftRow: " + currentLeftRow)
+                dbg("rightCountSum: " + rightCountSum)
+                dbg("leftCount: " + leftCount)
+              }
 
               if (doGrouping) {
                 val (groupingKey, buf) = bufferIterator.next()
@@ -357,6 +356,11 @@ class SortMergeCountJoinEvaluatorFactory(
 
                 val sumRow = new SpecificInternalRow(sumRowSchema)
                 sumRow.setLong(0, sum * leftCount)
+
+                if (numOutputRows.value < 32) {
+                  dbg(s"GROUPING: groupingKey=$groupingKey sum=$sum leftCount=$leftCount")
+                  dbg(s"  sumRow(0)=${sumRow.getLong(0)} aggResult=$aggregateResult")
+                }
 
                 val aggResult = aggProjection(joinedRow3(aggregateResult, groupingKey))
                 joinRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggResult)))

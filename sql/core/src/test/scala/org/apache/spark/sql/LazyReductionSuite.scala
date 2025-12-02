@@ -21,31 +21,27 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
 /**
- * Test suite for the lazy reduction optimization in CountJoin.
+ * Test suite for product aggregates in Yannakakis/CountJoin optimization.
  *
- * This tests the spark.sql.yannakakis.lazyReductionEnabled config option
- * which preserves grouping for pending products through the join tree
- * and reduces via an inserted Aggregate node instead of deferring to
- * the final aggregate.
+ * This tests that product aggregates (SUM(a * b), SUM(a * b * c), etc.)
+ * are computed correctly when using the physical CountJoin operator.
+ * Products are computed early in the join tree to avoid incorrect
+ * count multiplication.
  */
 class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
   import testImplicits._
 
   /**
-   * 4-table join that triggers incompatible grouping scenario.
+   * 4-table join that tests product computation with fan-out.
    *
-   * This is the key test for lazy reduction. The join tree is:
+   * The join tree is:
    *   title JOIN cast_info JOIN role_type JOIN movie_companies
    *
-   * The product (role_id * RT.id) is created at the RT join with grouping {T.id}
-   * but then propagates to the MC join where grouping changes (MC joins on T.id
-   * but multiplies the rows differently).
-   *
-   * Without lazy reduction, this causes wrong results due to incorrect count
-   * multiplication.
+   * The product (role_id * RT.id) is computed early at the RT join
+   * to avoid incorrect multiplication when fan-out occurs at the MC join.
    */
-  test("4-table join with incompatible grouping - lazy reduction required") {
+  test("4-table join with incompatible grouping - product computed early") {
     // title (T)
     val title = Seq(
       (1, "Movie1"),
@@ -98,22 +94,20 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
       checkAnswer(sql(query), expectedResult)
     }
 
-    // With Yannakakis + lazy reduction disabled
+    // With Yannakakis enabled
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
 
-    // With Yannakakis + lazy reduction enabled
+    // With Yannakakis enabled (second run for coverage)
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -148,22 +142,20 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
       checkAnswer(sql(query), expectedResult)
     }
 
-    // With Yannakakis enabled, lazy reduction disabled
+    // With Yannakakis enabled
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
 
-    // With Yannakakis enabled, lazy reduction enabled
+    // With Yannakakis enabled (second run for coverage)
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -206,8 +198,8 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     }
   }
 
-  test("lazy reduction with compatible grouping (no reduction needed)") {
-    // Test case where grouping is compatible - lazy reduction should not change behavior
+  test("product aggregate with compatible grouping") {
+    // Test case where grouping is compatible
     val t1 = Seq(
       (1, 10),
       (2, 20)
@@ -237,8 +229,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -313,15 +304,14 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
       checkAnswer(df, expectedResults)
     }
 
-    // With Yannakakis + lazy reduction disabled
+    // With Yannakakis enabled
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction DISABLED) - GROUP BY test ===")
+      println("\n=== YANNAKAKIS (early product computation) - GROUP BY test ===")
       println("Optimized Plan:")
       println(df.queryExecution.optimizedPlan.treeString)
       val result = df.collect()
@@ -329,18 +319,17 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
       // This may produce wrong results due to incompatible grouping
     }
 
-    // With Yannakakis + lazy reduction enabled
-    // NOTE: This query doesn't actually trigger lazy reduction (hasIncompatibleGrouping=false)
+    // With Yannakakis enabled (second run for coverage)
+    // NOTE: This query has compatible grouping (hasIncompatibleGrouping=false)
     // because the HT tree ordering causes the product to be computed at the same join
     // as the GROUP BY attribute. This test verifies that the query at least runs correctly.
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction ENABLED) - GROUP BY test ===")
+      println("\n=== YANNAKAKIS (early product computation (second run)) - GROUP BY test ===")
       println("Optimized Plan:")
       println(df.queryExecution.optimizedPlan.treeString)
       val result = df.collect()
@@ -353,7 +342,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
   /**
    * Test with multiple product aggregates across different joins.
-   * This tests that lazy reduction handles multiple pending products correctly.
+   * This tests that multiple pending products are handled correctly.
    */
   test("multiple product aggregates with different groupings") {
     val orders = Seq(
@@ -406,11 +395,10 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction DISABLED) - Multiple products test ===")
+      println("\n=== YANNAKAKIS (early product computation) - Multiple products test ===")
       println(df.queryExecution.optimizedPlan.treeString)
       val result = df.collect()
       println(s"Result: ${result.map(_.toString).mkString(", ")}")
@@ -419,11 +407,10 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction ENABLED) - Multiple products test ===")
+      println("\n=== YANNAKAKIS (second run) - Multiple products test ===")
       println(df.queryExecution.optimizedPlan.treeString)
       checkAnswer(df, expectedResults)
     }
@@ -443,7 +430,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
    * with its own grouping. When one product propagates through the join where
    * the other product's grouping is active, we get incompatible grouping.
    */
-  test("two products with conflicting groupings - triggers lazy reduction") {
+  test("two products with conflicting groupings") {
     // R table - the central table
     val r = Seq(
       (1, 10),
@@ -494,11 +481,10 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction DISABLED) - Two products ===")
+      println("\n=== YANNAKAKIS (early product computation) - Two products ===")
       println(df.queryExecution.optimizedPlan.treeString)
       val result = df.collect()
       println(s"Result: ${result.map(_.toString).mkString(", ")}")
@@ -508,13 +494,12 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction ENABLED) - Two products ===")
+      println("\n=== YANNAKAKIS (early product computation (second run)) - Two products ===")
       println(df.queryExecution.optimizedPlan.treeString)
-      // With lazy reduction, this should produce correct results
+      // With early computation, this produces correct results
       checkAnswer(df, expectedResults)
     }
     // scalastyle:on println
@@ -522,7 +507,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
   /**
    * Test with fan-out that creates different counts per grouping.
-   * This tests that lazy reduction correctly handles count multiplication
+   * This tests that early computation correctly handles count multiplication
    * when groupings are incompatible.
    *
    * The key scenario:
@@ -531,7 +516,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
    * - Product P1 propagates to A JOIN C where grouping becomes {C.cat}
    * - Since {B.y} is not a subset of {C.cat}, this is INCOMPATIBLE grouping
    */
-  test("fan-out with incompatible grouping - triggers lazy reduction") {
+  test("fan-out with incompatible grouping") {
     // A table - central table
     val a = Seq(
       (1, 10),
@@ -589,25 +574,23 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction DISABLED) - Fan-out ===")
+      println("\n=== YANNAKAKIS (early product computation) - Fan-out ===")
       println(df.queryExecution.optimizedPlan.treeString)
       val result = df.collect()
       println(s"Result: ${result.map(_.toString).mkString(", ")}")
-      // May produce wrong results without lazy reduction
+      // Products are computed early to produce correct results
     }
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction ENABLED) - Fan-out ===")
+      println("\n=== YANNAKAKIS (early product computation (second run)) - Fan-out ===")
       println(df.queryExecution.optimizedPlan.treeString)
       checkAnswer(df, expectedResult)
     }
@@ -715,12 +698,11 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
-      ) {
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        ) {
         val df = sql(query)
         if (i == 1) {
-          println("\n=== YANNAKAKIS (lazy reduction DISABLED) - Complex multi-product ===")
+          println("\n=== YANNAKAKIS (early product computation) - Complex multi-product ===")
           println("Optimized Plan:")
           println(df.queryExecution.optimizedPlan.treeString)
           println("\nPhysical Plan:")
@@ -757,12 +739,11 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
-      ) {
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        ) {
         val df = sql(query)
         if (i == 1) {
-          println("\n=== YANNAKAKIS (lazy reduction ENABLED) - Complex multi-product ===")
+          println("\n=== YANNAKAKIS (second run) - Complex multi-product ===")
           println(df.queryExecution.optimizedPlan.treeString)
 
           // Debug query to show intermediate values WITHOUT final aggregation
@@ -801,7 +782,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
   /**
    * Star schema test with 5 tables and multiple 2-attribute aggregations.
    * Central fact table joins with multiple dimension tables.
-   * Tests various product combinations to stress-test lazy reduction.
+   * Tests various product combinations to stress-test early computation.
    */
   test("star schema with 5 tables and mixed aggregations") {
     // Fact table F (central)
@@ -892,11 +873,10 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction DISABLED) - Star schema ===")
+      println("\n=== YANNAKAKIS (early product computation) - Star schema ===")
       println(df.queryExecution.optimizedPlan.treeString)
       val result = df.collect()
       println(s"Result: ${result.map(_.toString).mkString(", ")}")
@@ -905,11 +885,10 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
-      println("\n=== YANNAKAKIS (lazy reduction ENABLED) - Star schema ===")
+      println("\n=== YANNAKAKIS (early product computation (second run)) - Star schema ===")
       println(df.queryExecution.optimizedPlan.treeString)
       checkAnswer(df, expectedResults)
     }
@@ -1035,8 +1014,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResults)
     }
@@ -1044,8 +1022,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResults)
     }
@@ -1124,8 +1101,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy OFF) - GROUP BY with products ===")
@@ -1135,8 +1111,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy ON) - GROUP BY with products ===")
@@ -1188,8 +1163,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy OFF) - High fan-out ===")
@@ -1199,8 +1173,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy ON) - High fan-out ===")
@@ -1278,8 +1251,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy OFF) - 5-way linear join ===")
       val df = sql(query)
@@ -1290,8 +1262,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy ON) - 5-way linear join ===")
       val df = sql(query)
@@ -1372,8 +1343,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy OFF) - star schema join ===")
       val df = sql(query)
@@ -1384,8 +1354,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy ON) - star schema join ===")
       val df = sql(query)
@@ -1470,8 +1439,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "false"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy OFF) - cascading fan-out ===")
       val df = sql(query)
@@ -1482,12 +1450,329 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_LAZY_REDUCTION_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy ON) - cascading fan-out ===")
       val df = sql(query)
       df.explain(true)
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  /**
+   * 12-table IMDB-style join with multiple product aggregates.
+   * Tests the complex join structure from JOB query 4a.
+   */
+  test("12-table IMDB-style join with multiple products") {
+    // cast_info (CI) - central table
+    val ci = Seq(
+      (1, 1, 1, 2)  // movie_id=1, person_id=1, person_role_id=1, role_id=2
+    ).toDF("movie_id", "person_id", "person_role_id", "role_id")
+
+    // movie_info (MI)
+    val mi = Seq(
+      (1, 3)  // movie_id=1, info_type_id=3
+    ).toDF("movie_id", "info_type_id")
+
+    // title (T)
+    val t = Seq(
+      (1, 2020, 5, 7)  // id=1, production_year=2020, season_nr=5, kind_id=7
+    ).toDF("id", "production_year", "season_nr", "kind_id")
+
+    // movie_companies (MC)
+    val mc = Seq(
+      (1, 1, 4)  // movie_id=1, company_id=1, company_type_id=4
+    ).toDF("movie_id", "company_id", "company_type_id")
+
+    // char_name (CHN)
+    val chn = Seq(
+      (1, 100)  // person_role_id=1, imdb_id=100
+    ).toDF("id", "imdb_id")
+
+    // role_type (RT)
+    val rt = Seq(
+      (2)  // role_id=2
+    ).toDF("id")
+
+    // name (N)
+    val n = Seq(
+      (1)  // person_id=1
+    ).toDF("id")
+
+    // aka_name (AN)
+    val an = Seq(
+      (1)  // person_id=1
+    ).toDF("person_id")
+
+    // company_name (CN)
+    val cn = Seq(
+      (1)
+    ).toDF("id")
+
+    // info_type (IT)
+    val it = Seq(
+      (3)
+    ).toDF("id")
+
+    // keyword (K)
+    val k = Seq(
+      (1)
+    ).toDF("id")
+
+    // movie_keyword (MK)
+    val mk = Seq(
+      (1, 1)
+    ).toDF("movie_id", "keyword_id")
+
+    ci.createOrReplaceTempView("cast_info_imdb")
+    mi.createOrReplaceTempView("movie_info_imdb")
+    t.createOrReplaceTempView("title_imdb")
+    mc.createOrReplaceTempView("movie_companies_imdb")
+    chn.createOrReplaceTempView("char_name_imdb")
+    rt.createOrReplaceTempView("role_type_imdb")
+    n.createOrReplaceTempView("name_imdb")
+    an.createOrReplaceTempView("aka_name_imdb")
+    cn.createOrReplaceTempView("company_name_imdb")
+    it.createOrReplaceTempView("info_type_imdb")
+    k.createOrReplaceTempView("keyword_imdb")
+    mk.createOrReplaceTempView("movie_keyword_imdb")
+
+    val query = """
+      SELECT COUNT(*),
+          SUM(ci.role_id*mi.info_type_id),
+          SUM(t.production_year * ci.role_id),
+          SUM(t.season_nr * chn.imdb_id),
+          SUM(t.season_nr * rt.id),
+          SUM(mc.company_type_id * ci.role_id * t.kind_id)
+      FROM aka_name_imdb AS an,
+           char_name_imdb AS chn,
+           cast_info_imdb AS ci,
+           company_name_imdb AS cn,
+           info_type_imdb AS it,
+           keyword_imdb AS k,
+           movie_companies_imdb AS mc,
+           movie_info_imdb AS mi,
+           movie_keyword_imdb AS mk,
+           name_imdb AS n,
+           role_type_imdb AS rt,
+           title_imdb AS t
+      WHERE t.id = mi.movie_id
+        AND t.id = mc.movie_id
+        AND t.id = ci.movie_id
+        AND t.id = mk.movie_id
+        AND cn.id = mc.company_id
+        AND it.id = mi.info_type_id
+        AND n.id = ci.person_id
+        AND rt.id = ci.role_id
+        AND n.id = an.person_id
+        AND chn.id = ci.person_role_id
+        AND k.id = mk.keyword_id
+    """
+
+    // Expected: 1 row joined across all tables
+    // COUNT = 1
+    // role_id(2) * info_type_id(3) = 6
+    // production_year(2020) * role_id(2) = 4040
+    // season_nr(5) * imdb_id(100) = 500
+    // season_nr(5) * rt.id(2) = 10
+    // company_type_id(4) * role_id(2) * kind_id(7) = 56
+    val expectedResult = Row(1L, 6L, 4040L, 500L, 10L, 56L)
+
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      checkAnswer(sql(query), expectedResult)
+    }
+  }
+
+  /**
+   * 12-table IMDB join test with real data cardinalities.
+   *
+   * This test reproduces the actual cardinalities from the IMDB database:
+   * - 1 cast_info row
+   * - 1 title row
+   * - 1 movie_info row (info_type_id=16)
+   * - 9 movie_companies rows (creates fan-out)
+   * - 1 char_name row (imdb_id is NULL)
+   * - 1 role_type row (id=2)
+   * - 1 name row
+   * - 6 aka_name rows (creates fan-out)
+   * - 5 company_name rows (matched to mc)
+   * - 1 info_type row
+   * - 1 keyword row
+   * - 1 movie_keyword row
+   *
+   * Total rows = 9 mc * 6 an = 54
+   *
+   * Expected: COUNT=54, products inflated by 4/3 ratio with bug
+   */
+  test("12-table IMDB join with real data cardinalities - fan-out from mc and an") {
+    // cast_info (CI) - 1 row
+    // Using simplified IDs but maintaining same structure
+    val ci = Seq(
+      (1, 1, 1, 2)  // movie_id=1, person_id=1, person_role_id=1, role_id=2
+    ).toDF("movie_id", "person_id", "person_role_id", "role_id")
+
+    // movie_info (MI) - 1 row
+    val mi = Seq(
+      (1, 16)  // movie_id=1, info_type_id=16
+    ).toDF("movie_id", "info_type_id")
+
+    // title (T) - 1 row
+    val t = Seq(
+      (1, 2011, 9, 7)  // id=1, production_year=2011, season_nr=9, kind_id=7
+    ).toDF("id", "production_year", "season_nr", "kind_id")
+
+    // movie_companies (MC) - 9 rows (fan-out source!)
+    // Mapping from real data: 5 companies, some have multiple mc rows
+    // company_ids: 119(1 row), 741(2 rows), 787(3 rows), 114110(1 row), 114409(2 rows)
+    // company_type_ids: 119->1, 741->2, 787->1, 114110->2, 114409->2
+    val mc = Seq(
+      (1, 1, 1),   // movie_id=1, company_id=1, company_type_id=1 (like 787)
+      (1, 1, 1),   // duplicate (like 787)
+      (1, 1, 1),   // duplicate (like 787)
+      (1, 2, 1),   // company_id=2, company_type_id=1 (like 119)
+      (1, 3, 2),   // company_id=3, company_type_id=2 (like 741)
+      (1, 3, 2),   // duplicate (like 741)
+      (1, 4, 2),   // company_id=4, company_type_id=2 (like 114110)
+      (1, 5, 2),   // company_id=5, company_type_id=2 (like 114409)
+      (1, 5, 2)    // duplicate (like 114409)
+    ).toDF("movie_id", "company_id", "company_type_id")
+
+    // char_name (CHN) - 1 row with NULL imdb_id
+    val chn = Seq(
+      (1, null.asInstanceOf[java.lang.Integer])  // id=1, imdb_id=NULL
+    ).toDF("id", "imdb_id")
+
+    // role_type (RT) - 1 row
+    val rt = Seq(
+      (2)  // id=2 (actress)
+    ).toDF("id")
+
+    // name (N) - 1 row
+    val n = Seq(
+      (1)  // id=1
+    ).toDF("id")
+
+    // aka_name (AN) - 6 rows (fan-out source!)
+    val an = Seq(
+      (1), (1), (1), (1), (1), (1)  // 6 aliases for person_id=1
+    ).toDF("person_id")
+
+    // company_name (CN) - 5 rows (one per unique company)
+    val cn = Seq(
+      (1), (2), (3), (4), (5)
+    ).toDF("id")
+
+    // info_type (IT) - 1 row
+    val it = Seq(
+      (16)  // id=16
+    ).toDF("id")
+
+    // keyword (K) - 1 row
+    val k = Seq(
+      (1)  // id=1
+    ).toDF("id")
+
+    // movie_keyword (MK) - 1 row
+    val mk = Seq(
+      (1, 1)  // movie_id=1, keyword_id=1
+    ).toDF("movie_id", "keyword_id")
+
+    ci.createOrReplaceTempView("cast_info_real")
+    mi.createOrReplaceTempView("movie_info_real")
+    t.createOrReplaceTempView("title_real")
+    mc.createOrReplaceTempView("movie_companies_real")
+    chn.createOrReplaceTempView("char_name_real")
+    rt.createOrReplaceTempView("role_type_real")
+    n.createOrReplaceTempView("name_real")
+    an.createOrReplaceTempView("aka_name_real")
+    cn.createOrReplaceTempView("company_name_real")
+    it.createOrReplaceTempView("info_type_real")
+    k.createOrReplaceTempView("keyword_real")
+    mk.createOrReplaceTempView("movie_keyword_real")
+
+    val query = """
+      SELECT COUNT(*),
+          SUM(ci.role_id*mi.info_type_id),
+          SUM(t.production_year * ci.role_id),
+          SUM(t.season_nr * chn.imdb_id),
+          SUM(t.season_nr * rt.id),
+          SUM(mc.company_type_id * ci.role_id * t.kind_id)
+      FROM aka_name_real AS an,
+           char_name_real AS chn,
+           cast_info_real AS ci,
+           company_name_real AS cn,
+           info_type_real AS it,
+           keyword_real AS k,
+           movie_companies_real AS mc,
+           movie_info_real AS mi,
+           movie_keyword_real AS mk,
+           name_real AS n,
+           role_type_real AS rt,
+           title_real AS t
+      WHERE t.id = mi.movie_id
+        AND t.id = mc.movie_id
+        AND t.id = ci.movie_id
+        AND t.id = mk.movie_id
+        AND cn.id = mc.company_id
+        AND it.id = mi.info_type_id
+        AND n.id = ci.person_id
+        AND rt.id = ci.role_id
+        AND n.id = an.person_id
+        AND chn.id = ci.person_role_id
+        AND k.id = mk.keyword_id
+    """
+
+    // Ground truth calculation:
+    // Total rows = 9 mc * 6 an = 54
+    //
+    // COUNT = 54
+    //
+    // role_id(2) * info_type_id(16) = 32, summed 54 times = 32 * 54 = 1728
+    //
+    // production_year(2011) * role_id(2) = 4022, summed 54 times = 4022 * 54 = 217188
+    //
+    // season_nr(9) * imdb_id(NULL) = NULL (always)
+    //
+    // season_nr(9) * rt.id(2) = 18, summed 54 times = 18 * 54 = 972
+    //
+    // company_type_id * role_id(2) * kind_id(7) = 14 * company_type_id
+    // mc rows have company_type_ids: 1,1,1,1,2,2,2,2,2 = 4 ones + 5 twos
+    // Per mc row value: type=1 gives 14*1=14, type=2 gives 14*2=28
+    // 4 mc rows with type=1: 14 each, times 6 an = 4*6*14 = 336
+    // 5 mc rows with type=2: 28 each, times 6 an = 5*6*28 = 840
+    // Total = 336 + 840 = 1176
+    val expectedResult = Row(54L, 1728L, 217188L, null, 972L, 1176L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val df = sql(query)
+      println("\n=== BASELINE - 12-table real cardinalities ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString(", ")}")
+      checkAnswer(df, expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("\n=== YANNAKAKIS - 12-table real cardinalities ===")
+      println("Optimized Plan:")
+      println(df.queryExecution.optimizedPlan.treeString)
+      val result = df.collect()
+      println(s"Result: ${result.map(_.toString).mkString(", ")}")
+      println(s"Expected: $expectedResult")
+      // This test documents the current behavior - may fail if there's a bug
       checkAnswer(df, expectedResult)
     }
     // scalastyle:on println
