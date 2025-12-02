@@ -73,10 +73,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     // Track which lastSumMap entries are raw product expressions (not yet aggregated)
     // These need to be SUMmed at the next join, unlike already-aggregated values
     val pendingProductSumSet = new mutable.HashSet[Attribute]()
-    // Track products that need reduction (lazy reduction mode).
-    // Maps product resultAttribute -> grouping attributes to reduce over.
-    // These products had incompatible grouping but were preserved instead of deferred.
-    val lazyReductionProducts = new mutable.HashMap[Attribute, Set[Attribute]]()
 
     val namedGroupingExpressions = unnamedGroupingExpressions.map {
       case ne: NamedExpression => ne -> ne
@@ -259,7 +255,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               groupingExpressions ++ groupAliasAttributes,
               aggregateExpressionsWithAliasesReplaced,
               lastAggMap, lastSumMap, nextMultiplicationMap, pendingProductSumSet,
-              lazyReductionProducts, keyRefs, uniqueConstraints,
+              keyRefs, uniqueConstraints,
               conf.yannakakisCountGroupInLeavesEnabled,
               usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
               crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*))
@@ -343,94 +339,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }
           debugLog("rewrittenResultExpressions: " + rewrittenResultExpressions)
 
-          // Insert reduction aggregate if lazy reduction was used
-          val joinTreeWithReduction = if (lazyReductionProducts.nonEmpty) {
-            debugLog(s"Lazy reduction: inserting reduction aggregate for products: " +
-              lazyReductionProducts.keys.mkString(", "))
-
-            // Get the grouping attributes to reduce over (union of all product groupings)
-            val groupingToReduce = lazyReductionProducts.values.flatten.toSet
-
-            // Create SUM aggregates for each product that needs reduction
-            // and update lastSumMap to point to the new aliases
-            val reductionAggregates = lazyReductionProducts.keys.toSeq.flatMap { productAttr =>
-              lastSumMap.get(productAttr).map { currentAttr =>
-                val alias = Alias(Sum(currentAttr).toAggregateExpression(), currentAttr.name)()
-                // Update lastSumMap to point to the NEW alias's result attribute
-                lastSumMap.put(productAttr, alias.toAttribute)
-                alias
-              }
-            }
-
-            // Keep non-product attributes (those not being reduced)
-            val nonProductAttrs = yannakakisJoins.output.filterNot { attr =>
-              groupingToReduce.contains(attr) ||
-                lazyReductionProducts.keys.exists(k =>
-                  // Check both old and new mappings
-                  reductionAggregates.exists(ra =>
-                    ra.child.asInstanceOf[AggregateExpression]
-                      .aggregateFunction.children.head.semanticEquals(attr)))
-            }
-
-            // The reduction aggregate groups by non-reduced attributes and SUMs products
-            val reductionGrouping = nonProductAttrs.filterNot(groupingToReduce.contains)
-            val reductionOutput = reductionGrouping ++ reductionAggregates
-
-            debugLog(s"Reduction grouping: $reductionGrouping")
-            debugLog(s"Reduction aggregates: $reductionAggregates")
-
-            Aggregate(reductionGrouping, reductionOutput, yannakakisJoins)
-          } else {
-            yannakakisJoins
-          }
-
-          // If lazy reduction was used, re-compute result expressions with updated lastSumMap
-          // Otherwise use the already computed rewrittenResultExpressions
-          val finalRewrittenResultExpressions = if (lazyReductionProducts.nonEmpty) {
-            resultExpressionsWithAliasesReplaced.map {
-              expr =>
-                expr.transformDown {
-                  case ae: AggregateExpression =>
-                    val resultAtt = equivalentAggregateExpressions.getExprState(ae).map(_.expr)
-                      .getOrElse(ae).asInstanceOf[AggregateExpression].resultAttribute
-                    ae.aggregateFunction match {
-                      case a: Count =>
-                        // Counts become SUM of counts
-                        val lastSum = lastSumMap.getOrElse(resultAtt, countingAttribute)
-                        AggregateExpression(
-                          Sum(lastSum), ae.mode, ae.isDistinct, ae.filter, ae.resultId)
-
-                      case Sum(child, _) =>
-                        // Product sums - use the updated lastSumMap if available
-                        // For non-product SUMs, multiply by count
-                        if (lastSumMap.contains(resultAtt)) {
-                          val lastSum = lastSumMap(resultAtt)
-                          AggregateExpression(
-                            Sum(lastSum), ae.mode, ae.isDistinct, ae.filter, ae.resultId)
-                        } else {
-                          // Not in lastSumMap - single-column SUM needs count mult
-                          val newChild = Multiply(child,
-                            Cast(countingAttribute, child.dataType))
-                          val newFunc = ae.aggregateFunction.withNewChildren(Seq(newChild))
-                          ae.withNewChildren(Seq(newFunc))
-                            .asInstanceOf[AggregateExpression]
-                        }
-
-                      case _ => ae
-                    }
-                  case expression if !expression.foldable =>
-                    groupExpressionMap.collectFirst {
-                      case (expr, ne) if expr semanticEquals expression => ne.toAttribute
-                    }.getOrElse(expression)
-                }.asInstanceOf[NamedExpression]
-            }
-          } else {
-            rewrittenResultExpressions
-          }
-
           val newAgg = Aggregate(groupingExpressions,
-            finalRewrittenResultExpressions,
-            Project(joinTreeWithReduction.output ++ groupAliasProjections, joinTreeWithReduction))
+            rewrittenResultExpressions,
+            Project(yannakakisJoins.output ++ groupAliasProjections, yannakakisJoins))
           val queryClass = if (piecewiseGuarded) "piecewise-guarded" else "unguarded"
           logWarning(f"new aggregate ($queryClass): " + newAgg)
           debugLog("time difference: " + (System.nanoTime() - startTime))
@@ -460,7 +371,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               root.buildBottomUpJoinsCounting(aggregateAttributes,
                 groupingExpressions,
                 aggregateExpressions, lastAggMap, lastSumMap, nextMultiplicationMap,
-                pendingProductSumSet, lazyReductionProducts,
+                pendingProductSumSet,
                 keyRefs, uniqueConstraints,
                 conf.yannakakisCountGroupInLeavesEnabled,
                 usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
@@ -518,34 +429,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                 }.asInstanceOf[NamedExpression]
             }
 
-            // Insert reduction aggregate if lazy reduction was used
-            val joinTreeWithReduction = if (lazyReductionProducts.nonEmpty) {
-              debugLog(s"Lazy reduction (guarded): inserting reduction aggregate for: " +
-                lazyReductionProducts.keys.mkString(", "))
-
-              val groupingToReduce = lazyReductionProducts.values.flatten.toSet
-
-              val reductionAggregates = lazyReductionProducts.keys.toSeq.flatMap { productAttr =>
-                lastSumMap.get(productAttr).map { currentAttr =>
-                  Alias(Sum(currentAttr).toAggregateExpression(), currentAttr.name)()
-                }
-              }
-
-              val nonProductAttrs = yannakakisJoins.output.filterNot { attr =>
-                groupingToReduce.contains(attr) ||
-                  lazyReductionProducts.keys.exists(k => lastSumMap.get(k).contains(attr))
-              }
-
-              val reductionGrouping = nonProductAttrs.filterNot(groupingToReduce.contains)
-              val reductionOutput = reductionGrouping ++ reductionAggregates
-
-              Aggregate(reductionGrouping, reductionOutput, yannakakisJoins)
-            } else {
-              yannakakisJoins
-            }
-
             val newAgg = Aggregate(groupingExpressions,
-              rewrittenResultExpressions, joinTreeWithReduction)
+              rewrittenResultExpressions, yannakakisJoins)
 
             logWarning("new aggregate (guarded): " + newAgg)
             debugLog("time difference: " + (System.nanoTime() - startTime))
@@ -754,7 +639,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                                  lastSumMap: mutable.HashMap[Attribute, Attribute],
                                  nextMultiplicationMap: mutable.HashMap[Attribute, Expression],
                                  pendingProductSumSet: mutable.HashSet[Attribute],
-                                 lazyReductionProducts: mutable.HashMap[Attribute, Set[Attribute]],
                                  keyRefs: Seq[Seq[Expression]],
                                  uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean,
                                  usePhysicalCountJoin: Boolean = false,
@@ -817,7 +701,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         c.buildBottomUpJoinsCounting(aggregateAttributes,
           groupingExpressions, aggExpressions, lastAggMap, lastSumMap,
           nextMultiplicationMap, pendingProductSumSet,
-          lazyReductionProducts, keyRefs, uniqueConstraints,
+          keyRefs, uniqueConstraints,
           groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin,
           crossRelationFilters = crossRelationFilters)
 
@@ -1143,8 +1027,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               dbg(s"refsOnLeft: $refsOnLeft, refsOnRight: $refsOnRight")
 
               // Count how many attributes are in the product (excluding count attributes)
-              // 2-attribute products can be computed early
-              // 3+ attribute products are deferred to avoid grouping interference
               val productAttrs = agg.references.filter(a =>
                 !a.name.startsWith("c#") && a.name != "c")
               val numProductAttrs = productAttrs.size
@@ -1177,10 +1059,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // Left-side attrs don't need to be in grouping because CountJoin processes
               // each left row individually, so left-side values are naturally preserved.
               // Only right-side attrs need to be covered by grouping.
-              if (!SQLConf.get.yannakakisDeferProductsEnabled && numProductAttrs <= 2
-                && !hasUncoveredRightAttr) {
-                // 2-attribute product: compute early at this join
-                dbg(s"Computing 2-attr product early: ${agg}")
+              if (!SQLConf.get.yannakakisDeferProductsEnabled && !hasUncoveredRightAttr) {
+                // Compute product early at this join (works for any number of attributes)
+                dbg(s"Computing product early ($numProductAttrs attrs): ${agg}")
                 dbg(s"  refsOnLeft=$refsOnLeft refsOnRight=$refsOnRight")
                 dbg(s"  rightPlanIsLeaf=$rightPlanIsLeaf isLeafNode=$isLeafNode")
                 dbg(s"  applicableGroupAttributes=${applicableGroupAttributes.map(_.toString)}")
@@ -1230,17 +1111,11 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 // Only store non-aggregate grouping attributes (filter out count expressions)
                 // Aggregate expressions like count(1) have empty .references and shouldn't
                 // be stored as grouping attributes for lazy reduction.
-                dbg(s"Added pending 2-attr product: $productExpr")
+                dbg(s"Added pending product ($numProductAttrs attrs): $productExpr")
                 dbg(s"  productAlias=${productAlias.toAttribute}")
               } else {
-                // Defer to final aggregate: 3+ attrs, uncovered left attr, or uncovered right attr
-                if (hasUncoveredLeftAttr) {
-                  dbg(s"Deferring product (uncovered left attr: $leftAttrsNotInGrouping): ${agg}")
-                } else if (hasUncoveredRightAttr) {
-                  dbg(s"Deferring product (uncovered right attr: $rightAttrsNotInGrouping): ${agg}")
-                } else {
-                  dbg(s"Deferring 3+ attr product to final aggregate: ${agg}")
-                }
+                // Defer to final aggregate: uncovered right attr (right attr not in grouping)
+                dbg(s"Deferring product (uncovered right attr: $rightAttrsNotInGrouping): ${agg}")
                 // Don't add to lastSumMap - will be handled at final aggregate
               }
             }
