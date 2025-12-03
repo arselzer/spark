@@ -332,4 +332,66 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
     }
     // scalastyle:on println
   }
+
+  test("mixed products - independent computed early, conflicting deferred") {
+    // Test the Phase 1-2 per-product conflict detection:
+    // Some products are independent (can compute early)
+    // Some products conflict (must defer)
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows - fan-out
+    val t2 = Seq((1, 20)).toDF("id", "b")
+    val t3 = Seq((1, 30)).toDF("id", "c")
+    val t4 = Seq((1, 40)).toDF("id", "d")
+    val t5 = Seq((1, 50)).toDF("id", "e")
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+    t4.createOrReplaceTempView("t4")
+    t5.createOrReplaceTempView("t5")
+
+    // Three products:
+    // Product 1: SUM(a*b) uses {a, b}
+    // Product 2: SUM(b*c) uses {b, c} - overlaps with product 1 via 'b'
+    // Product 3: SUM(d*e) uses {d, e} - completely independent of products 1 & 2
+    //
+    // Conflict graph: Product 1 <-> Product 2 (overlap via 'b', neither subset)
+    // Product 3 is independent (no overlap with either)
+    //
+    // With Phase 1-2: Product 3 should compute early, Products 1&2 deferred
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b),
+             SUM(t2.b * t3.c),
+             SUM(t4.d * t5.e)
+      FROM t1, t2, t3, t4, t5
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id AND t4.id = t5.id
+    """
+
+    // t1 has 2 rows, others have 1 row each
+    // JOIN produces 2 rows
+    // COUNT = 2
+    // SUM(a*b) = (10*20) + (11*20) = 200 + 220 = 420
+    // SUM(b*c) = (20*30) + (20*30) = 600 + 600 = 1200
+    // SUM(d*e) = (40*50) + (40*50) = 2000 + 2000 = 4000
+    val expectedResult = Row(2L, 420L, 1200L, 4000L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== MIXED PRODUCTS (INDEPENDENT + CONFLICTING) ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
 }

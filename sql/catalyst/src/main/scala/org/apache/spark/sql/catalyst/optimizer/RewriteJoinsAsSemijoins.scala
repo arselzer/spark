@@ -249,29 +249,64 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             }
           }
 
-          // Check for conflicting product aggregates
-          // If there are multiple SUM(a*b) aggregates with non-overlapping attributes,
-          // we must defer all products to the final aggregate to avoid incorrect counts.
-          val productAggRefs = aggregateExpressionsWithAliasesReplaced.flatMap { agg =>
-            agg.aggregateFunction match {
-              case Sum(child, _) if child.references.nonEmpty =>
-                val refs = child.references.filter(a =>
-                  !a.name.startsWith("c#") && a.name != "c")
-                if (refs.size >= 2) Some(refs) else None
-              case _ => None
+          // Phase 1: Build conflict graph for product aggregates
+          // Extract product info: (aggregate expression, attribute set, result attribute)
+          case class ProductInfo(
+            agg: AggregateExpression,
+            attrs: Set[Attribute],
+            resultAttr: Attribute
+          )
+
+          val productInfos: Seq[ProductInfo] = aggregateExpressionsWithAliasesReplaced.flatMap {
+            aggExpr =>
+              aggExpr.aggregateFunction match {
+                case Sum(child, _) if child.references.nonEmpty =>
+                  val refs = child.references.filter(a =>
+                    !a.name.startsWith("c#") && a.name != "c").toSet
+                  if (refs.size >= 2) {
+                    Some(ProductInfo(aggExpr, refs, aggExpr.resultAttribute))
+                  } else None
+                case _ => None
+              }
+          }
+
+          // Define conflict relation: two products conflict if they share some but not all attrs
+          // (i.e., neither is a subset of the other)
+          def productsConflict(p1: ProductInfo, p2: ProductInfo): Boolean = {
+            val overlap = p1.attrs.intersect(p2.attrs)
+            // Conflict if: overlap exists but neither is subset of other
+            overlap.nonEmpty && !p1.attrs.subsetOf(p2.attrs) && !p2.attrs.subsetOf(p1.attrs)
+          }
+
+          // Build conflict graph and identify conflicting vs independent products
+          val conflictingProductAttrs: Set[Attribute] = if (productInfos.size >= 2) {
+            val conflictPairs = productInfos.combinations(2).filter {
+              case Seq(p1, p2) => productsConflict(p1, p2)
+              case _ => false
+            }.toSet
+
+            // Products involved in any conflict
+            val conflicting = conflictPairs.flatten.map(_.resultAttr).toSet
+            val independent = productInfos.map(_.resultAttr).toSet -- conflicting
+
+            if (conflicting.nonEmpty) {
+              debugLog(s"Conflicting products (${conflicting.size}): " +
+                productInfos.filter(p => conflicting.contains(p.resultAttr))
+                  .map(p => s"${p.agg.aggregateFunction}[${p.attrs.map(_.name).mkString(",")}]"))
             }
-          }
-          val hasConflictingProducts = productAggRefs.size >= 2 && {
-            // Check if any two products have non-overlapping attribute sets
-            productAggRefs.combinations(2).exists { case Seq(refs1, refs2) =>
-              val overlap = refs1.intersect(refs2)
-              overlap.isEmpty || (refs1 -- overlap).nonEmpty ||
-                (refs2 -- overlap).nonEmpty
+            if (independent.nonEmpty) {
+              debugLog(s"Independent products (${independent.size}): " +
+                productInfos.filter(p => independent.contains(p.resultAttr))
+                  .map(p => s"${p.agg.aggregateFunction}[${p.attrs.map(_.name).mkString(",")}]"))
             }
+
+            conflicting
+          } else {
+            Set.empty[Attribute]
           }
-          if (hasConflictingProducts) {
-            debugLog("conflicting product aggregates - will defer all products")
-          }
+
+          // For backward compatibility, also compute hasConflictingProducts boolean
+          val hasConflictingProducts = conflictingProductAttrs.nonEmpty
 
           debugLog("applicable query (joins=" + (items.size - 1) + ")")
 
@@ -284,12 +319,18 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               conf.yannakakisCountGroupInLeavesEnabled,
               usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
               crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
-              forceProductDeferral = hasConflictingProducts)
+              conflictingProductAttrs = conflictingProductAttrs)
 
           debugLog("lastAggMap: " + lastAggMap)
           debugLog("lastSumMap: " + lastSumMap)
           debugLog("resultExpressionsWithAliasesReplaced: " +
             resultExpressionsWithAliasesReplaced)
+
+          // Phase 4 (disabled for now - window-based approach needs more work)
+          // For conflicting products, we defer to the final aggregate with count multiplication
+          // The per-product conflict detection in Phase 1-2 handles this correctly
+          val productCountTrackMap = mutable.Map[Attribute, Attribute]()
+          val joinsWithWindowCounts: LogicalPlan = yannakakisJoins
 
           // Adapt the result expressions to make use of the frequency attribute
           val rewrittenResultExpressions = resultExpressionsWithAliasesReplaced.map {
@@ -328,9 +369,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                                 a.withNewChildren(Seq(lastSumAtt))
                               }
                               else {
+                                // Phase 4: Use window count for conflicting products
+                                val countToUse = productCountTrackMap.getOrElse(
+                                  resultAtt, countingAttribute)
                                 a.withNewChildren(
                                   Seq(Multiply(a.children.head,
-                                    Cast(countingAttribute, a.children.head.dataType))))
+                                    Cast(countToUse, a.children.head.dataType))))
                               }
                             case _ =>
                               // MIN, MAX
@@ -367,7 +411,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
 
           val newAgg = Aggregate(groupingExpressions,
             rewrittenResultExpressions,
-            Project(yannakakisJoins.output ++ groupAliasProjections, yannakakisJoins))
+            Project(joinsWithWindowCounts.output ++ groupAliasProjections, joinsWithWindowCounts))
           val queryClass = if (piecewiseGuarded) "piecewise-guarded" else "unguarded"
           logWarning(f"new aggregate ($queryClass): " + newAgg)
           debugLog("time difference: " + (System.nanoTime() - startTime))
@@ -402,7 +446,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                 conf.yannakakisCountGroupInLeavesEnabled,
                 usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
                 crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
-                forceProductDeferral = false)
+                conflictingProductAttrs = Set.empty)
 
             val rewrittenResultExpressions = resultExpressions.map {
               expr =>
@@ -671,7 +715,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                                  usePhysicalCountJoin: Boolean = false,
                                  crossRelationFilters: mutable.Set[Expression] =
                                    mutable.Set.empty,
-                                 forceProductDeferral: Boolean = false):
+                                 conflictingProductAttrs: Set[Attribute] = Set.empty):
   (LogicalPlan, NamedExpression, Boolean, Boolean) = {
     // scalastyle:on argcount
 
@@ -732,7 +776,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
           keyRefs, uniqueConstraints,
           groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin,
           crossRelationFilters = crossRelationFilters,
-          forceProductDeferral = forceProductDeferral)
+          conflictingProductAttrs = conflictingProductAttrs)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
@@ -825,7 +869,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       // For product aggregates (SUM(A*B) where A and B are from different relations),
       // we need to carry attributes through the tree until both are available.
       // Add right-side product attributes to grouping if the product can't be computed yet,
-      // or if forceProductDeferral is true (we're deferring even when we could compute).
+      // or if this specific product is marked as conflicting.
       val combinedOutputSet = leftPlan.outputSet ++ rightPlan.outputSet
       aggExpressions.foreach(agg => {
         agg.aggregateFunction match {
@@ -843,10 +887,12 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               !a.name.startsWith("c#") && a.name != "c")
             val isProductAgg = productAttrs.size >= 2
 
-            // When forceProductDeferral is true, we need to carry ALL product attributes
-            // through to the final aggregate, even for products that could be computed here
+            // Check if THIS SPECIFIC product is conflicting (Phase 2: per-product check)
+            val isConflictingProduct = conflictingProductAttrs.contains(agg.resultAttribute)
+
+            // Carry through if: product not yet computable OR this product conflicts with others
             val needsCarryThrough = (!isProductAggHere && refsNotYetAvailable.nonEmpty) ||
-              (forceProductDeferral && isProductAgg && refsOnRight.nonEmpty)
+              (isConflictingProduct && isProductAgg && refsOnRight.nonEmpty)
 
             if (needsCarryThrough) {
               // Add right-side refs to grouping to carry them through
@@ -1050,14 +1096,17 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 !a.name.startsWith("c#") && a.name != "c")
               val isProductAgg = productAttrsInAgg.size >= 2
 
+              // Check if THIS SPECIFIC product is conflicting (Phase 2: per-product check)
+              val isConflictingProduct = conflictingProductAttrs.contains(agg.resultAttribute)
+
               if (sumChildInGrouping) {
                 dbg(s"Skipping SUM at CountJoin - child $sumChild is in grouping, would be trivial")
                 // Don't add to applicableAggExpressions - it will be computed at final aggregate
                 // with count multiplication
-              } else if (forceProductDeferral && isProductAgg) {
-                // Product deferral is forced and this is a product aggregate -
+              } else if (isConflictingProduct && isProductAgg) {
+                // This specific product conflicts with others -
                 // skip computing it here, will be handled at final aggregate
-                dbg(s"Skipping product SUM due to forceProductDeferral: $agg")
+                dbg(s"Skipping product SUM due to conflict with other products: $agg")
               } else {
                 val newAgg = if (rightPlanIsLeaf) {
                   agg
@@ -1186,12 +1235,15 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // there's no grouping yet. After that, we must defer to final agg.
               val mustDeferForGrouping = hasConflict && !isLeafNode
 
+              // Phase 1-2: Per-product conflict check using conflict graph
+              val isConflictingProduct = conflictingProductAttrs.contains(agg.resultAttribute)
+
               dbg(s"Conflict check for ${agg}: hasForeign=$hasForeignGrouping " +
                 s"otherUnseen=$otherProductsHaveUnseenAttrs isLeaf=$isLeafNode " +
-                s"mustDefer=$mustDeferForGrouping forceDefer=$forceProductDeferral")
+                s"mustDefer=$mustDeferForGrouping isConflicting=$isConflictingProduct")
 
               if (!SQLConf.get.yannakakisDeferProductsEnabled && !hasUncoveredRightAttr &&
-                  !mustDeferForGrouping && !forceProductDeferral) {
+                  !mustDeferForGrouping && !isConflictingProduct) {
                 // Compute product early at this join (works for any number of attributes)
                 dbg(s"Computing product early ($numProductAttrs attrs): ${agg}")
                 dbg(s"  refsOnLeft=$refsOnLeft refsOnRight=$refsOnRight")
