@@ -394,4 +394,276 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
     }
     // scalastyle:on println
   }
+
+  test("chain of conflicts with multiple fan-outs") {
+    // Chain conflict: P1-P2 conflict, P2-P3 conflict, P1-P3 transitively connected
+    // Multiple fan-outs to stress test count tracking
+    val t1 = Seq((1, 10), (1, 11), (1, 12)).toDF("id", "a")  // 3 rows
+    val t2 = Seq((1, 20), (1, 21)).toDF("id", "b")           // 2 rows
+    val t3 = Seq((1, 30)).toDF("id", "c")                    // 1 row
+    val t4 = Seq((1, 40), (1, 41)).toDF("id", "d")           // 2 rows
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+    t4.createOrReplaceTempView("t4")
+
+    // Chain of conflicts:
+    // P1: SUM(a*b) uses {a, b}
+    // P2: SUM(b*c) uses {b, c} - overlaps P1 via 'b'
+    // P3: SUM(c*d) uses {c, d} - overlaps P2 via 'c'
+    // All three form a conflict chain
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b),
+             SUM(t2.b * t3.c),
+             SUM(t3.c * t4.d)
+      FROM t1, t2, t3, t4
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id
+    """
+
+    // JOIN produces 3*2*1*2 = 12 rows
+    // Each row has: (a from {10,11,12}, b from {20,21}, c=30, d from {40,41})
+    //
+    // COUNT = 12
+    //
+    // SUM(a*b):
+    // For each (a,b) pair, it appears 1*2 = 2 times (c has 1 val, d has 2 vals)
+    // (10,20): 200 * 2 = 400
+    // (10,21): 210 * 2 = 420
+    // (11,20): 220 * 2 = 440
+    // (11,21): 231 * 2 = 462
+    // (12,20): 240 * 2 = 480
+    // (12,21): 252 * 2 = 504
+    // Total: 400+420+440+462+480+504 = 2706
+    //
+    // SUM(b*c):
+    // For each (b,c) pair, it appears 3*2 = 6 times (a has 3 vals, d has 2 vals)
+    // (20,30): 600 * 6 = 3600
+    // (21,30): 630 * 6 = 3780
+    // Total: 3600+3780 = 7380
+    //
+    // SUM(c*d):
+    // For each (c,d) pair, it appears 3*2 = 6 times (a has 3 vals, b has 2 vals)
+    // (30,40): 1200 * 6 = 7200
+    // (30,41): 1230 * 6 = 7380
+    // Total: 7200+7380 = 14580
+    val expectedResult = Row(12L, 2706L, 7380L, 14580L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (chain): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CHAIN OF CONFLICTS WITH MULTIPLE FAN-OUTS ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("three-way product with fan-out") {
+    // Product involving three attributes from three different tables
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows
+    val t2 = Seq((1, 20), (1, 21)).toDF("id", "b")  // 2 rows
+    val t3 = Seq((1, 30)).toDF("id", "c")           // 1 row
+    val t4 = Seq((1, 40)).toDF("id", "d")           // 1 row
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+    t4.createOrReplaceTempView("t4")
+
+    // Three-way product: SUM(a*b*c)
+    // Plus a regular product: SUM(a*d)
+    // These conflict because they share 'a' but have different other attrs
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b * t3.c),
+             SUM(t1.a * t4.d)
+      FROM t1, t2, t3, t4
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id
+    """
+
+    // JOIN produces 2*2*1*1 = 4 rows
+    // Rows: (a,b,c,d) in {(10,20,30,40), (10,21,30,40), (11,20,30,40), (11,21,30,40)}
+    //
+    // COUNT = 4
+    //
+    // SUM(a*b*c):
+    // (10,20,30): 6000
+    // (10,21,30): 6300
+    // (11,20,30): 6600
+    // (11,21,30): 6930
+    // Total: 6000+6300+6600+6930 = 25830
+    //
+    // SUM(a*d):
+    // (10,40): 400 appears 2 times (b has 2 vals) = 800
+    // (11,40): 440 appears 2 times (b has 2 vals) = 880
+    // Total: 800+880 = 1680
+    val expectedResult = Row(4L, 25830L, 1680L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (3-way): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== THREE-WAY PRODUCT WITH FAN-OUT ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("asymmetric fan-out stress test") {
+    // Highly asymmetric fan-out to stress the count multiplication
+    val t1 = Seq((1, 1), (1, 2), (1, 3), (1, 4), (1, 5)).toDF("id", "a")  // 5 rows
+    val t2 = Seq((1, 10)).toDF("id", "b")                                  // 1 row
+    val t3 = Seq((1, 100), (1, 101), (1, 102)).toDF("id", "c")            // 3 rows
+    val t4 = Seq((1, 1000)).toDF("id", "d")                                // 1 row
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+    t4.createOrReplaceTempView("t4")
+
+    // Products with very different fan-out patterns:
+    // P1: SUM(a*b) - {a,b}, a has 5 vals, b has 1 val
+    // P2: SUM(c*d) - {c,d}, c has 3 vals, d has 1 val
+    // These are independent (no shared attrs) but have asymmetric cardinalities
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b),
+             SUM(t3.c * t4.d)
+      FROM t1, t2, t3, t4
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id
+    """
+
+    // JOIN produces 5*1*3*1 = 15 rows
+    //
+    // COUNT = 15
+    //
+    // SUM(a*b):
+    // Each a value appears 3 times (once per c value)
+    // (1*10)*3 + (2*10)*3 + (3*10)*3 + (4*10)*3 + (5*10)*3
+    // = 30 + 60 + 90 + 120 + 150 = 450
+    //
+    // SUM(c*d):
+    // Each c value appears 5 times (once per a value)
+    // (100*1000)*5 + (101*1000)*5 + (102*1000)*5
+    // = 500000 + 505000 + 510000 = 1515000
+    val expectedResult = Row(15L, 450L, 1515000L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (asymmetric): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== ASYMMETRIC FAN-OUT STRESS TEST ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("complex conflict web - all products interconnected") {
+    // Every product overlaps with every other product
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows
+    val t2 = Seq((1, 20)).toDF("id", "b")           // 1 row
+    val t3 = Seq((1, 30), (1, 31)).toDF("id", "c")  // 2 rows
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+
+    // Four products that form a complete conflict graph:
+    // P1: SUM(a*b) uses {a, b}
+    // P2: SUM(b*c) uses {b, c}
+    // P3: SUM(a*c) uses {a, c}
+    // P4: SUM(a*b*c) uses {a, b, c}
+    //
+    // All four conflict with each other (pairwise overlap, none is subset)
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b),
+             SUM(t2.b * t3.c),
+             SUM(t1.a * t3.c),
+             SUM(t1.a * t2.b * t3.c)
+      FROM t1, t2, t3
+      WHERE t1.id = t2.id AND t2.id = t3.id
+    """
+
+    // JOIN produces 2*1*2 = 4 rows
+    // Rows: (a,b,c) in {(10,20,30), (10,20,31), (11,20,30), (11,20,31)}
+    //
+    // COUNT = 4
+    //
+    // SUM(a*b):
+    // (10,20) appears 2 times (c has 2 vals) = 200*2 = 400
+    // (11,20) appears 2 times (c has 2 vals) = 220*2 = 440
+    // Total: 840
+    //
+    // SUM(b*c):
+    // (20,30) appears 2 times (a has 2 vals) = 600*2 = 1200
+    // (20,31) appears 2 times (a has 2 vals) = 620*2 = 1240
+    // Total: 2440
+    //
+    // SUM(a*c):
+    // (10,30) appears 1 time = 300
+    // (10,31) appears 1 time = 310
+    // (11,30) appears 1 time = 330
+    // (11,31) appears 1 time = 341
+    // Total: 1281
+    //
+    // SUM(a*b*c):
+    // 10*20*30 = 6000
+    // 10*20*31 = 6200
+    // 11*20*30 = 6600
+    // 11*20*31 = 6820
+    // Total: 25620
+    val expectedResult = Row(4L, 840L, 2440L, 1281L, 25620L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (web): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== COMPLEX CONFLICT WEB ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
 }
