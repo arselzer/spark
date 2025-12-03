@@ -1100,4 +1100,579 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
     }
     // scalastyle:on println
   }
+
+  // ============================================================================
+  // Cross-relation filter tests
+  // These test the DeferredComputation framework with filters spanning relations
+  // ============================================================================
+
+  test("cross-relation filter only - no products (optimization should apply)") {
+    // This test has ONLY cross-relation filters, no product aggregates.
+    // The Yannakakis optimization should fully apply here.
+    // Filter: a + b > 30
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+
+    // t1: id=1 -> a in {10, 11, 12}
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 11), (1, 12)")
+    // t2: id=1 -> b in {20, 21}
+    spark.sql("INSERT INTO t2 VALUES (1, 20), (1, 21)")
+
+    val query = """
+      SELECT COUNT(*)
+      FROM t1, t2
+      WHERE t1.id = t2.id AND t1.a + t2.b > 30
+    """
+
+    // Full join produces 3*2 = 6 rows:
+    // (10,20), (10,21), (11,20), (11,21), (12,20), (12,21)
+    // Filter a + b > 30:
+    // (10,20)=30 NO, (10,21)=31 YES, (11,20)=31 YES, (11,21)=32 YES,
+    // (12,20)=32 YES, (12,21)=33 YES
+    // Passing: 5 rows
+    val expectedResult = Row(5L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (filter-only): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CROSS-RELATION FILTER ONLY (optimized) ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("cross-relation filter - simple two-table filter") {
+    // Filter: a + b > 30
+    // This filter spans two relations and must be deferred until both are available
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+
+    // t1: id=1 -> a in {10, 11, 12}
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 11), (1, 12)")
+    // t2: id=1 -> b in {20, 21}
+    spark.sql("INSERT INTO t2 VALUES (1, 20), (1, 21)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a), SUM(t2.b)
+      FROM t1, t2
+      WHERE t1.id = t2.id AND t1.a + t2.b > 30
+    """
+
+    // Full join produces 3*2 = 6 rows:
+    // (10,20), (10,21), (11,20), (11,21), (12,20), (12,21)
+    // Filter a + b > 30:
+    // (10,20)=30 NO, (10,21)=31 YES, (11,20)=31 YES, (11,21)=32 YES,
+    // (12,20)=32 YES, (12,21)=33 YES
+    // Passing: 5 rows
+    // SUM(a) = 10+11+11+12+12 = 56
+    // SUM(b) = 21+20+21+20+21 = 103
+    val expectedResult = Row(5L, 56L, 103L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (cross-filter-2-table): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CROSS-RELATION FILTER (2-table) ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("cross-relation filter - three-table filter chain") {
+    // Filter: a + b + c > 60
+    // This filter spans three relations
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+    spark.sql("DROP TABLE IF EXISTS t3")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+    spark.sql("CREATE TABLE t3 (id INT, c INT) USING parquet")
+
+    // t1: id=1 -> a in {10, 20}
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 20)")
+    // t2: id=1 -> b in {15, 25}
+    spark.sql("INSERT INTO t2 VALUES (1, 15), (1, 25)")
+    // t3: id=1 -> c in {30}
+    spark.sql("INSERT INTO t3 VALUES (1, 30)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a), SUM(t2.b), SUM(t3.c)
+      FROM t1, t2, t3
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t1.a + t2.b + t3.c > 60
+    """
+
+    // Full join produces 2*2*1 = 4 rows:
+    // (10,15,30), (10,25,30), (20,15,30), (20,25,30)
+    // Filter a + b + c > 60:
+    // (10,15,30)=55 NO, (10,25,30)=65 YES, (20,15,30)=65 YES, (20,25,30)=75 YES
+    // Passing: 3 rows
+    // SUM(a) = 10+20+20 = 50
+    // SUM(b) = 25+15+25 = 65
+    // SUM(c) = 30+30+30 = 90
+    val expectedResult = Row(3L, 50L, 65L, 90L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (cross-filter-3-table): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CROSS-RELATION FILTER (3-table chain) ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("cross-relation filter with product aggregate") {
+    // Combines a cross-relation filter with a product aggregate
+    // Filter: a + b > 30
+    // Aggregate: SUM(a * b)
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+
+    // t1: id=1 -> a in {10, 11, 12}
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 11), (1, 12)")
+    // t2: id=1 -> b in {20, 21}
+    spark.sql("INSERT INTO t2 VALUES (1, 20), (1, 21)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a * t2.b)
+      FROM t1, t2
+      WHERE t1.id = t2.id AND t1.a + t2.b > 30
+    """
+
+    // Full join produces 6 rows, filter passes 5:
+    // (10,21), (11,20), (11,21), (12,20), (12,21)
+    // SUM(a*b) = 10*21 + 11*20 + 11*21 + 12*20 + 12*21
+    //          = 210 + 220 + 231 + 240 + 252 = 1153
+    val expectedResult = Row(5L, 1153L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (filter+product): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CROSS-RELATION FILTER + PRODUCT ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("multiple cross-relation filters") {
+    // Multiple filters spanning different relation pairs
+    // Filter 1: a + b > 30
+    // Filter 2: b + c > 50
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+    spark.sql("DROP TABLE IF EXISTS t3")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+    spark.sql("CREATE TABLE t3 (id INT, c INT) USING parquet")
+
+    // t1: id=1 -> a in {10, 20}
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 20)")
+    // t2: id=1 -> b in {25, 35}
+    spark.sql("INSERT INTO t2 VALUES (1, 25), (1, 35)")
+    // t3: id=1 -> c in {20, 30}
+    spark.sql("INSERT INTO t3 VALUES (1, 20), (1, 30)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a), SUM(t2.b), SUM(t3.c)
+      FROM t1, t2, t3
+      WHERE t1.id = t2.id AND t2.id = t3.id
+        AND t1.a + t2.b > 30
+        AND t2.b + t3.c > 50
+    """
+
+    // Full join produces 2*2*2 = 8 rows:
+    // (a,b,c): (10,25,20), (10,25,30), (10,35,20), (10,35,30),
+    //         (20,25,20), (20,25,30), (20,35,20), (20,35,30)
+    //
+    // Filter a + b > 30:
+    // (10,25)=35 YES, (10,35)=45 YES, (20,25)=45 YES, (20,35)=55 YES
+    // All pass first filter
+    //
+    // Filter b + c > 50:
+    // (25,20)=45 NO, (25,30)=55 YES, (35,20)=55 YES, (35,30)=65 YES
+    //
+    // Combined passing rows:
+    // (10,25,30), (10,35,20), (10,35,30), (20,25,30), (20,35,20), (20,35,30)
+    // That's 6 rows
+    //
+    // SUM(a) = 10+10+10+20+20+20 = 90
+    // SUM(b) = 25+35+35+25+35+35 = 190
+    // SUM(c) = 30+20+30+30+20+30 = 160
+    val expectedResult = Row(6L, 90L, 190L, 160L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (multi-filter): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== MULTIPLE CROSS-RELATION FILTERS ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("cross-relation filter with inequality") {
+    // Filter: a < b (inequality comparison across relations)
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+
+    // t1: id=1 -> a in {10, 20, 30}
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 20), (1, 30)")
+    // t2: id=1 -> b in {15, 25}
+    spark.sql("INSERT INTO t2 VALUES (1, 15), (1, 25)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a), SUM(t2.b)
+      FROM t1, t2
+      WHERE t1.id = t2.id AND t1.a < t2.b
+    """
+
+    // Full join produces 3*2 = 6 rows:
+    // (10,15), (10,25), (20,15), (20,25), (30,15), (30,25)
+    // Filter a < b:
+    // (10,15) 10<15 YES, (10,25) 10<25 YES, (20,15) 20<15 NO,
+    // (20,25) 20<25 YES, (30,15) 30<15 NO, (30,25) 30<25 NO
+    // Passing: 3 rows
+    // SUM(a) = 10+10+20 = 40
+    // SUM(b) = 15+25+25 = 65
+    val expectedResult = Row(3L, 40L, 65L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (inequality-filter): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CROSS-RELATION INEQUALITY FILTER ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("cross-relation filter with product - hierarchical") {
+    // Hierarchical products with a cross-relation filter
+    // Products: sum(a), sum(a*b), sum(a*b*c) - containment: {a} < {a,b} < {a,b,c}
+    // Filter: a + c > 35
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+    spark.sql("DROP TABLE IF EXISTS t3")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+    spark.sql("CREATE TABLE t3 (id INT, c INT) USING parquet")
+
+    // t1: id=1 -> a in {10, 20}
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 20)")
+    // t2: id=1 -> b in {2, 3}
+    spark.sql("INSERT INTO t2 VALUES (1, 2), (1, 3)")
+    // t3: id=1 -> c in {30}
+    spark.sql("INSERT INTO t3 VALUES (1, 30)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a), SUM(t1.a * t2.b), SUM(t1.a * t2.b * t3.c)
+      FROM t1, t2, t3
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t1.a + t3.c > 35
+    """
+
+    // Full join produces 2*2*1 = 4 rows:
+    // (10,2,30), (10,3,30), (20,2,30), (20,3,30)
+    // Filter a + c > 35:
+    // (10,_,30) = 40 YES, (20,_,30) = 50 YES
+    // All 4 rows pass!
+    //
+    // COUNT = 4
+    // SUM(a) = 10+10+20+20 = 60
+    // SUM(a*b) = 10*2 + 10*3 + 20*2 + 20*3 = 20+30+40+60 = 150
+    // SUM(a*b*c) = 20*30 + 30*30 + 40*30 + 60*30 = 600+900+1200+1800 = 4500
+    val expectedResult = Row(4L, 60L, 150L, 4500L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (hierarchical+filter): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== HIERARCHICAL PRODUCTS + CROSS-RELATION FILTER ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("filter superset of product - 4 tables with complex filter") {
+    // Filter spans all 4 attrs: a*b + c*d > 100
+    // Product spans 2 attrs: SUM(a*b)
+    // Filter attrs {a,b,c,d} is superset of product attrs {a,b} - should optimize
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+    spark.sql("DROP TABLE IF EXISTS t3")
+    spark.sql("DROP TABLE IF EXISTS t4")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+    spark.sql("CREATE TABLE t3 (id INT, c INT) USING parquet")
+    spark.sql("CREATE TABLE t4 (id INT, d INT) USING parquet")
+
+    spark.sql("INSERT INTO t1 VALUES (1, 5), (1, 10)")
+    spark.sql("INSERT INTO t2 VALUES (1, 6), (1, 12)")
+    spark.sql("INSERT INTO t3 VALUES (1, 3)")
+    spark.sql("INSERT INTO t4 VALUES (1, 4)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a * t2.b)
+      FROM t1, t2, t3, t4
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id
+        AND t1.a * t2.b + t3.c * t4.d > 50
+    """
+
+    // Full join: 2*2*1*1 = 4 rows
+    // (a,b,c,d): (5,6,3,4), (5,12,3,4), (10,6,3,4), (10,12,3,4)
+    // a*b + c*d: 30+12=42, 60+12=72, 60+12=72, 120+12=132
+    // Filter > 50: (5,12), (10,6), (10,12) pass = 3 rows
+    // SUM(a*b) = 60 + 60 + 120 = 240
+    val expectedResult = Row(3L, 240L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (4-table-filter-superset): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== 4-TABLE FILTER SUPERSET OF PRODUCT ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("filter with multiple products - all contained") {
+    // Filter: a*b > 50
+    // Products: SUM(a), SUM(b), SUM(a*b)
+    // All products {a}, {b}, {a,b} are subsets of filter {a,b}
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+
+    spark.sql("INSERT INTO t1 VALUES (1, 5), (1, 10), (1, 15)")
+    spark.sql("INSERT INTO t2 VALUES (1, 6), (1, 8)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a), SUM(t2.b), SUM(t1.a * t2.b)
+      FROM t1, t2
+      WHERE t1.id = t2.id AND t1.a * t2.b > 50
+    """
+
+    // Full join: 3*2 = 6 rows
+    // (a,b): (5,6)=30, (5,8)=40, (10,6)=60, (10,8)=80, (15,6)=90, (15,8)=120
+    // Filter a*b > 50: (10,6), (10,8), (15,6), (15,8) pass = 4 rows
+    // SUM(a) = 10+10+15+15 = 50
+    // SUM(b) = 6+8+6+8 = 28
+    // SUM(a*b) = 60+80+90+120 = 350
+    val expectedResult = Row(4L, 50L, 28L, 350L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (multi-product-contained): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== MULTIPLE PRODUCTS ALL CONTAINED IN FILTER ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("filter with OR condition across relations") {
+    // Filter: a > 15 OR b > 25
+    // This creates a disjunctive filter spanning two relations
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 20)")
+    spark.sql("INSERT INTO t2 VALUES (1, 20), (1, 30)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a), SUM(t2.b)
+      FROM t1, t2
+      WHERE t1.id = t2.id AND (t1.a > 15 OR t2.b > 25)
+    """
+
+    // Full join: 2*2 = 4 rows
+    // (a,b): (10,20), (10,30), (20,20), (20,30)
+    // Filter a>15 OR b>25:
+    // (10,20): 10>15=F, 20>25=F -> NO
+    // (10,30): 10>15=F, 30>25=T -> YES
+    // (20,20): 20>15=T, 20>25=F -> YES
+    // (20,30): 20>15=T, 30>25=T -> YES
+    // Passing: 3 rows
+    // SUM(a) = 10+20+20 = 50
+    // SUM(b) = 30+20+30 = 80
+    val expectedResult = Row(3L, 50L, 80L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (or-filter): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== OR FILTER ACROSS RELATIONS ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("filter with function application across relations") {
+    // Filter: ABS(a - b) < 10 (function applied to cross-relation expression)
+    spark.sql("DROP TABLE IF EXISTS t1")
+    spark.sql("DROP TABLE IF EXISTS t2")
+
+    spark.sql("CREATE TABLE t1 (id INT, a INT) USING parquet")
+    spark.sql("CREATE TABLE t2 (id INT, b INT) USING parquet")
+
+    spark.sql("INSERT INTO t1 VALUES (1, 10), (1, 25), (1, 40)")
+    spark.sql("INSERT INTO t2 VALUES (1, 15), (1, 30)")
+
+    val query = """
+      SELECT COUNT(*), SUM(t1.a), SUM(t2.b), SUM(t1.a * t2.b)
+      FROM t1, t2
+      WHERE t1.id = t2.id AND ABS(t1.a - t2.b) < 10
+    """
+
+    // Full join: 3*2 = 6 rows
+    // (a,b): (10,15), (10,30), (25,15), (25,30), (40,15), (40,30)
+    // ABS(a-b): 5, 20, 10, 5, 25, 10
+    // Filter ABS(a-b) < 10:
+    // (10,15)=5 YES, (10,30)=20 NO, (25,15)=10 NO, (25,30)=5 YES,
+    // (40,15)=25 NO, (40,30)=10 NO
+    // Passing: 2 rows
+    // SUM(a) = 10+25 = 35
+    // SUM(b) = 15+30 = 45
+    // SUM(a*b) = 10*15 + 25*30 = 150 + 750 = 900
+    val expectedResult = Row(2L, 35L, 45L, 900L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (abs-filter): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== ABS FUNCTION FILTER ACROSS RELATIONS ===")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
 }

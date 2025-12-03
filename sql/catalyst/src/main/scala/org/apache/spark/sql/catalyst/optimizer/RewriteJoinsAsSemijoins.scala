@@ -331,13 +331,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               debugLog("unguarded. plan is not changed")
               return agg
             }
-            // Check if there are cross-relation filters AND cross-relation product aggregates.
-            // This combination is problematic because the counts computed at early joins
-            // don't account for the cross-relation filter. Fall back to non-optimized execution.
-            if (hg.crossRelationFilters.nonEmpty && unguardedAggAttributes.nonEmpty) {
-              debugLog("unguarded with cross-relation filters. plan is not changed")
-              return agg
-            }
           }
 
           // Phase 1: Extract and analyze deferred computations using unified framework
@@ -346,6 +339,42 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             aggregateExpressionsWithAliasesReplaced,
             hg.crossRelationFilters
           )
+
+          // Check if there are cross-relation filters AND cross-relation product aggregates.
+          // The key insight: filters are added to the CountJoin condition (lines 939-944),
+          // so they're evaluated BEFORE count aggregation. This means:
+          // - At the join where filter becomes applicable, rows are filtered first
+          // - Counts are computed only on filtered rows
+          // - Products computed at that join use correct filtered counts
+          //
+          // HOWEVER, there's a subtle issue with 3+ table joins:
+          // If filter spans {a,c} and product spans {a,b} with order t3->t2->t1,
+          // the count at t3 join t2 is computed before the filter can be applied.
+          //
+          // Safe case: Filter and product have the SAME attribute set, or filter attrs
+          // are a superset of product attrs. Then filter is applied at same/earlier join.
+          //
+          // For now, only allow if filter attrs contain all product attrs (containment).
+          if (hg.crossRelationFilters.nonEmpty && unguardedAggAttributes.nonEmpty) {
+            val filterAttrs = hg.crossRelationFilters.flatMap(_.references).toSet
+            val productAttrSets = deferredComputations
+              .filter(_.computationType == ProductAggregate)
+              .map(_.attrs)
+
+            val allProductsContainedInFilter = productAttrSets.forall { prodAttrs =>
+              prodAttrs.subsetOf(filterAttrs)
+            }
+
+            if (!allProductsContainedInFilter) {
+              debugLog("unguarded with cross-relation filters (non-contained). " +
+                "plan is not changed")
+              debugLog(s"  filter attrs: $filterAttrs")
+              debugLog(s"  product attr sets: $productAttrSets")
+              return agg
+            }
+
+            debugLog("Filter+product optimization: products contained in filter attrs")
+          }
 
           // Separate products from filters for logging
           val productComputations = deferredComputations.filter(
