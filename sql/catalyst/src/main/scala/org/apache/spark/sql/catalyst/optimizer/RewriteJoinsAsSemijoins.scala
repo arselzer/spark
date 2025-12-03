@@ -39,6 +39,97 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     if (DEBUG_LOGGING) logWarning(msg)
   }
 
+  /**
+   * DeferredComputation: A unified abstraction for computations that need attributes
+   * from multiple relations before they can be evaluated.
+   *
+   * This unifies two concepts:
+   * 1. Product aggregates: SUM(A*B) where A and B come from different relations
+   * 2. Cross-relation filters: predicates like (R.x + S.y > 10) spanning multiple relations
+   *
+   * Both use the same strategy:
+   * - Carry required attributes through grouping at each join
+   * - Compute/apply when all required attributes become available
+   * - For products: early computation with count propagation
+   * - For filters: apply at the join where all attrs are available
+   *
+   * Key insight: The current implementation already handles this correctly:
+   * - Products are computed early and counts are propagated (Phase 1-2)
+   * - Conflicting products add all their attrs to grouping to ensure correct counts
+   * - Cross-relation filters carry attrs and apply when available (lines 929-949)
+   *
+   * The "cost" of handling conflicts is carrying attributes through, but this is
+   * mathematically equivalent to any hierarchical approach and unavoidable when
+   * there's no containment structure among the computations.
+   */
+  sealed trait DeferredComputationType
+  case object ProductAggregate extends DeferredComputationType
+  case object CrossRelationFilter extends DeferredComputationType
+
+  case class DeferredComputation(
+    attrs: Set[Attribute],          // Attributes required for this computation
+    expr: Expression,               // The expression to evaluate
+    computationType: DeferredComputationType,
+    resultAttr: Option[Attribute] = None  // For products: the result attribute
+  ) {
+    // Check if this computation can be evaluated given available attributes
+    def canEvaluate(availableAttrs: AttributeSet): Boolean =
+      attrs.forall(a => availableAttrs.contains(a))
+
+    // Check if two deferred computations conflict (share some but not all attrs)
+    def conflictsWith(other: DeferredComputation): Boolean = {
+      val overlap = attrs.intersect(other.attrs)
+      overlap.nonEmpty && !attrs.subsetOf(other.attrs) && !other.attrs.subsetOf(attrs)
+    }
+
+    // Check if this computation's attrs are contained in another's (for hierarchical)
+    def containedIn(other: DeferredComputation): Boolean =
+      attrs.subsetOf(other.attrs) && attrs != other.attrs
+  }
+
+  /**
+   * Analyzes the containment structure among deferred computations.
+   * Returns true if hierarchical count tracks could help (i.e., containment exists).
+   *
+   * For the IMDB query, this returns false because all products conflict without containment.
+   * For "complex conflict web" test, P4 contains P1, P2, P3, so this would return true.
+   */
+  def hasContainmentStructure(computations: Seq[DeferredComputation]): Boolean = {
+    computations.exists { c1 =>
+      computations.exists { c2 =>
+        c1 != c2 && c1.containedIn(c2)
+      }
+    }
+  }
+
+  /**
+   * Extracts deferred computations from aggregate expressions.
+   */
+  def extractDeferredComputations(
+    aggExpressions: Seq[AggregateExpression],
+    crossRelationFilters: Seq[Expression]
+  ): Seq[DeferredComputation] = {
+    // Extract product aggregates
+    val products = aggExpressions.flatMap { agg =>
+      agg.aggregateFunction match {
+        case Sum(child, _) if child.references.nonEmpty =>
+          val refs = child.references.filter(a =>
+            !a.name.startsWith("c#") && a.name != "c").toSet
+          if (refs.size >= 2) {
+            Some(DeferredComputation(refs, child, ProductAggregate, Some(agg.resultAttribute)))
+          } else None
+        case _ => None
+      }
+    }
+
+    // Extract cross-relation filters
+    val filters = crossRelationFilters.map { filter =>
+      DeferredComputation(filter.references.toSet, filter, CrossRelationFilter)
+    }
+
+    products ++ filters
+  }
+
   /** As in [[PhysicalAggregation]] the aggregate  expressions are extracted from the
    * outputExpressions ([[NamedExpression]]. Then these are replaced in the output expressions
    * by new references.
@@ -249,55 +340,50 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             }
           }
 
-          // Phase 1: Build conflict graph for product aggregates
-          // Extract product info: (aggregate expression, attribute set, result attribute)
-          case class ProductInfo(
-            agg: AggregateExpression,
-            attrs: Set[Attribute],
-            resultAttr: Attribute
+          // Phase 1: Extract and analyze deferred computations using unified framework
+          // This includes both product aggregates and cross-relation filters
+          val deferredComputations = extractDeferredComputations(
+            aggregateExpressionsWithAliasesReplaced,
+            hg.crossRelationFilters
           )
 
-          val productInfos: Seq[ProductInfo] = aggregateExpressionsWithAliasesReplaced.flatMap {
-            aggExpr =>
-              aggExpr.aggregateFunction match {
-                case Sum(child, _) if child.references.nonEmpty =>
-                  val refs = child.references.filter(a =>
-                    !a.name.startsWith("c#") && a.name != "c").toSet
-                  if (refs.size >= 2) {
-                    Some(ProductInfo(aggExpr, refs, aggExpr.resultAttribute))
-                  } else None
-                case _ => None
-              }
+          // Separate products from filters for logging
+          val productComputations = deferredComputations.filter(
+            _.computationType == ProductAggregate)
+          val filterComputations = deferredComputations.filter(
+            _.computationType == CrossRelationFilter)
+
+          // Log containment analysis (useful for understanding optimization potential)
+          if (productComputations.size >= 2) {
+            val hasContainment = hasContainmentStructure(productComputations)
+            debugLog(s"Product containment structure exists: $hasContainment")
+            if (hasContainment) {
+              debugLog("  (Hierarchical count tracks could optimize this case)")
+            } else {
+              debugLog("  (No containment - all products require full attr propagation)")
+            }
           }
 
-          // Define conflict relation: two products conflict if they share some but not all attrs
-          // (i.e., neither is a subset of the other)
-          def productsConflict(p1: ProductInfo, p2: ProductInfo): Boolean = {
-            val overlap = p1.attrs.intersect(p2.attrs)
-            // Conflict if: overlap exists but neither is subset of other
-            overlap.nonEmpty && !p1.attrs.subsetOf(p2.attrs) && !p2.attrs.subsetOf(p1.attrs)
-          }
-
-          // Build conflict graph and identify conflicting vs independent products
-          val conflictingProductAttrs: Set[Attribute] = if (productInfos.size >= 2) {
-            val conflictPairs = productInfos.combinations(2).filter {
-              case Seq(p1, p2) => productsConflict(p1, p2)
+          // Build conflict graph using DeferredComputation.conflictsWith
+          val conflictingProductAttrs: Set[Attribute] = if (productComputations.size >= 2) {
+            val conflictPairs = productComputations.combinations(2).filter {
+              case Seq(p1, p2) => p1.conflictsWith(p2)
               case _ => false
             }.toSet
 
             // Products involved in any conflict
-            val conflicting = conflictPairs.flatten.map(_.resultAttr).toSet
-            val independent = productInfos.map(_.resultAttr).toSet -- conflicting
+            val conflicting = conflictPairs.flatten.flatMap(_.resultAttr).toSet
+            val independent = productComputations.flatMap(_.resultAttr).toSet -- conflicting
 
             if (conflicting.nonEmpty) {
               debugLog(s"Conflicting products (${conflicting.size}): " +
-                productInfos.filter(p => conflicting.contains(p.resultAttr))
-                  .map(p => s"${p.agg.aggregateFunction}[${p.attrs.map(_.name).mkString(",")}]"))
+                productComputations.filter(p => p.resultAttr.exists(conflicting.contains))
+                  .map(p => s"${p.expr}[${p.attrs.map(_.name).mkString(",")}]"))
             }
             if (independent.nonEmpty) {
               debugLog(s"Independent products (${independent.size}): " +
-                productInfos.filter(p => independent.contains(p.resultAttr))
-                  .map(p => s"${p.agg.aggregateFunction}[${p.attrs.map(_.name).mkString(",")}]"))
+                productComputations.filter(p => p.resultAttr.exists(independent.contains))
+                  .map(p => s"${p.expr}[${p.attrs.map(_.name).mkString(",")}]"))
             }
 
             conflicting
@@ -305,7 +391,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             Set.empty[Attribute]
           }
 
-          // For backward compatibility, also compute hasConflictingProducts boolean
+          // Log cross-relation filters (handled uniformly with products)
+          if (filterComputations.nonEmpty) {
+            debugLog(s"Cross-relation filters (${filterComputations.size}): " +
+              filterComputations.map(f => s"${f.expr}[${f.attrs.map(_.name).mkString(",")}]"))
+          }
+
+          // For backward compatibility
           val hasConflictingProducts = conflictingProductAttrs.nonEmpty
 
           debugLog("applicable query (joins=" + (items.size - 1) + ")")
