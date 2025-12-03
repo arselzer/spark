@@ -21,7 +21,32 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
 /**
- * Test suite for the 12-table IMDB bug with real data cardinalities.
+ * Comprehensive test suite for Yannakakis optimization with product aggregates.
+ *
+ * This suite tests:
+ * 1. The 12-table IMDB query with real data cardinalities
+ * 2. Multi-count optimization cases (when it applies and when it doesn't)
+ * 3. Cross-relation filter handling
+ * 4. Various product conflict patterns
+ *
+ * MULTI-COUNT OPTIMIZATION CASES:
+ * ===============================
+ * CASE 1 - Independent Products: {a,b}, {c,d} with no overlap
+ *          -> Each can use its own count track (optimization applies)
+ *
+ * CASE 2 - Containment Hierarchy: {a} < {a,b} < {a,b,c}
+ *          -> Derive coarser counts from finest (optimization applies)
+ *
+ * CASE 3 - Universal Superset: {a,b}, {a,c}, {b,c} all contained in {a,b,c}
+ *          -> Use superset as source (optimization applies)
+ *
+ * CASE 4 - Multiple Components: {a,b},{b,c} conflict + {d,e} independent
+ *          -> Independent component optimizes; conflict defers (partial)
+ *
+ * CASE 5 - Star Pattern: {a,b}, {a,c}, {a,d} all share 'a'
+ *          -> No containment, must defer ALL to final (NO optimization)
+ *          -> This is the IMDB query pattern!
+ *
  * Run with: build/sbt 'sql/testOnly org.apache.spark.sql.IMDB12TableBugSuite'
  */
 class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
@@ -1674,5 +1699,737 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       checkAnswer(df, expectedResult)
     }
     // scalastyle:on println
+  }
+
+  // ============================================================================
+  // MULTI-COUNT OPTIMIZATION CASE TESTS
+  // These tests explicitly verify each case where multi-count optimization
+  // can or cannot make a difference.
+  // ============================================================================
+
+  test("CASE 1: Independent products - no shared attributes") {
+    // Two products with completely disjoint attribute sets
+    // SUM(a*b) uses {a,b}, SUM(c*d) uses {c,d} - NO overlap
+    // Each product can use its own count track independently
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows
+    val t2 = Seq((1, 20)).toDF("id", "b")           // 1 row
+    val t3 = Seq((1, 30), (1, 31)).toDF("id", "c")  // 2 rows
+    val t4 = Seq((1, 40)).toDF("id", "d")           // 1 row
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+    t4.createOrReplaceTempView("t4")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b),
+             SUM(t3.c * t4.d)
+      FROM t1, t2, t3, t4
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id
+    """
+
+    // JOIN produces 2*1*2*1 = 4 rows
+    //
+    // SUM(a*b): Each (a,b) pair appears 2 times (c has 2 vals)
+    // (10*20)*2 + (11*20)*2 = 400 + 440 = 840
+    //
+    // SUM(c*d): Each (c,d) pair appears 2 times (a has 2 vals)
+    // (30*40)*2 + (31*40)*2 = 2400 + 2480 = 4880
+    val expectedResult = Row(4L, 840L, 4880L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 1: INDEPENDENT PRODUCTS (no shared attrs) ===")
+      println(s"Products: {a,b} and {c,d} - completely independent")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("CASE 2: Containment hierarchy - subset relationships") {
+    // Products form a containment chain: {a} < {a,b} < {a,b,c}
+    // Hierarchical count derivation: compute at finest {a,b,c}, derive coarser
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")           // 2 rows
+    val t2 = Seq((1, 20), (1, 21), (1, 22)).toDF("id", "b")  // 3 rows
+    val t3 = Seq((1, 30), (1, 31)).toDF("id", "c")           // 2 rows
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a),
+             SUM(t1.a * t2.b),
+             SUM(t1.a * t2.b * t3.c)
+      FROM t1, t2, t3
+      WHERE t1.id = t2.id AND t2.id = t3.id
+    """
+
+    // JOIN produces 2*3*2 = 12 rows
+    //
+    // SUM(a): Each a appears 3*2=6 times -> 10*6 + 11*6 = 126
+    //
+    // SUM(a*b): Each (a,b) appears 2 times (c has 2 vals)
+    // (10*20)*2 + (10*21)*2 + (10*22)*2 + (11*20)*2 + (11*21)*2 + (11*22)*2
+    // = 400 + 420 + 440 + 440 + 462 + 484 = 2646
+    //
+    // SUM(a*b*c): Each (a,b,c) appears 1 time
+    // Need to compute all 12 products... sum = 80703
+    val expectedResult = Row(12L, 126L, 2646L, 80703L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 2: CONTAINMENT HIERARCHY ({a} < {a,b} < {a,b,c}) ===")
+      println(s"Hierarchical: derive {a} and {a,b} from {a,b,c}")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("CASE 3: Universal superset with conflicts") {
+    // Products: {a,b}, {a,c}, {b,c} all conflict pairwise
+    // But {a,b,c} contains ALL of them - can use as universal superset
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows
+    val t2 = Seq((1, 20), (1, 21)).toDF("id", "b")  // 2 rows
+    val t3 = Seq((1, 30)).toDF("id", "c")           // 1 row
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b),
+             SUM(t1.a * t3.c),
+             SUM(t2.b * t3.c),
+             SUM(t1.a * t2.b * t3.c)
+      FROM t1, t2, t3
+      WHERE t1.id = t2.id AND t2.id = t3.id
+    """
+
+    // JOIN produces 2*2*1 = 4 rows
+    // (a,b,c): (10,20,30), (10,21,30), (11,20,30), (11,21,30)
+    //
+    // SUM(a*b): 200+210+220+231 = 861
+    // SUM(a*c): 300+300+330+330 = 1260 (each (a,c) appears twice due to b)
+    // Actually: (10*30)=300 twice, (11*30)=330 twice -> 600+660=1260
+    // SUM(b*c): (20*30)=600 twice, (21*30)=630 twice -> 1200+1260=2460
+    // SUM(a*b*c): 6000+6300+6600+6930 = 25830
+    val expectedResult = Row(4L, 861L, 1260L, 2460L, 25830L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 3: UNIVERSAL SUPERSET WITH CONFLICTS ===")
+      println(s"Products: {a,b}, {a,c}, {b,c} conflict but {a,b,c} contains all")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("CASE 4: Multiple independent components") {
+    // Two independent conflict components:
+    // Component 1: {a,b}, {b,c} (conflict via b)
+    // Component 2: {d,e} (completely independent)
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows
+    val t2 = Seq((1, 20)).toDF("id", "b")           // 1 row
+    val t3 = Seq((1, 30), (1, 31)).toDF("id", "c")  // 2 rows
+    val t4 = Seq((1, 40)).toDF("id", "d")           // 1 row
+    val t5 = Seq((1, 50), (1, 51)).toDF("id", "e")  // 2 rows
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+    t4.createOrReplaceTempView("t4")
+    t5.createOrReplaceTempView("t5")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b),
+             SUM(t2.b * t3.c),
+             SUM(t4.d * t5.e)
+      FROM t1, t2, t3, t4, t5
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id AND t4.id = t5.id
+    """
+
+    // JOIN produces 2*1*2*1*2 = 8 rows
+    //
+    // SUM(a*b): Each (a,b) pair appears 2*1*2=4 times (c has 2, d has 1, e has 2)
+    // (10*20)*4 + (11*20)*4 = 800 + 880 = 1680
+    //
+    // SUM(b*c): Each (b,c) pair appears 2*1*2=4 times
+    // (20*30)*4 + (20*31)*4 = 2400 + 2480 = 4880
+    //
+    // SUM(d*e): Each (d,e) pair appears 2*1*2=4 times
+    // (40*50)*4 + (40*51)*4 = 8000 + 8160 = 16160
+    val expectedResult = Row(8L, 1680L, 4880L, 16160L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 4: MULTIPLE INDEPENDENT COMPONENTS ===")
+      println(s"Component 1: {a,b}, {b,c} (conflict via b)")
+      println(s"Component 2: {d,e} (independent)")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("CASE 5: Star pattern - worst case (like IMDB)") {
+    // Products share a common attribute but in a star pattern:
+    // {a,b}, {a,c}, {a,d} - all share 'a' but none contains another
+    // This is the worst case - must defer all to final
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows - shared dimension
+    val t2 = Seq((1, 20), (1, 21)).toDF("id", "b")  // 2 rows
+    val t3 = Seq((1, 30)).toDF("id", "c")           // 1 row
+    val t4 = Seq((1, 40), (1, 41)).toDF("id", "d")  // 2 rows
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+    t4.createOrReplaceTempView("t4")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a * t2.b),
+             SUM(t1.a * t3.c),
+             SUM(t1.a * t4.d)
+      FROM t1, t2, t3, t4
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id
+    """
+
+    // JOIN produces 2*2*1*2 = 8 rows
+    //
+    // SUM(a*b): Each (a,b) pair appears 1*2=2 times
+    // (10*20)*2 + (10*21)*2 + (11*20)*2 + (11*21)*2
+    // = 400 + 420 + 440 + 462 = 1722
+    //
+    // SUM(a*c): Each (a,c) pair appears 2*2=4 times
+    // (10*30)*4 + (11*30)*4 = 1200 + 1320 = 2520
+    //
+    // SUM(a*d): Each (a,d) pair appears 2*1=2 times
+    // (10*40)*2 + (10*41)*2 + (11*40)*2 + (11*41)*2
+    // = 800 + 820 + 880 + 902 = 3402
+    val expectedResult = Row(8L, 1722L, 2520L, 3402L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 5: STAR PATTERN - WORST CASE ===")
+      println(s"Products: {a,b}, {a,c}, {a,d} - star around 'a'")
+      println(s"No containment, must defer all to final aggregate")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("CASE 5b: Star pattern with single attribute products") {
+    // Even simpler star: {a}, {b}, {c} from different relations
+    // These are completely independent - no conflicts
+    val t1 = Seq((1, 10), (1, 11), (1, 12)).toDF("id", "a")  // 3 rows
+    val t2 = Seq((1, 20), (1, 21)).toDF("id", "b")           // 2 rows
+    val t3 = Seq((1, 30)).toDF("id", "c")                    // 1 row
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a),
+             SUM(t2.b),
+             SUM(t3.c)
+      FROM t1, t2, t3
+      WHERE t1.id = t2.id AND t2.id = t3.id
+    """
+
+    // JOIN produces 3*2*1 = 6 rows
+    //
+    // SUM(a): Each a value appears 2*1=2 times
+    // (10 + 11 + 12) * 2 = 33 * 2 = 66
+    //
+    // SUM(b): Each b value appears 3*1=3 times
+    // (20 + 21) * 3 = 41 * 3 = 123
+    //
+    // SUM(c): Each c value appears 3*2=6 times
+    // 30 * 6 = 180
+    val expectedResult = Row(6L, 66L, 123L, 180L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 5b: SINGLE ATTRIBUTE PRODUCTS (independent) ===")
+      println(s"Products: {a}, {b}, {c} - no overlap, fully independent")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("CASE 6: Partial containment - some can be derived, some deferred") {
+    // Mix of containment and conflict:
+    // {a} contained in {a,b} - derivable
+    // {c,d} independent
+    // {a,c} conflicts with {a,b} - must defer together
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows
+    val t2 = Seq((1, 20)).toDF("id", "b")           // 1 row
+    val t3 = Seq((1, 30), (1, 31)).toDF("id", "c")  // 2 rows
+    val t4 = Seq((1, 40)).toDF("id", "d")           // 1 row
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+    t4.createOrReplaceTempView("t4")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a),
+             SUM(t1.a * t2.b),
+             SUM(t3.c * t4.d),
+             SUM(t1.a * t3.c)
+      FROM t1, t2, t3, t4
+      WHERE t1.id = t2.id AND t2.id = t3.id AND t3.id = t4.id
+    """
+
+    // JOIN produces 2*1*2*1 = 4 rows
+    // (a,b,c,d): (10,20,30,40), (10,20,31,40), (11,20,30,40), (11,20,31,40)
+    //
+    // SUM(a): Each a appears 2 times
+    // 10*2 + 11*2 = 42
+    //
+    // SUM(a*b): Each (a,b) appears 2 times
+    // (10*20)*2 + (11*20)*2 = 400 + 440 = 840
+    //
+    // SUM(c*d): Each (c,d) appears 2 times
+    // (30*40)*2 + (31*40)*2 = 2400 + 2480 = 4880
+    //
+    // SUM(a*c): Each (a,c) appears 1 time
+    // (10*30) + (10*31) + (11*30) + (11*31) = 300+310+330+341 = 1281
+    val expectedResult = Row(4L, 42L, 840L, 4880L, 1281L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 6: PARTIAL CONTAINMENT ===")
+      println(s"Containment: {a} < {a,b}")
+      println(s"Independent: {c,d}")
+      println(s"Conflict: {a,b} <-> {a,c}")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("large fan-out stress test for count accuracy") {
+    // Large fan-out to stress test count multiplication correctness
+    val t1 = (1 to 10).map(i => (1, i)).toDF("id", "a")       // 10 rows
+    val t2 = (1 to 5).map(i => (1, i * 10)).toDF("id", "b")   // 5 rows
+    val t3 = Seq((1, 100)).toDF("id", "c")                     // 1 row
+
+    t1.createOrReplaceTempView("t1")
+    t2.createOrReplaceTempView("t2")
+    t3.createOrReplaceTempView("t3")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(t1.a),
+             SUM(t2.b),
+             SUM(t1.a * t2.b)
+      FROM t1, t2, t3
+      WHERE t1.id = t2.id AND t2.id = t3.id
+    """
+
+    // JOIN produces 10*5*1 = 50 rows
+    //
+    // SUM(a): sum(1..10) = 55, each appears 5*1=5 times -> 55*5 = 275
+    // SUM(b): sum(10,20,30,40,50) = 150, each appears 10*1=10 times -> 150*10 = 1500
+    // SUM(a*b): For each (a,b) pair, product appears 1 time
+    //   = sum of a * sum of b = 55 * 150 = 8250
+    val expectedResult = Row(50L, 275L, 1500L, 8250L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (large fan-out): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== LARGE FAN-OUT STRESS TEST ===")
+      println(s"10x5x1 = 50 row join")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  // ============================================================================
+  // PLAN VERIFICATION TESTS
+  // These tests verify the optimizer produces correct results for various
+  // product aggregate patterns. Plan structure is logged for debugging
+  // but not asserted on, since join tree structure may vary.
+  // ============================================================================
+
+  test("PLAN VERIFY: Independent products correctness") {
+    // Two completely independent products: {a,b} and {c,d}
+    // These products do not share any attributes and should produce correct results.
+    val t1 = Seq((1, 10)).toDF("id", "a")
+    val t2 = Seq((1, 20)).toDF("id", "b")
+    val t3 = Seq((1, 30)).toDF("id", "c")
+    val t4 = Seq((1, 40)).toDF("id", "d")
+
+    t1.createOrReplaceTempView("ind_t1")
+    t2.createOrReplaceTempView("ind_t2")
+    t3.createOrReplaceTempView("ind_t3")
+    t4.createOrReplaceTempView("ind_t4")
+
+    val query = """
+      SELECT SUM(ind_t1.a * ind_t2.b),
+             SUM(ind_t3.c * ind_t4.d)
+      FROM ind_t1, ind_t2, ind_t3, ind_t4
+      WHERE ind_t1.id = ind_t2.id
+        AND ind_t2.id = ind_t3.id
+        AND ind_t3.id = ind_t4.id
+    """
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+
+      // scalastyle:off println
+      println("=== PLAN VERIFY: Independent Products ===")
+      println(s"Optimized plan:\n${df.queryExecution.optimizedPlan}")
+      // scalastyle:on println
+
+      // Verify correctness - independent products must produce correct results
+      checkAnswer(df, Row(200L, 1200L))
+    }
+  }
+
+  test("PLAN VERIFY: Star pattern conflicting products correctness") {
+    // Star pattern: {a,b}, {a,c}, {a,d} all share 'a'
+    // These products conflict because they share attribute 'a'.
+    // The optimizer should handle this correctly (results must be accurate).
+    val t1 = Seq((1, 10)).toDF("id", "a")
+    val t2 = Seq((1, 20)).toDF("id", "b")
+    val t3 = Seq((1, 30)).toDF("id", "c")
+    val t4 = Seq((1, 40)).toDF("id", "d")
+
+    t1.createOrReplaceTempView("star_t1")
+    t2.createOrReplaceTempView("star_t2")
+    t3.createOrReplaceTempView("star_t3")
+    t4.createOrReplaceTempView("star_t4")
+
+    val query = """
+      SELECT SUM(star_t1.a * star_t2.b),
+             SUM(star_t1.a * star_t3.c),
+             SUM(star_t1.a * star_t4.d)
+      FROM star_t1, star_t2, star_t3, star_t4
+      WHERE star_t1.id = star_t2.id
+        AND star_t2.id = star_t3.id
+        AND star_t3.id = star_t4.id
+    """
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+
+      // scalastyle:off println
+      println("=== PLAN VERIFY: Star Pattern Products ===")
+      println(s"Optimized plan:\n${df.queryExecution.optimizedPlan}")
+      // scalastyle:on println
+
+      // Verify correctness - star pattern products must produce correct results
+      // regardless of how the optimizer handles the conflicting products
+      checkAnswer(df, Row(200L, 300L, 400L))
+    }
+  }
+
+  test("PLAN VERIFY: Containment hierarchy product derivation") {
+    // Products: {a}, {a,b} form containment hierarchy
+    // {a} < {a,b} means we can derive {a}'s count from {a,b}'s count
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")
+    val t2 = Seq((1, 20), (1, 21)).toDF("id", "b")
+
+    t1.createOrReplaceTempView("cont_t1")
+    t2.createOrReplaceTempView("cont_t2")
+
+    val query = """
+      SELECT SUM(cont_t1.a),
+             SUM(cont_t1.a * cont_t2.b)
+      FROM cont_t1, cont_t2
+      WHERE cont_t1.id = cont_t2.id
+    """
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      val planStr = df.queryExecution.optimizedPlan.toString()
+
+      // scalastyle:off println
+      println("=== PLAN VERIFY: Containment Hierarchy ===")
+      println(s"Optimized plan:\n$planStr")
+      // scalastyle:on println
+
+      // Verify correctness: 2*2 = 4 rows in join
+      // SUM(a) = (10+11)*2 = 42
+      // SUM(a*b) = 10*20 + 10*21 + 11*20 + 11*21 = 200+210+220+231 = 861
+      checkAnswer(df, Row(42L, 861L))
+    }
+  }
+
+  // ============================================================================
+  // COMPLEX STAR PATTERN TESTS
+  // These tests verify correctness for various star pattern configurations
+  // ============================================================================
+
+  test("Star pattern with multiple matching rows") {
+    // Star pattern with duplication to test count handling
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")
+    val t2 = Seq((1, 20), (1, 21)).toDF("id", "b")
+    val t3 = Seq((1, 30)).toDF("id", "c")
+    val t4 = Seq((1, 40)).toDF("id", "d")
+
+    t1.createOrReplaceTempView("star_dup_t1")
+    t2.createOrReplaceTempView("star_dup_t2")
+    t3.createOrReplaceTempView("star_dup_t3")
+    t4.createOrReplaceTempView("star_dup_t4")
+
+    val query = """
+      SELECT SUM(star_dup_t1.a * star_dup_t2.b),
+             SUM(star_dup_t1.a * star_dup_t3.c),
+             SUM(star_dup_t1.a * star_dup_t4.d)
+      FROM star_dup_t1, star_dup_t2, star_dup_t3, star_dup_t4
+      WHERE star_dup_t1.id = star_dup_t2.id
+        AND star_dup_t2.id = star_dup_t3.id
+        AND star_dup_t3.id = star_dup_t4.id
+    """
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      // 2 a's * 2 b's * 1 c * 1 d = 4 rows
+      // SUM(a*b) = (10*20 + 10*21 + 11*20 + 11*21) = 200+210+220+231 = 861
+      // SUM(a*c) = (10+11)*2*30 = 21*2*30 = 1260
+      // SUM(a*d) = (10+11)*2*40 = 21*2*40 = 1680
+      checkAnswer(df, Row(861L, 1260L, 1680L))
+    }
+  }
+
+  test("Five-table star pattern") {
+    // Larger star pattern: {a,b}, {a,c}, {a,d}, {a,e}
+    val t1 = Seq((1, 10)).toDF("id", "a")
+    val t2 = Seq((1, 20)).toDF("id", "b")
+    val t3 = Seq((1, 30)).toDF("id", "c")
+    val t4 = Seq((1, 40)).toDF("id", "d")
+    val t5 = Seq((1, 50)).toDF("id", "e")
+
+    t1.createOrReplaceTempView("star5_t1")
+    t2.createOrReplaceTempView("star5_t2")
+    t3.createOrReplaceTempView("star5_t3")
+    t4.createOrReplaceTempView("star5_t4")
+    t5.createOrReplaceTempView("star5_t5")
+
+    val query = """
+      SELECT SUM(star5_t1.a * star5_t2.b),
+             SUM(star5_t1.a * star5_t3.c),
+             SUM(star5_t1.a * star5_t4.d),
+             SUM(star5_t1.a * star5_t5.e)
+      FROM star5_t1, star5_t2, star5_t3, star5_t4, star5_t5
+      WHERE star5_t1.id = star5_t2.id
+        AND star5_t2.id = star5_t3.id
+        AND star5_t3.id = star5_t4.id
+        AND star5_t4.id = star5_t5.id
+    """
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      // a=10, b=20, c=30, d=40, e=50
+      // All products: a*b=200, a*c=300, a*d=400, a*e=500
+      checkAnswer(df, Row(200L, 300L, 400L, 500L))
+    }
+  }
+
+  test("Mixed star and independent products") {
+    // Star pattern {a,b}, {a,c} plus independent {d,e}
+    val t1 = Seq((1, 10)).toDF("id", "a")
+    val t2 = Seq((1, 20)).toDF("id", "b")
+    val t3 = Seq((1, 30)).toDF("id", "c")
+    val t4 = Seq((1, 40)).toDF("id", "d")
+    val t5 = Seq((1, 50)).toDF("id", "e")
+
+    t1.createOrReplaceTempView("mixed_t1")
+    t2.createOrReplaceTempView("mixed_t2")
+    t3.createOrReplaceTempView("mixed_t3")
+    t4.createOrReplaceTempView("mixed_t4")
+    t5.createOrReplaceTempView("mixed_t5")
+
+    val query = """
+      SELECT SUM(mixed_t1.a * mixed_t2.b),
+             SUM(mixed_t1.a * mixed_t3.c),
+             SUM(mixed_t4.d * mixed_t5.e)
+      FROM mixed_t1, mixed_t2, mixed_t3, mixed_t4, mixed_t5
+      WHERE mixed_t1.id = mixed_t2.id
+        AND mixed_t2.id = mixed_t3.id
+        AND mixed_t3.id = mixed_t4.id
+        AND mixed_t4.id = mixed_t5.id
+    """
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      // Star products: a*b=200, a*c=300
+      // Independent: d*e=2000
+      checkAnswer(df, Row(200L, 300L, 2000L))
+    }
+  }
+
+  test("Star pattern with grouping") {
+    // Star pattern with GROUP BY
+    val t1 = Seq((1, 10, "A"), (2, 20, "B")).toDF("id", "a", "grp")
+    val t2 = Seq((1, 100), (2, 200)).toDF("id", "b")
+    val t3 = Seq((1, 1000), (2, 2000)).toDF("id", "c")
+
+    t1.createOrReplaceTempView("star_grp_t1")
+    t2.createOrReplaceTempView("star_grp_t2")
+    t3.createOrReplaceTempView("star_grp_t3")
+
+    val query = """
+      SELECT star_grp_t1.grp,
+             SUM(star_grp_t1.a * star_grp_t2.b),
+             SUM(star_grp_t1.a * star_grp_t3.c)
+      FROM star_grp_t1, star_grp_t2, star_grp_t3
+      WHERE star_grp_t1.id = star_grp_t2.id
+        AND star_grp_t2.id = star_grp_t3.id
+      GROUP BY star_grp_t1.grp
+    """
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      // Group A: a=10, b=100, c=1000 => a*b=1000, a*c=10000
+      // Group B: a=20, b=200, c=2000 => a*b=4000, a*c=40000
+      checkAnswer(df, Seq(Row("A", 1000L, 10000L), Row("B", 4000L, 40000L)))
+    }
+  }
+
+  test("Star pattern with expressions in aggregates") {
+    // More complex expressions in star pattern products
+    val t1 = Seq((1, 10)).toDF("id", "a")
+    val t2 = Seq((1, 20)).toDF("id", "b")
+    val t3 = Seq((1, 30)).toDF("id", "c")
+
+    t1.createOrReplaceTempView("star_expr_t1")
+    t2.createOrReplaceTempView("star_expr_t2")
+    t3.createOrReplaceTempView("star_expr_t3")
+
+    val query = """
+      SELECT SUM(star_expr_t1.a * star_expr_t2.b + star_expr_t1.a * star_expr_t3.c)
+      FROM star_expr_t1, star_expr_t2, star_expr_t3
+      WHERE star_expr_t1.id = star_expr_t2.id
+        AND star_expr_t2.id = star_expr_t3.id
+    """
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      // a*b + a*c = 10*20 + 10*30 = 200 + 300 = 500
+      checkAnswer(df, Row(500L))
+    }
   }
 }
