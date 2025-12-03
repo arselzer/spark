@@ -28,11 +28,13 @@ import org.apache.spark.sql.test.SharedSparkSession
  * 2. Multi-count optimization cases (when it applies and when it doesn't)
  * 3. Cross-relation filter handling
  * 4. Various product conflict patterns
+ * 5. Complex independent product scenarios (computed early with own count tracks)
  *
  * MULTI-COUNT OPTIMIZATION CASES:
  * ===============================
  * CASE 1 - Independent Products: {a,b}, {c,d} with no overlap
  *          -> Each can use its own count track (optimization applies)
+ *          -> See "COMPLEX INDEPENDENT PRODUCT TESTS" section for extensive coverage
  *
  * CASE 2 - Containment Hierarchy: {a} < {a,b} < {a,b,c}
  *          -> Derive coarser counts from finest (optimization applies)
@@ -2431,5 +2433,329 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       // a*b + a*c = 10*20 + 10*30 = 200 + 300 = 500
       checkAnswer(df, Row(500L))
     }
+  }
+
+  // ============================================================================
+  // COMPLEX INDEPENDENT PRODUCT TESTS
+  // These tests verify the optimization for independent products (disjoint attrs)
+  // that can each be computed early with their own count tracks.
+  // ============================================================================
+
+  test("Independent products - 6 table chain with 3 disjoint products") {
+    // Six tables forming a chain: T1-T2-T3-T4-T5-T6
+    // Three completely independent products:
+    //   P1: SUM(a*b) uses {a,b} from T1,T2
+    //   P2: SUM(c*d) uses {c,d} from T3,T4
+    //   P3: SUM(e*f) uses {e,f} from T5,T6
+    // All products are disjoint - should each optimize independently
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows
+    val t2 = Seq((1, 20)).toDF("id", "b")           // 1 row
+    val t3 = Seq((1, 30), (1, 31), (1, 32)).toDF("id", "c")  // 3 rows
+    val t4 = Seq((1, 40)).toDF("id", "d")           // 1 row
+    val t5 = Seq((1, 50), (1, 51)).toDF("id", "e")  // 2 rows
+    val t6 = Seq((1, 60)).toDF("id", "f")           // 1 row
+
+    t1.createOrReplaceTempView("ind6_t1")
+    t2.createOrReplaceTempView("ind6_t2")
+    t3.createOrReplaceTempView("ind6_t3")
+    t4.createOrReplaceTempView("ind6_t4")
+    t5.createOrReplaceTempView("ind6_t5")
+    t6.createOrReplaceTempView("ind6_t6")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(ind6_t1.a * ind6_t2.b),
+             SUM(ind6_t3.c * ind6_t4.d),
+             SUM(ind6_t5.e * ind6_t6.f)
+      FROM ind6_t1, ind6_t2, ind6_t3, ind6_t4, ind6_t5, ind6_t6
+      WHERE ind6_t1.id = ind6_t2.id
+        AND ind6_t2.id = ind6_t3.id
+        AND ind6_t3.id = ind6_t4.id
+        AND ind6_t4.id = ind6_t5.id
+        AND ind6_t5.id = ind6_t6.id
+    """
+
+    // JOIN produces 2*1*3*1*2*1 = 12 rows
+    //
+    // SUM(a*b): Each (a,b) pair appears 3*1*2*1=6 times
+    // (10*20)*6 + (11*20)*6 = 1200 + 1320 = 2520
+    //
+    // SUM(c*d): Each (c,d) pair appears 2*1*2*1=4 times
+    // (30*40)*4 + (31*40)*4 + (32*40)*4 = 4800 + 4960 + 5120 = 14880
+    //
+    // SUM(e*f): Each (e,f) pair appears 2*1*3*1=6 times
+    // (50*60)*6 + (51*60)*6 = 18000 + 18360 = 36360
+    val expectedResult = Row(12L, 2520L, 14880L, 36360L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (6-table-3-indep): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== 6-TABLE CHAIN WITH 3 INDEPENDENT PRODUCTS ===")
+      println(s"Products: {a,b}, {c,d}, {e,f} - all disjoint")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("Independent products with large fan-out multipliers") {
+    // Test with larger fan-out to stress count accuracy
+    // Products {a,b} and {c,d} are independent
+    val t1 = (1 to 5).map(i => (1, i * 10)).toDF("id", "a")    // 5 rows
+    val t2 = (1 to 4).map(i => (1, i * 100)).toDF("id", "b")   // 4 rows
+    val t3 = (1 to 3).map(i => (1, i * 1000)).toDF("id", "c")  // 3 rows
+    val t4 = (1 to 2).map(i => (1, i * 10000)).toDF("id", "d") // 2 rows
+
+    t1.createOrReplaceTempView("indfan_t1")
+    t2.createOrReplaceTempView("indfan_t2")
+    t3.createOrReplaceTempView("indfan_t3")
+    t4.createOrReplaceTempView("indfan_t4")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(indfan_t1.a * indfan_t2.b),
+             SUM(indfan_t3.c * indfan_t4.d)
+      FROM indfan_t1, indfan_t2, indfan_t3, indfan_t4
+      WHERE indfan_t1.id = indfan_t2.id
+        AND indfan_t2.id = indfan_t3.id
+        AND indfan_t3.id = indfan_t4.id
+    """
+
+    // JOIN produces 5*4*3*2 = 120 rows
+    //
+    // sum(a) = 10+20+30+40+50 = 150
+    // sum(b) = 100+200+300+400 = 1000
+    // sum(c) = 1000+2000+3000 = 6000
+    // sum(d) = 10000+20000 = 30000
+    //
+    // SUM(a*b): Each (a,b) pair appears 3*2=6 times
+    // Total = sum(a) * sum(b) * 6 = 150 * 1000 = 150000 (but pairs not products)
+    // Actually: sum over all (a,b) pairs of a*b, each appearing 6 times
+    // = 6 * sum_a sum_b (a*b) = 6 * (sum_a * sum_b) = 6 * 150 * 1000 = 900000
+    //
+    // SUM(c*d): Each (c,d) pair appears 5*4=20 times
+    // = 20 * (sum_c * sum_d) = 20 * 6000 * 30000 = 3600000000
+    val expectedResult = Row(120L, 900000L, 3600000000L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (large-fan-indep): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== INDEPENDENT PRODUCTS WITH LARGE FAN-OUT ===")
+      println(s"120 row join, products {a,b} and {c,d} independent")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("Independent products with mixed single and multi-attr") {
+    // Mix of single-attribute and multi-attribute products, all independent:
+    // P1: SUM(a) uses {a}
+    // P2: SUM(b*c) uses {b,c}
+    // P3: SUM(d) uses {d}
+    // P4: SUM(e*f) uses {e,f}
+    // All sets are disjoint
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")
+    val t2 = Seq((1, 20)).toDF("id", "b")
+    val t3 = Seq((1, 30), (1, 31)).toDF("id", "c")
+    val t4 = Seq((1, 40)).toDF("id", "d")
+    val t5 = Seq((1, 50)).toDF("id", "e")
+    val t6 = Seq((1, 60), (1, 61)).toDF("id", "f")
+
+    t1.createOrReplaceTempView("indmix_t1")
+    t2.createOrReplaceTempView("indmix_t2")
+    t3.createOrReplaceTempView("indmix_t3")
+    t4.createOrReplaceTempView("indmix_t4")
+    t5.createOrReplaceTempView("indmix_t5")
+    t6.createOrReplaceTempView("indmix_t6")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(indmix_t1.a),
+             SUM(indmix_t2.b * indmix_t3.c),
+             SUM(indmix_t4.d),
+             SUM(indmix_t5.e * indmix_t6.f)
+      FROM indmix_t1, indmix_t2, indmix_t3, indmix_t4, indmix_t5, indmix_t6
+      WHERE indmix_t1.id = indmix_t2.id
+        AND indmix_t2.id = indmix_t3.id
+        AND indmix_t3.id = indmix_t4.id
+        AND indmix_t4.id = indmix_t5.id
+        AND indmix_t5.id = indmix_t6.id
+    """
+
+    // JOIN produces 2*1*2*1*1*2 = 8 rows
+    //
+    // SUM(a): Each a appears 1*2*1*1*2=4 times
+    // (10+11)*4 = 84
+    //
+    // SUM(b*c): Each (b,c) pair appears 2*1*1*2=4 times
+    // (20*30 + 20*31)*4 = (600+620)*4 = 4880
+    //
+    // SUM(d): Each d appears 2*1*2*1*2=8 times
+    // 40*8 = 320
+    //
+    // SUM(e*f): Each (e,f) pair appears 2*1*2*1=4 times
+    // (50*60 + 50*61)*4 = (3000+3050)*4 = 24200
+    val expectedResult = Row(8L, 84L, 4880L, 320L, 24200L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (mixed-indep): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== MIXED SINGLE AND MULTI-ATTR INDEPENDENT PRODUCTS ===")
+      println(s"Products: {a}, {b,c}, {d}, {e,f} - all disjoint")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("Independent products with cross-relation filter") {
+    // Independent products with a cross-relation filter
+    // P1: SUM(a*b) uses {a,b}
+    // P2: SUM(c*d) uses {c,d}
+    // Filter: a + c > 35 spans {a,c}
+    val t1 = Seq((1, 10), (1, 20)).toDF("id", "a")
+    val t2 = Seq((1, 100)).toDF("id", "b")
+    val t3 = Seq((1, 30), (1, 40)).toDF("id", "c")
+    val t4 = Seq((1, 1000)).toDF("id", "d")
+
+    t1.createOrReplaceTempView("indfilter_t1")
+    t2.createOrReplaceTempView("indfilter_t2")
+    t3.createOrReplaceTempView("indfilter_t3")
+    t4.createOrReplaceTempView("indfilter_t4")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(indfilter_t1.a * indfilter_t2.b),
+             SUM(indfilter_t3.c * indfilter_t4.d)
+      FROM indfilter_t1, indfilter_t2, indfilter_t3, indfilter_t4
+      WHERE indfilter_t1.id = indfilter_t2.id
+        AND indfilter_t2.id = indfilter_t3.id
+        AND indfilter_t3.id = indfilter_t4.id
+        AND indfilter_t1.a + indfilter_t3.c > 35
+    """
+
+    // Full join produces 2*1*2*1 = 4 rows:
+    // (a,b,c,d): (10,100,30,1000), (10,100,40,1000), (20,100,30,1000), (20,100,40,1000)
+    // Filter a+c > 35:
+    // (10,100,30,1000): 10+30=40 YES
+    // (10,100,40,1000): 10+40=50 YES
+    // (20,100,30,1000): 20+30=50 YES
+    // (20,100,40,1000): 20+40=60 YES
+    // All 4 pass!
+    //
+    // SUM(a*b): (10*100)+(10*100)+(20*100)+(20*100) = 1000+1000+2000+2000 = 6000
+    // SUM(c*d): (30*1000)+(40*1000)+(30*1000)+(40*1000) = 30000+40000+30000+40000 = 140000
+    val expectedResult = Row(4L, 6000L, 140000L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (indep+filter): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== INDEPENDENT PRODUCTS WITH CROSS-RELATION FILTER ===")
+      println(s"Products: {a,b} and {c,d} independent, filter on {a,c}")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("Independent three-attr products") {
+    // Independent products with 3 attributes each:
+    // P1: SUM(a*b*c) uses {a,b,c}
+    // P2: SUM(d*e*f) uses {d,e,f}
+    val t1 = Seq((1, 10)).toDF("id", "a")
+    val t2 = Seq((1, 20), (1, 21)).toDF("id", "b")
+    val t3 = Seq((1, 30)).toDF("id", "c")
+    val t4 = Seq((1, 40), (1, 41)).toDF("id", "d")
+    val t5 = Seq((1, 50)).toDF("id", "e")
+    val t6 = Seq((1, 60)).toDF("id", "f")
+
+    t1.createOrReplaceTempView("ind3attr_t1")
+    t2.createOrReplaceTempView("ind3attr_t2")
+    t3.createOrReplaceTempView("ind3attr_t3")
+    t4.createOrReplaceTempView("ind3attr_t4")
+    t5.createOrReplaceTempView("ind3attr_t5")
+    t6.createOrReplaceTempView("ind3attr_t6")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(ind3attr_t1.a * ind3attr_t2.b * ind3attr_t3.c),
+             SUM(ind3attr_t4.d * ind3attr_t5.e * ind3attr_t6.f)
+      FROM ind3attr_t1, ind3attr_t2, ind3attr_t3, ind3attr_t4, ind3attr_t5, ind3attr_t6
+      WHERE ind3attr_t1.id = ind3attr_t2.id
+        AND ind3attr_t2.id = ind3attr_t3.id
+        AND ind3attr_t3.id = ind3attr_t4.id
+        AND ind3attr_t4.id = ind3attr_t5.id
+        AND ind3attr_t5.id = ind3attr_t6.id
+    """
+
+    // JOIN produces 1*2*1*2*1*1 = 4 rows
+    //
+    // SUM(a*b*c): Each (a,b,c) tuple appears 2*1*1=2 times
+    // (10*20*30 + 10*21*30)*2 = (6000+6300)*2 = 24600
+    //
+    // SUM(d*e*f): Each (d,e,f) tuple appears 1*2*1=2 times
+    // (40*50*60 + 41*50*60)*2 = (120000+123000)*2 = 486000
+    val expectedResult = Row(4L, 24600L, 486000L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val baseline = sql(query).collect()
+      println(s"Baseline (3-attr-indep): ${baseline.map(_.toString).mkString}")
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== INDEPENDENT 3-ATTR PRODUCTS ===")
+      println(s"Products: {a,b,c} and {d,e,f} - disjoint 3-attr products")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
   }
 }

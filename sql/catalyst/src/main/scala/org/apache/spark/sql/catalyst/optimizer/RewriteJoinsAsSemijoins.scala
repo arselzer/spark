@@ -1953,6 +1953,10 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //
               // Safe to compute when: all other uncommitted products have ALL their attrs
               // already in the combined output (so they won't add new grouping later).
+              //
+              // KEY INSIGHT: Only products that SHARE attributes with us can cause conflicts.
+              // Completely independent products (no shared attrs) can be computed separately
+              // without affecting each other's count semantics.
               val otherProductsHaveUnseenAttrs = aggExpressions.exists { otherAgg =>
                 otherAgg.aggregateFunction match {
                   case Sum(child, _) if otherAgg != agg =>
@@ -1966,13 +1970,15 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                       // Does this uncommitted product have attrs not yet available?
                       val otherHasUnseenAttrs = otherRefs.exists(a =>
                         !combinedOutputSet.contains(a))
-                      // Does this product have non-overlapping attrs with ours?
+                      // Does this product SHARE any attrs with ours?
+                      // Only products that share attrs can conflict - completely independent
+                      // products (disjoint attr sets) don't affect each other's count semantics.
                       val otherAttrs = otherRefs
                       val thisAttrs = productAttrsSet
-                      val hasNonOverlap = otherAttrs.exists(a => !thisAttrs.contains(a)) ||
-                        thisAttrs.exists(a => !otherAttrs.contains(a))
-                      // Conflict if: other has unseen attrs AND has non-overlapping attrs
-                      otherHasUnseenAttrs && hasNonOverlap
+                      val hasSharedAttrs = otherAttrs.exists(a => thisAttrs.contains(a))
+                      // Conflict ONLY if: other has unseen attrs AND shares attrs with us
+                      // Independent products (no shared attrs) can be computed separately
+                      otherHasUnseenAttrs && hasSharedAttrs
                     }
                   case _ => false
                 }
