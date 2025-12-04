@@ -2627,6 +2627,16 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED =
+    buildConf("spark.sql.yannakakis.syntheticSupersetEnabled")
+      .doc("When enabled, for star-pattern product conflicts (products sharing some but not " +
+        "all attributes), create a synthetic superset product containing all attributes and " +
+        "derive each product's count via GROUP BY. This can reduce deferred products at the " +
+        "cost of extra GROUP BY aggregations.")
+      .version("2.3.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
       .doc("Enables CBO for estimation of plan statistics when set true.")
@@ -4928,6 +4938,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def yannakakisDeferProductsEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_DEFER_PRODUCTS_ENABLED)
+
+  def yannakakisSyntheticSupersetEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 

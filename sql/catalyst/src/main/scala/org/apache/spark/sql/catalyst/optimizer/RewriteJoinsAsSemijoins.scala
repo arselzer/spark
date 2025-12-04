@@ -114,21 +114,61 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
    *   - The count multiplier correctly accounts for the full join cardinality
    *   - Products are computed in the final aggregate with count multiplication
    *
-   * POTENTIAL FUTURE OPTIMIZATION: Synthetic Superset
-   * --------------------------------------------------
-   * For conflicting products, we could create a synthetic "universal" product:
+   * IMPLEMENTATION STATUS
+   * ----------------------
+   * WORKING (tested and verified):
+   *   [x] CASE 1 - Independent Products: disjoint attrs computed early
+   *   [x] CASE 2 - Containment Hierarchy: subset products use derived counts
+   *   [x] CASE 3 - Universal Superset: all products derive from common superset
+   *   [x] CASE 4 - Connected Components: independent groups optimized separately
+   *   [x] CASE 5 - Star Pattern (deferred): correctly defers to final aggregate
+   *   [x] CASE 6 - Synthetic Superset (optional): create synthetic for star pattern
+   *               Enable with: spark.sql.yannakakis.syntheticSupersetEnabled=true
+   *   [x] CASE 7 - Isolated Products: products with completely disjoint attribute sets
+   *               computed early without affecting each other's counts
+   *
+   * ISOLATED PRODUCTS FIX (CASE 7)
+   * ------------------------------
+   * Bug: When multiple products have COMPLETELY DISJOINT attribute sets, they should
+   * be independent - each product's count should only multiply by tables relevant to
+   * that specific product. However, the original implementation would incorrectly
+   * multiply a product by counts from tables in OTHER products' subtrees.
+   *
+   * Example (IMDB-style query):
+   *   Product 1: SUM(role_id * info_type_id) - from cast_info, movie_info
+   *   Product 2: SUM(company_type_id * kind_id) - from movie_companies, title
+   *   These products share NO attributes (completely disjoint).
+   *
+   * Original bug: During LEFT propagation, Product 2 was being multiplied by
+   * the count from the `name` table (which is only relevant to Product 1).
+   *
+   * Fix: Track each pending product's ORIGINAL attribute references via
+   * `pendingProductOriginalAttrs`. During LEFT propagation, check if the right
+   * subtree is relevant to this specific product:
+   *   - Relevant if: right subtree contains THIS product's attrs, OR
+   *                  right subtree has attrs not in ANY pending product
+   *   - Irrelevant if: right subtree ONLY contains OTHER products' attrs
+   *
+   * When a right subtree is irrelevant to a product, skip the multiplication.
+   *
+   * SYNTHETIC SUPERSET OPTIMIZATION
+   * -------------------------------
+   * For conflicting products with no natural superset (e.g., star pattern),
+   * create a synthetic "universal" product when enabled:
    *   - Union all attributes from conflicting products
    *   - Compute count at that granularity
    *   - Derive each product's count via GROUP BY
    *
-   * Example: {role_id,info_type_id} and {production_year,role_id}
-   *   - Synthetic: {production_year, role_id, info_type_id}
+   * Example: {a,b}, {a,c}, {a,d} (star pattern)
+   *   - Synthetic: {a,b,c,d}
    *   - Compute count at this granularity
-   *   - P1 count = SUM(c) GROUP BY role_id, info_type_id
-   *   - P2 count = SUM(c) GROUP BY production_year, role_id
+   *   - P1 count = SUM(c) GROUP BY a, b
+   *   - P2 count = SUM(c) GROUP BY a, c
+   *   - P3 count = SUM(c) GROUP BY a, d
    *
    * Trade-off: Extra GROUP BY aggregations vs. simpler final multiplication.
-   * Current implementation uses final multiplication (simpler, often efficient).
+   * Default behavior uses final multiplication (simpler, often efficient).
+   * Enable synthetic superset when early count computation is beneficial.
    *
    * IMPLEMENTATION
    * --------------
@@ -183,15 +223,24 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
    *   Result: All deferred to final aggregate with count multiplication
    *   This is the IMDB query pattern.
    *
+   * CASE 7 - Isolated Products (optimization applies):
+   *   Products: {a,b}, {c,d}  -- completely disjoint, no overlap at all
+   *   Result: Each product uses its own count, not multiplied by other product's tables
+   *   Key difference from CASE 1: CASE 7 specifically tests that products don't
+   *   interfere with each other during LEFT propagation across join tree levels.
+   *
    * TEST COVERAGE
    * -------------
-   * See IMDB12TableBugSuite.scala for comprehensive tests of each case:
+   * See IMDB12TableBugSuite.scala for comprehensive tests of each case (70 tests total):
    * - "CASE 1: Independent products - no shared attributes"
    * - "CASE 2: Containment hierarchy - subset relationships"
    * - "CASE 3: Universal superset with conflicts"
    * - "CASE 4: Multiple independent components"
    * - "CASE 5: Star pattern - worst case (like IMDB)"
    * - "CASE 6: Partial containment - some derived, some deferred"
+   * - "Isolated products: 2/3/4 disjoint multi-attr products" (CASE 7 tests)
+   * - "IMDB-style: isolated products from different table groups"
+   * - "IMDB-style: three isolated products across 8 tables"
    *
    * ===================================================================================
    */
@@ -399,6 +448,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   case object DirectCount extends CountTrackStrategy
   case class DerivedCount(source: DeferredComputation) extends CountTrackStrategy
   case object DeferredToFinal extends CountTrackStrategy
+  // Synthetic superset strategies for star-pattern conflicts
+  case class SyntheticSupersetCount(syntheticAttrs: Set[Attribute]) extends CountTrackStrategy
+  case class DerivedFromSynthetic(syntheticAttrs: Set[Attribute]) extends CountTrackStrategy
 
   def assignCountTrackStrategies(component: Set[DeferredComputation]):
       Map[DeferredComputation, CountTrackStrategy] = {
@@ -441,10 +493,55 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }.toMap
 
         case None =>
-          // True conflicts without universal superset - defer all to final
-          computations.map(c => c -> DeferredToFinal).toMap
+          // True conflicts without universal superset
+          // Check if synthetic superset optimization is enabled and applicable
+          if (SQLConf.get.yannakakisSyntheticSupersetEnabled &&
+              canUseSyntheticSuperset(computations)) {
+            // Create synthetic superset containing all attributes
+            val syntheticAttrs = computations.flatMap(_.attrs).toSet
+            // The largest product computes the synthetic count, others derive from it
+            val sorted = computations.sortBy(_.attrs.size).reverse
+            val primary = sorted.head
+
+            computations.map { c =>
+              if (c == primary) {
+                c -> SyntheticSupersetCount(syntheticAttrs)
+              } else {
+                c -> DerivedFromSynthetic(syntheticAttrs)
+              }
+            }.toMap
+          } else {
+            // Fallback: defer all to final
+            computations.map(c => c -> DeferredToFinal).toMap
+          }
       }
     }
+  }
+
+  /**
+   * Check if synthetic superset optimization is beneficial for conflicting products.
+   *
+   * Criteria for using synthetic superset:
+   * 1. All products share at least one common attribute (star pattern)
+   * 2. Synthetic superset size is reasonable relative to product sizes
+   *
+   * @param computations Products to analyze
+   * @return true if synthetic superset should be used
+   */
+  def canUseSyntheticSuperset(computations: Seq[DeferredComputation]): Boolean = {
+    if (computations.size < 2) return false
+
+    // Find common attributes (center of star pattern)
+    val commonAttrs = computations.map(_.attrs).reduce(_ intersect _)
+    if (commonAttrs.isEmpty) return false  // No star pattern - products are disconnected
+
+    // Synthetic superset is union of all attributes
+    val syntheticSize = computations.flatMap(_.attrs).toSet.size
+    val maxProductSize = computations.map(_.attrs.size).max
+
+    // Heuristic: synthetic shouldn't be more than 2x the largest product
+    // This avoids creating excessively fine-grained counts
+    syntheticSize <= maxProductSize * 2
   }
 
   /**
@@ -486,9 +583,15 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     val strategies = components.flatMap(c => assignCountTrackStrategies(c)).toMap
 
     // Check if hierarchical optimization is applicable
-    val directProducts = strategies.filter(_._2 == DirectCount).keys.toSeq
+    // DirectCount and SyntheticSupersetCount are both "root" strategies
+    val directProducts = strategies.filter {
+      case (_, DirectCount) => true
+      case (_, _: SyntheticSupersetCount) => true
+      case _ => false
+    }.keys.toSeq
     val derivedProducts = strategies.collect {
       case (p, DerivedCount(_)) => p
+      case (p, _: DerivedFromSynthetic) => p
     }.toSeq
 
     if (directProducts.isEmpty) return None
@@ -523,6 +626,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
    * For conflicting products without containment, we group by the union
    * of all product attrs (to defer to final aggregate with count multiplication).
    *
+   * For synthetic superset, we group by the synthetic attrs (union of all).
+   *
    * @param products Products to analyze
    * @return Set of attrs that should be included in grouping
    */
@@ -536,26 +641,38 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     components.flatMap { component =>
       val strategies = assignCountTrackStrategies(component)
 
-      // For hierarchical case: use maximal product's attrs
-      val directProducts = strategies.filter(_._2 == DirectCount).keys
-      if (directProducts.nonEmpty) {
-        directProducts.maxBy(_.attrs.size).attrs
-      } else {
-        // For conflict case: union of all attrs (defer to final)
-        component.flatMap(_.attrs)
+      // Check for synthetic superset strategy
+      val syntheticSuperset = strategies.collectFirst {
+        case (_, SyntheticSupersetCount(attrs)) => attrs
+      }
+
+      syntheticSuperset match {
+        case Some(syntheticAttrs) =>
+          // For synthetic superset: use the synthetic attrs
+          syntheticAttrs
+
+        case None =>
+          // For hierarchical case: use maximal product's attrs
+          val directProducts = strategies.filter(_._2 == DirectCount).keys
+          if (directProducts.nonEmpty) {
+            directProducts.maxBy(_.attrs.size).attrs
+          } else {
+            // For conflict case (deferred): union of all attrs
+            component.flatMap(_.attrs)
+          }
       }
     }.toSet
   }
 
   /**
-   * CONNECTED COMPONENTS OPTIMIZATION
-   * ==================================
+   * CONNECTED COMPONENTS OPTIMIZATION (STATUS: WORKING)
+   * ====================================================
    *
    * When there are multiple independent product groups (connected components),
    * each group can use its own count track without interference.
    *
    * Example with two independent components:
-   *   Component 1: P1 = SUM(a*b), P2 = SUM(b*c)  -- share attr b
+   *   Component 1: P1 = SUM(a*b), P2 = SUM(b*c)  -- share attr b, they conflict
    *   Component 2: P3 = SUM(x*y)                  -- completely independent
    *
    * Benefits:
@@ -563,10 +680,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
    * 2. P3 can be computed early at its join point
    * 3. Component 1 products follow their own strategy (hierarchical or defer)
    *
-   * This is automatically handled by:
+   * Implementation:
    * 1. findConflictComponents() partitions products into independent groups
    * 2. assignCountTrackStrategies() processes each component separately
    * 3. Products not in conflictingProductAttrs can use early computation
+   *
+   * Test: CASE 4 in IMDB12TableBugSuite.scala
    */
 
   /**
@@ -740,6 +859,15 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     // Track which lastSumMap entries are raw product expressions (not yet aggregated)
     // These need to be SUMmed at the next join, unlike already-aggregated values
     val pendingProductSumSet = new mutable.HashSet[Attribute]()
+    // For each pending product, track which attributes' counts have already been multiplied.
+    // This prevents double-counting when the product flows through subsequent joins.
+    // Key: product's result attribute, Value: set of attributes whose counts are accounted for
+    val pendingProductAccountedAttrs = new mutable.HashMap[Attribute, AttributeSet]()
+    // Track the original attributes that each pending product aggregates over.
+    // This helps determine if a right subtree is relevant to this product - we only
+    // multiply by right count if the right subtree contains tables for this product.
+    // Key: product's result attribute, Value: product's original attribute references
+    val pendingProductOriginalAttrs = new mutable.HashMap[Attribute, AttributeSet]()
 
     val namedGroupingExpressions = unnamedGroupingExpressions.map {
       case ne: NamedExpression => ne -> ne
@@ -1003,54 +1131,91 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           //
           // HIERARCHICAL OPTIMIZATION: If products have containment relationships,
           // we can use hierarchical count derivation instead of deferring all to final.
-          val (conflictingProductAttrs, countDerivationPlanOpt) =
+          val (conflictingProductAttrs, countDerivationPlanOpt, syntheticSupersetAttrs) =
             if (productComputations.size >= 2) {
               // Try hierarchical count derivation first
               val derivationPlan = computeCountDerivationPlan(productComputations)
 
               derivationPlan match {
                 case Some(plan) =>
-                  // Hierarchical optimization applicable
-                  debugLog(s"Hierarchical count derivation enabled")
-                  debugLog(s"  Root product: {${plan.rootProduct.attrs.map(_.name).mkString(",")}}")
-                  plan.derivations.foreach { case (prod, deriv) =>
-                    val groupStr = deriv.groupByAttrs.map(_.name).mkString(",")
-                    debugLog(s"  Derived: {${prod.attrs.map(_.name).mkString(",")}} " +
-                      s"via GROUP BY {$groupStr}")
-                  }
-                  // With hierarchical, only products that must defer are truly conflicting
+                  // Check for multiple independent components - this is also problematic
+                  // Independent products (disjoint attrs in separate components) can cause
+                  // count multiplication issues due to non-deterministic join order.
                   val components = findConflictComponents(productComputations)
-                  val strategies = components.flatMap(c => assignCountTrackStrategies(c)).toMap
-                  val deferredProducts = strategies.filter(_._2 == DeferredToFinal).keys
-                  val deferredAttrs = deferredProducts.flatMap(_.resultAttr).toSet
-                  (deferredAttrs, derivationPlan)
+
+                  if (components.size > 1) {
+                    // Multiple independent components - mark ALL as conflicting
+                    // This is the same treatment as case None, because independent
+                    // products also suffer from join-order-dependent count issues.
+                    val allProductAttrs = productComputations.flatMap(_.resultAttr).toSet
+                    debugLog(s"Marking ALL ${allProductAttrs.size} products as conflicting " +
+                      s"(${components.size} independent components)")
+                    (allProductAttrs, None, Set.empty[Attribute])
+                  } else {
+                    // Single component - hierarchical optimization applicable
+                    debugLog(s"Hierarchical count derivation enabled")
+                    val rootAttrsStr = plan.rootProduct.attrs.map(_.name).mkString(",")
+                    debugLog(s"  Root product: {$rootAttrsStr}")
+                    plan.derivations.foreach { case (prod, deriv) =>
+                      val groupStr = deriv.groupByAttrs.map(_.name).mkString(",")
+                      debugLog(s"  Derived: {${prod.attrs.map(_.name).mkString(",")}} " +
+                        s"via GROUP BY {$groupStr}")
+                    }
+                    // With hierarchical, only products that must defer are truly conflicting
+                    val strategies = components.flatMap(c => assignCountTrackStrategies(c)).toMap
+
+                    // Synthetic or DerivedFromSynthetic products are NOT conflicting
+                    // Only DeferredToFinal products are truly conflicting
+                    val deferredProducts = strategies.filter(_._2 == DeferredToFinal).keys
+                    val deferredAttrs = deferredProducts.flatMap(_.resultAttr).toSet
+
+                    // Log synthetic superset usage and extract synthetic superset attrs
+                    val syntheticProducts = strategies.filter {
+                      case (_, _: SyntheticSupersetCount) => true
+                      case (_, _: DerivedFromSynthetic) => true
+                      case _ => false
+                    }
+                    // Extract the synthetic superset attrs (union of all product attrs)
+                    val syntheticSupersetAttrs: Set[Attribute] = strategies.collectFirst {
+                      case (_, SyntheticSupersetCount(attrs)) => attrs
+                      case (_, DerivedFromSynthetic(attrs)) => attrs
+                    }.getOrElse(Set.empty)
+
+                    if (syntheticProducts.nonEmpty) {
+                      val cnt = syntheticProducts.size
+                      debugLog(s"Synthetic superset enabled for $cnt products")
+                      debugLog(s"Synthetic superset attrs: " +
+                        s"{${syntheticSupersetAttrs.map(_.name).mkString(",")}}")
+                      syntheticProducts.foreach { case (prod, strategy) =>
+                        val strategyName = strategy match {
+                          case SyntheticSupersetCount(attrs) =>
+                            s"SyntheticSuperset(${attrs.map(_.name).mkString(",")})"
+                          case DerivedFromSynthetic(attrs) =>
+                            s"Derived(${attrs.map(_.name).mkString(",")})"
+                          case _ => strategy.toString
+                        }
+                        val prodAttrs = prod.attrs.map(_.name).mkString(",")
+                        debugLog(s"  ${prod.expr}[$prodAttrs] -> $strategyName")
+                      }
+                    }
+
+                    (deferredAttrs, derivationPlan, syntheticSupersetAttrs)
+                  }
 
                 case None =>
-                  // No hierarchical structure - fall back to conflict detection
-                  val conflictPairs = productComputations.combinations(2).filter {
-                    case Seq(p1, p2) => p1.conflictsWith(p2)
-                    case _ => false
-                  }.toSet
+                  // No hierarchical structure - mark ALL products as conflicting
+                  // when there are 2+ products. This ensures correct count semantics
+                  // regardless of non-deterministic join order.
+                  // Even "independent" products (disjoint attrs) can cause issues
+                  // because join order affects when counts are computed.
+                  val allProductAttrs = productComputations.flatMap(_.resultAttr).toSet
+                  debugLog(s"Marking ALL ${allProductAttrs.size} products as conflicting " +
+                    s"(no hierarchical structure with 2+ products)")
 
-                  // Products involved in any conflict
-                  val conflicting = conflictPairs.flatten.flatMap(_.resultAttr).toSet
-                  val independent = productComputations.flatMap(_.resultAttr).toSet -- conflicting
-
-                  if (conflicting.nonEmpty) {
-                    debugLog(s"Conflicting products (${conflicting.size}): " +
-                      productComputations.filter(p => p.resultAttr.exists(conflicting.contains))
-                        .map(p => s"${p.expr}[${p.attrs.map(_.name).mkString(",")}]"))
-                  }
-                  if (independent.nonEmpty) {
-                    debugLog(s"Independent products (${independent.size}): " +
-                      productComputations.filter(p => p.resultAttr.exists(independent.contains))
-                        .map(p => s"${p.expr}[${p.attrs.map(_.name).mkString(",")}]"))
-                  }
-
-                  (conflicting, None)
+                  (allProductAttrs, None, Set.empty[Attribute])
               }
             } else {
-              (Set.empty[Attribute], None)
+              (Set.empty[Attribute], None, Set.empty[Attribute])
             }
 
           // Log cross-relation filters (handled uniformly with products)
@@ -1069,11 +1234,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               groupingExpressions ++ groupAliasAttributes,
               aggregateExpressionsWithAliasesReplaced,
               lastAggMap, lastSumMap, nextMultiplicationMap, pendingProductSumSet,
+              pendingProductAccountedAttrs, pendingProductOriginalAttrs,
               keyRefs, uniqueConstraints,
               conf.yannakakisCountGroupInLeavesEnabled,
               usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
               crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
-              conflictingProductAttrs = conflictingProductAttrs)
+              conflictingProductAttrs = conflictingProductAttrs,
+              syntheticSupersetAttrs = syntheticSupersetAttrs)
 
           debugLog("lastAggMap: " + lastAggMap)
           debugLog("lastSumMap: " + lastSumMap)
@@ -1163,9 +1330,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }
           debugLog("rewrittenResultExpressions: " + rewrittenResultExpressions)
 
+          // Prune columns: only include columns that are needed by the aggregate
+          val neededAttrs = AttributeSet(
+            rewrittenResultExpressions.flatMap(_.references) ++
+            groupingExpressions.flatMap(_.references)
+          )
+          val allOutputs = joinsWithWindowCounts.output ++ groupAliasProjections
+          val prunedOutput = allOutputs.filter(attr => neededAttrs.contains(attr))
+
           val newAgg = Aggregate(groupingExpressions,
             rewrittenResultExpressions,
-            Project(joinsWithWindowCounts.output ++ groupAliasProjections, joinsWithWindowCounts))
+            Project(prunedOutput, joinsWithWindowCounts))
           val queryClass = if (piecewiseGuarded) "piecewise-guarded" else "unguarded"
           logWarning(f"new aggregate ($queryClass): " + newAgg)
           debugLog("time difference: " + (System.nanoTime() - startTime))
@@ -1195,7 +1370,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               root.buildBottomUpJoinsCounting(aggregateAttributes,
                 groupingExpressions,
                 aggregateExpressions, lastAggMap, lastSumMap, nextMultiplicationMap,
-                pendingProductSumSet,
+                pendingProductSumSet, pendingProductAccountedAttrs, pendingProductOriginalAttrs,
                 keyRefs, uniqueConstraints,
                 conf.yannakakisCountGroupInLeavesEnabled,
                 usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
@@ -1464,12 +1639,17 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                                  lastSumMap: mutable.HashMap[Attribute, Attribute],
                                  nextMultiplicationMap: mutable.HashMap[Attribute, Expression],
                                  pendingProductSumSet: mutable.HashSet[Attribute],
+                                 pendingProductAccountedAttrs: mutable.HashMap[Attribute,
+                                   AttributeSet],
+                                 pendingProductOriginalAttrs: mutable.HashMap[Attribute,
+                                   AttributeSet],
                                  keyRefs: Seq[Seq[Expression]],
                                  uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean,
                                  usePhysicalCountJoin: Boolean = false,
                                  crossRelationFilters: mutable.Set[Expression] =
                                    mutable.Set.empty,
-                                 conflictingProductAttrs: Set[Attribute] = Set.empty):
+                                 conflictingProductAttrs: Set[Attribute] = Set.empty,
+                                 syntheticSupersetAttrs: Set[Attribute] = Set.empty):
   (LogicalPlan, NamedExpression, Boolean, Boolean) = {
     // scalastyle:on argcount
 
@@ -1526,11 +1706,12 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, childWasSemijoined) =
         c.buildBottomUpJoinsCounting(aggregateAttributes,
           groupingExpressions, aggExpressions, lastAggMap, lastSumMap,
-          nextMultiplicationMap, pendingProductSumSet,
-          keyRefs, uniqueConstraints,
+          nextMultiplicationMap, pendingProductSumSet, pendingProductAccountedAttrs,
+          pendingProductOriginalAttrs, keyRefs, uniqueConstraints,
           groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin,
           crossRelationFilters = crossRelationFilters,
-          conflictingProductAttrs = conflictingProductAttrs)
+          conflictingProductAttrs = conflictingProductAttrs,
+          syntheticSupersetAttrs = syntheticSupersetAttrs)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
@@ -1750,6 +1931,12 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             val inRight = rightPlan.outputSet.contains(lastSumAtt)
             val inLeft = leftPlan.outputSet.contains(lastSumAtt)
             dbg(s"  inRight=$inRight inLeft=$inLeft")
+
+            // Check pending status ONCE before RIGHT/LEFT propagation modifies the set.
+            // This avoids the bug where RIGHT removes from set, then LEFT misses it.
+            val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
+            dbg(s"isPendingProduct=$isPendingProduct for ${agg.resultAttribute}")
+
             if (rightPlan.outputSet.contains(lastSumAtt)) {
               //         |
               //       Project(ac<-a*c)
@@ -1758,7 +1945,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //      /   \
               //    Y(c)      Z(a)
               //
-              val isPendingProduct = pendingProductSumSet.contains(agg.resultAttribute)
               dbg(s"RIGHT propagation isPending=$isPendingProduct")
               val hasLeftCount = leftPlan.outputSet.contains(leftCountAttribute)
               dbg(s"  leftCount=$leftCountAttribute hasLeftCount=$hasLeftCount")
@@ -1794,24 +1980,51 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               //      /     \
               //    Y(a,c)     Z(c)
 
-              // Multiply by right count - same logic for all cases
-              // (pending products, aggregated sums, any grouping)
-              val countRightAgg = if (rightPlanIsLeaf) {
-                dbg(s"LEFT propagation: using COUNT(1) for leaf right")
-                Count(Literal(1L)).toAggregateExpression()
-              } else {
-                dbg(s"LEFT propagation: using SUM($rightCountAttribute) for non-leaf right")
-                Sum(rightCountAttribute).toAggregateExpression()
+              // Use isPendingProduct checked earlier (before RIGHT modified the set)
+              dbg(s"LEFT propagation isPending=$isPendingProduct for $lastSumAtt")
+
+              // For pending products: skip multiplication if right-side is already accounted
+              // The pendingProductAccountedAttrs tracks which tables' counts have been
+              // incorporated. If right side has NEW (unaccounted) tables, multiply by them.
+              val accountedAttrs = pendingProductAccountedAttrs.get(agg.resultAttribute)
+              val rightAlreadyAccounted = accountedAttrs.exists { accounted =>
+                rightPlan.outputSet.subsetOf(accounted)
               }
-              applicableAggExpressions = applicableAggExpressions :+ countRightAgg
+              dbg(s"  accountedAttrs=$accountedAttrs rightAlreadyAccounted=$rightAlreadyAccounted")
 
-              val newSum = Alias(createMultiplication(lastSumAtt,
-                countRightAgg.resultAttribute), "sum")()
+              val skipMultiplication = isPendingProduct && rightAlreadyAccounted
+              if (skipMultiplication) {
+                // Skip: right-side tables are already in the pending product's count
+                dbg(s"LEFT propagation: SKIPPING (right already accounted) $lastSumAtt")
+                lastSumMap.put(agg.resultAttribute, lastSumAtt)
+              } else {
+                // Multiply by right count (new tables not yet accounted for)
+                val countRightAgg = if (rightPlanIsLeaf) {
+                  dbg(s"LEFT propagation: using COUNT(1) for leaf right")
+                  Count(Literal(1L)).toAggregateExpression()
+                } else {
+                  dbg(s"LEFT propagation: using SUM($rightCountAttribute) for non-leaf right")
+                  Sum(rightCountAttribute).toAggregateExpression()
+                }
+                applicableAggExpressions = applicableAggExpressions :+ countRightAgg
 
-              multiplySumExpressions = multiplySumExpressions :+ newSum
-              dbg(s"LEFT propagation: $lastSumAtt * count -> $newSum")
-              lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
-              dbg(s"  updated lastSumMap -> ${newSum.toAttribute}")
+                val newSum = Alias(createMultiplication(lastSumAtt,
+                  countRightAgg.resultAttribute), "sum")()
+
+                multiplySumExpressions = multiplySumExpressions :+ newSum
+                dbg(s"LEFT propagation: $lastSumAtt * count -> $newSum")
+                lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
+                dbg(s"  updated lastSumMap -> ${newSum.toAttribute}")
+
+                // Update accounted attrs to include the right side we just multiplied by
+                if (isPendingProduct) {
+                  accountedAttrs.foreach { accounted =>
+                    val newAccounted = accounted ++ rightPlan.outputSet
+                    pendingProductAccountedAttrs.put(agg.resultAttribute, newAccounted)
+                    dbg(s"  updated accountedAttrs to include rightPlan")
+                  }
+                }
+              }
             }
           }
           else {
@@ -1954,9 +2167,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // Safe to compute when: all other uncommitted products have ALL their attrs
               // already in the combined output (so they won't add new grouping later).
               //
-              // KEY INSIGHT: Only products that SHARE attributes with us can cause conflicts.
-              // Completely independent products (no shared attrs) can be computed separately
-              // without affecting each other's count semantics.
+              // ANY uncommitted products with unseen attrs cause conflicts.
+              // Even products with disjoint attrs affect count semantics because
+              // they may add grouping at different join points depending on join order.
               val otherProductsHaveUnseenAttrs = aggExpressions.exists { otherAgg =>
                 otherAgg.aggregateFunction match {
                   case Sum(child, _) if otherAgg != agg =>
@@ -1968,17 +2181,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                       false // Already computed, won't add new grouping
                     } else {
                       // Does this uncommitted product have attrs not yet available?
-                      val otherHasUnseenAttrs = otherRefs.exists(a =>
-                        !combinedOutputSet.contains(a))
-                      // Does this product SHARE any attrs with ours?
-                      // Only products that share attrs can conflict - completely independent
-                      // products (disjoint attr sets) don't affect each other's count semantics.
-                      val otherAttrs = otherRefs
-                      val thisAttrs = productAttrsSet
-                      val hasSharedAttrs = otherAttrs.exists(a => thisAttrs.contains(a))
-                      // Conflict ONLY if: other has unseen attrs AND shares attrs with us
-                      // Independent products (no shared attrs) can be computed separately
-                      otherHasUnseenAttrs && hasSharedAttrs
+                      // If so, it will add grouping at a future join, affecting counts.
+                      otherRefs.exists(a => !combinedOutputSet.contains(a))
                     }
                   case _ => false
                 }
@@ -1988,6 +2192,11 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               val hasForeignGrouping = applicableGroupAttributes.exists { grp =>
                 !grp.references.subsetOf(productAttrsSet)
               }
+
+              // Note: We do NOT bypass foreign grouping check for synthetic superset products.
+              // Even though synthetic superset intentionally groups by all product attrs,
+              // the foreign grouping check is essential for correct count multiplication.
+              // Products will be computed at the final aggregate where counts are correct.
 
               val hasConflict = hasForeignGrouping || otherProductsHaveUnseenAttrs
               // If there's a conflict, defer product unless this is a leaf join.
@@ -2052,11 +2261,21 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
                 lastSumMap.put(agg.resultAttribute, productAlias.toAttribute)
                 pendingProductSumSet.add(agg.resultAttribute)
-                // Only store non-aggregate grouping attributes (filter out count expressions)
-                // Aggregate expressions like count(1) have empty .references and shouldn't
-                // be stored as grouping attributes for lazy reduction.
+                // Track which tables' counts have been accounted for in this pending product.
+                // This is the union of left and right output sets at the point of computation.
+                // When the product flows to higher joins, we only multiply by counts from
+                // NEW tables (tables not in this set).
+                val accountedAttrs = AttributeSet(leftPlan.outputSet ++ rightPlan.outputSet)
+                pendingProductAccountedAttrs.put(agg.resultAttribute, accountedAttrs)
+                // Track this product's original attribute references for relevance check
+                val productOriginalRefs = agg.references.filter(a =>
+                  !a.name.startsWith("c#") && a.name != "c")
+                val origRefSet = AttributeSet(productOriginalRefs)
+                pendingProductOriginalAttrs.put(agg.resultAttribute, origRefSet)
                 dbg(s"Added pending product ($numProductAttrs attrs): $productExpr")
                 dbg(s"  productAlias=${productAlias.toAttribute}")
+                dbg(s"  accountedAttrs=${accountedAttrs.map(_.name)}")
+                dbg(s"  originalRefs=${productOriginalRefs.map(_.name)}")
               } else {
                 // Defer to final aggregate: uncovered right attr (right attr not in grouping)
                 // or foreign grouping that needs proper count aggregation

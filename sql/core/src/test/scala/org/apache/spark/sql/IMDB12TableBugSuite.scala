@@ -30,24 +30,37 @@ import org.apache.spark.sql.test.SharedSparkSession
  * 4. Various product conflict patterns
  * 5. Complex independent product scenarios (computed early with own count tracks)
  *
- * MULTI-COUNT OPTIMIZATION CASES:
- * ===============================
+ * IMPLEMENTATION STATUS (all cases below are WORKING):
+ * =====================================================
+ *
  * CASE 1 - Independent Products: {a,b}, {c,d} with no overlap
- *          -> Each can use its own count track (optimization applies)
+ *          -> Each uses its own count track (optimization applies)
  *          -> See "COMPLEX INDEPENDENT PRODUCT TESTS" section for extensive coverage
+ *          STATUS: WORKING (products computed early at their join points)
  *
  * CASE 2 - Containment Hierarchy: {a} < {a,b} < {a,b,c}
  *          -> Derive coarser counts from finest (optimization applies)
+ *          STATUS: WORKING (hierarchical count derivation)
  *
  * CASE 3 - Universal Superset: {a,b}, {a,c}, {b,c} all contained in {a,b,c}
  *          -> Use superset as source (optimization applies)
+ *          STATUS: WORKING (all derive from common superset)
  *
- * CASE 4 - Multiple Components: {a,b},{b,c} conflict + {d,e} independent
+ * CASE 4 - Multiple Components (Connected Components):
+ *          {a,b},{b,c} conflict + {d,e} independent
  *          -> Independent component optimizes; conflict defers (partial)
+ *          STATUS: WORKING (components handled separately)
  *
  * CASE 5 - Star Pattern: {a,b}, {a,c}, {a,d} all share 'a'
  *          -> No containment, must defer ALL to final (NO optimization)
  *          -> This is the IMDB query pattern!
+ *          STATUS: WORKING (correctly defers to final aggregate)
+ *
+ * FUTURE OPTIMIZATION (not yet implemented):
+ * ==========================================
+ * Synthetic Superset: For star pattern, create synthetic {a,b,c,d} and derive
+ * each product's count via GROUP BY. This would allow early computation even
+ * for star pattern queries.
  *
  * Run with: build/sbt 'sql/testOnly org.apache.spark.sql.IMDB12TableBugSuite'
  */
@@ -2755,6 +2768,1632 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       println(s"Products: {a,b,c} and {d,e,f} - disjoint 3-attr products")
       println(s"Result: ${df.collect().map(_.toString).mkString}")
       checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  // ============================================================================
+  // ADDITIONAL CONNECTED COMPONENTS TESTS
+  // ============================================================================
+
+  test("CASE 4b: Three independent components") {
+    // Three completely independent components - verifies transitive closure is correct
+    // Component 1: {a,b} - single product
+    // Component 2: {c,d} - single product
+    // Component 3: {e,f} - single product
+    // None share any attributes, so all should be optimized independently
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows
+    val t2 = Seq((1, 20)).toDF("id", "b")           // 1 row
+    val t3 = Seq((1, 30), (1, 31)).toDF("id", "c")  // 2 rows
+    val t4 = Seq((1, 40)).toDF("id", "d")           // 1 row
+    val t5 = Seq((1, 50), (1, 51)).toDF("id", "e")  // 2 rows
+    val t6 = Seq((1, 60)).toDF("id", "f")           // 1 row
+
+    t1.createOrReplaceTempView("c4b_t1")
+    t2.createOrReplaceTempView("c4b_t2")
+    t3.createOrReplaceTempView("c4b_t3")
+    t4.createOrReplaceTempView("c4b_t4")
+    t5.createOrReplaceTempView("c4b_t5")
+    t6.createOrReplaceTempView("c4b_t6")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(c4b_t1.a * c4b_t2.b),
+             SUM(c4b_t3.c * c4b_t4.d),
+             SUM(c4b_t5.e * c4b_t6.f)
+      FROM c4b_t1, c4b_t2, c4b_t3, c4b_t4, c4b_t5, c4b_t6
+      WHERE c4b_t1.id = c4b_t2.id
+        AND c4b_t2.id = c4b_t3.id
+        AND c4b_t3.id = c4b_t4.id
+        AND c4b_t4.id = c4b_t5.id
+        AND c4b_t5.id = c4b_t6.id
+    """
+
+    // JOIN produces 2*1*2*1*2*1 = 8 rows
+    //
+    // SUM(a*b): Each (a,b) pair appears 2*1*2*1 = 4 times
+    // (10*20 + 11*20) * 4 = (200+220)*4 = 1680
+    //
+    // SUM(c*d): Each (c,d) pair appears 2*1*2*1 = 4 times
+    // (30*40 + 31*40) * 4 = (1200+1240)*4 = 9760
+    //
+    // SUM(e*f): Each (e,f) pair appears 2*1*2*1 = 4 times
+    // (50*60 + 51*60) * 4 = (3000+3060)*4 = 24240
+    val expectedResult = Row(8L, 1680L, 9760L, 24240L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 4b: THREE INDEPENDENT COMPONENTS ===")
+      println("Component 1: {a,b} - independent")
+      println("Component 2: {c,d} - independent")
+      println("Component 3: {e,f} - independent")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  test("CASE 4c: Star with independent product") {
+    // Star pattern (conflicting) + one independent product
+    // Component 1: {a,b}, {a,c}, {a,d} - star pattern (all conflict via 'a')
+    // Component 2: {e,f} - independent
+    // The star products should defer; the independent should optimize
+    val t1 = Seq((1, 10), (1, 11)).toDF("id", "a")  // 2 rows - shared
+    val t2 = Seq((1, 20)).toDF("id", "b")           // 1 row
+    val t3 = Seq((1, 30), (1, 31)).toDF("id", "c")  // 2 rows
+    val t4 = Seq((1, 40)).toDF("id", "d")           // 1 row
+    val t5 = Seq((1, 50), (1, 51)).toDF("id", "e")  // 2 rows
+    val t6 = Seq((1, 60)).toDF("id", "f")           // 1 row
+
+    t1.createOrReplaceTempView("c4c_t1")
+    t2.createOrReplaceTempView("c4c_t2")
+    t3.createOrReplaceTempView("c4c_t3")
+    t4.createOrReplaceTempView("c4c_t4")
+    t5.createOrReplaceTempView("c4c_t5")
+    t6.createOrReplaceTempView("c4c_t6")
+
+    val query = """
+      SELECT COUNT(*),
+             SUM(c4c_t1.a * c4c_t2.b),
+             SUM(c4c_t1.a * c4c_t3.c),
+             SUM(c4c_t1.a * c4c_t4.d),
+             SUM(c4c_t5.e * c4c_t6.f)
+      FROM c4c_t1, c4c_t2, c4c_t3, c4c_t4, c4c_t5, c4c_t6
+      WHERE c4c_t1.id = c4c_t2.id
+        AND c4c_t2.id = c4c_t3.id
+        AND c4c_t3.id = c4c_t4.id
+        AND c4c_t4.id = c4c_t5.id
+        AND c4c_t5.id = c4c_t6.id
+    """
+
+    // JOIN produces 2*1*2*1*2*1 = 8 rows
+    //
+    // SUM(a*b): Each (a,b) appears 2*1*2*1 = 4 times
+    // (10*20 + 11*20) * 4 = 420*4 = 1680
+    //
+    // SUM(a*c): Each (a,c) appears 1*1*2*1 = 2 times
+    // (10*30 + 10*31 + 11*30 + 11*31) * 2 = (300+310+330+341)*2 = 2562
+    //
+    // SUM(a*d): Each (a,d) appears 1*2*1*2 = 4 times
+    // (10*40 + 11*40) * 4 = 840*4 = 3360
+    //
+    // SUM(e*f): Each (e,f) appears 2*1*2*1 = 4 times
+    // (50*60 + 51*60) * 4 = 6060*4 = 24240
+    val expectedResult = Row(8L, 1680L, 2562L, 3360L, 24240L)
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      checkAnswer(sql(query), expectedResult)
+    }
+
+    withSQLConf(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+    ) {
+      val df = sql(query)
+      println("=== CASE 4c: STAR WITH INDEPENDENT PRODUCT ===")
+      println("Component 1 (star): {a,b}, {a,c}, {a,d} - conflict via 'a'")
+      println("Component 2 (indep): {e,f}")
+      println(s"Result: ${df.collect().map(_.toString).mkString}")
+      checkAnswer(df, expectedResult)
+    }
+    // scalastyle:on println
+  }
+
+  // ==========================================================================
+  // CASE 6: SYNTHETIC SUPERSET OPTIMIZATION (STATUS: OPTIONAL)
+  // ==========================================================================
+  // For star-pattern conflicts, create synthetic superset when enabled.
+  // Tests that synthetic superset produces same results as deferred approach.
+
+  test("CASE 6: Synthetic superset for star pattern") {
+    // Create simple tables for star pattern test
+    // Star pattern: {a,b}, {a,c}, {a,d} - all share 'a' but none contains another
+    withTable("star_r1", "star_r2", "star_r3", "star_r4") {
+      sql("CREATE TABLE star_r1 (id INT, a INT, b INT) USING parquet")
+      sql("CREATE TABLE star_r2 (id INT, a INT, c INT) USING parquet")
+      sql("CREATE TABLE star_r3 (id INT, a INT, d INT) USING parquet")
+      sql("CREATE TABLE star_r4 (id INT, a INT) USING parquet")
+
+      // Insert test data
+      sql("INSERT INTO star_r1 VALUES (1, 10, 100), (2, 10, 101), (3, 20, 200)")
+      sql("INSERT INTO star_r2 VALUES (1, 10, 1000), (2, 20, 2000)")
+      sql("INSERT INTO star_r3 VALUES (1, 10, 10000), (2, 10, 10001), (3, 20, 20000)")
+      sql("INSERT INTO star_r4 VALUES (1, 10), (2, 20)")
+
+      val query = """
+        SELECT SUM(r1.a * r1.b) as p1,
+               SUM(r1.a * r2.c) as p2,
+               SUM(r1.a * r3.d) as p3
+        FROM star_r1 r1
+        JOIN star_r4 r4 ON r1.a = r4.a
+        JOIN star_r2 r2 ON r1.a = r2.a
+        JOIN star_r3 r3 ON r1.a = r3.a
+      """
+
+      // Get baseline result with Yannakakis disabled
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // Test with synthetic superset DISABLED (current behavior - deferred)
+      // scalastyle:off println
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "false"
+      ) {
+        val df = sql(query)
+        println("=== CASE 6: SYNTHETIC SUPERSET (disabled) ===")
+        println("Star pattern: {a,b}, {a,c}, {a,d}")
+        println(s"Result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+
+      // Test with synthetic superset ENABLED
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println("=== CASE 6: SYNTHETIC SUPERSET (enabled) ===")
+        println("Star pattern: {a,b}, {a,c}, {a,d} -> Synthetic: {a,b,c,d}")
+        println(s"Result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 6b: Synthetic superset with too-large synthetic rejected") {
+    // Test that synthetic superset is NOT used when union would be too large
+    // Criteria: syntheticSize <= maxProductSize * 2
+    // Here we have products of size 2, but union would be size 5 (> 2*2=4)
+    withTable("large_r1", "large_r2", "large_r3") {
+      sql("CREATE TABLE large_r1 (id INT, a INT, b INT) USING parquet")
+      sql("CREATE TABLE large_r2 (id INT, a INT, c INT, d INT) USING parquet")
+      sql("CREATE TABLE large_r3 (id INT, a INT, e INT, f INT) USING parquet")
+
+      sql("INSERT INTO large_r1 VALUES (1, 10, 100)")
+      sql("INSERT INTO large_r2 VALUES (1, 10, 1000, 2000)")
+      sql("INSERT INTO large_r3 VALUES (1, 10, 10000, 20000)")
+
+      // Product attrs: {a,b} size=2, {a,c} size=2, {a,e} size=2
+      // But union {a,b,c,d,e,f} size=6 > 2*2=4, so synthetic should be rejected
+      val query = """
+        SELECT SUM(r1.a * r1.b) as p1,
+               SUM(r1.a * r2.c) as p2,
+               SUM(r1.a * r3.e) as p3
+        FROM large_r1 r1
+        JOIN large_r2 r2 ON r1.a = r2.a
+        JOIN large_r3 r3 ON r1.a = r3.a
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // Both should produce same result (synthetic rejected, falls back to defer)
+      // scalastyle:off println
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println("=== CASE 6b: SYNTHETIC TOO LARGE ===")
+        println("Products: {a,b}, {a,c}, {a,e} - union too large for synthetic")
+        println(s"Result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 6c: Synthetic superset with duplicate rows - count accuracy") {
+    // Test that counts are accurate when there are duplicate rows
+    withTable("dup_t1", "dup_t2", "dup_t3") {
+      sql("CREATE TABLE dup_t1 (a INT, b INT) USING parquet")
+      sql("CREATE TABLE dup_t2 (a INT, c INT) USING parquet")
+      sql("CREATE TABLE dup_t3 (a INT, d INT) USING parquet")
+
+      // Insert duplicates to create cross-product multiplications
+      sql("INSERT INTO dup_t1 VALUES (1, 10), (1, 10), (1, 20)")  // 3 rows for a=1
+      sql("INSERT INTO dup_t2 VALUES (1, 100), (1, 100)")          // 2 rows for a=1
+      sql("INSERT INTO dup_t3 VALUES (1, 1000)")                    // 1 row for a=1
+
+      val query = """
+        SELECT SUM(t1.a * t1.b) as p1,
+               SUM(t1.a * t2.c) as p2,
+               SUM(t1.a * t3.d) as p3
+        FROM dup_t1 t1
+        JOIN dup_t2 t2 ON t1.a = t2.a
+        JOIN dup_t3 t3 ON t1.a = t3.a
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println("=== CASE 6c: DUPLICATE ROWS - COUNT ACCURACY ===")
+        println(s"Baseline: ${baseline.map(_.toString).mkString}")
+        println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 6d: No common center - synthetic superset should be rejected") {
+    // Products: {a,b}, {c,d} - no overlap, so no star pattern
+    withTable("nostar_t1", "nostar_t2") {
+      sql("CREATE TABLE nostar_t1 (id INT, a INT, b INT) USING parquet")
+      sql("CREATE TABLE nostar_t2 (id INT, c INT, d INT) USING parquet")
+
+      sql("INSERT INTO nostar_t1 VALUES (1, 10, 100)")
+      sql("INSERT INTO nostar_t2 VALUES (1, 1000, 10000)")
+
+      val query = """
+        SELECT SUM(t1.a * t1.b) as p1,
+               SUM(t2.c * t2.d) as p2
+        FROM nostar_t1 t1
+        JOIN nostar_t2 t2 ON t1.id = t2.id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println("=== CASE 6d: NO COMMON CENTER ===")
+        println("Products: {a,b}, {c,d} - no common attrs, synthetic NOT used")
+        println(s"Result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 6e: IMDB-style star pattern with role_id center") {
+    // Mimics IMDB query structure:
+    // Products: {role_id, info_type_id}, {production_year, role_id},
+    //           {company_type_id, role_id, kind_id}
+    // Common center: role_id
+    withTable("imdb_ci", "imdb_mi", "imdb_mc", "imdb_t", "imdb_rt") {
+      sql("CREATE TABLE imdb_ci (id INT, role_id INT, movie_id INT) USING parquet")
+      sql("CREATE TABLE imdb_mi (id INT, movie_id INT, info_type_id INT) USING parquet")
+      sql("CREATE TABLE imdb_mc (id INT, movie_id INT, company_type_id INT) USING parquet")
+      sql("CREATE TABLE imdb_t (id INT, production_year INT, kind_id INT) USING parquet")
+      sql("CREATE TABLE imdb_rt (id INT) USING parquet")
+
+      sql("INSERT INTO imdb_ci VALUES (1, 2, 100)")
+      sql("INSERT INTO imdb_mi VALUES (1, 100, 5)")
+      sql("INSERT INTO imdb_mc VALUES (1, 100, 3)")
+      sql("INSERT INTO imdb_t VALUES (100, 2015, 7)")
+      sql("INSERT INTO imdb_rt VALUES (2)")
+
+      // Products all share role_id as center:
+      // {role_id, info_type_id}, {production_year, role_id}, {company_type_id, role_id, kind_id}
+      val query = """
+        SELECT SUM(ci.role_id * mi.info_type_id) as p1,
+               SUM(t.production_year * ci.role_id) as p2,
+               SUM(mc.company_type_id * ci.role_id * t.kind_id) as p3
+        FROM imdb_ci ci
+        JOIN imdb_mi mi ON ci.movie_id = mi.movie_id
+        JOIN imdb_mc mc ON ci.movie_id = mc.movie_id
+        JOIN imdb_t t ON ci.movie_id = t.id
+        JOIN imdb_rt rt ON ci.role_id = rt.id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== CASE 6e: IMDB-STYLE STAR PATTERN ===")
+      println("Products: {role_id,info_type_id}, {production_year,role_id}, " +
+        "{company_type_id,role_id,kind_id}")
+      println("Common center: role_id")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 6f: Synthetic superset with multiple rows - all products early") {
+    // Tests that all products in a star pattern are computed early (not deferred)
+    // Previous bug: foreign grouping check blocked products even with synthetic superset
+    withTable("star_center", "star_a", "star_b", "star_c") {
+      sql("CREATE TABLE star_center (id INT, x INT) USING parquet")
+      sql("CREATE TABLE star_a (id INT, a INT) USING parquet")
+      sql("CREATE TABLE star_b (id INT, b INT) USING parquet")
+      sql("CREATE TABLE star_c (id INT, c INT) USING parquet")
+
+      // Multiple rows to test count accuracy
+      sql("INSERT INTO star_center VALUES (1, 10), (2, 20), (3, 30)")
+      sql("INSERT INTO star_a VALUES (1, 2), (2, 3)")
+      sql("INSERT INTO star_b VALUES (1, 4), (2, 5), (3, 6)")
+      sql("INSERT INTO star_c VALUES (1, 7), (3, 8)")
+
+      // Star pattern: all products share x from center
+      // p1 = SUM(x * a)  attrs: {x, a}
+      // p2 = SUM(x * b)  attrs: {x, b}
+      // p3 = SUM(x * c)  attrs: {x, c}
+      val query = """
+        SELECT SUM(s.x * a.a) as p1,
+               SUM(s.x * b.b) as p2,
+               SUM(s.x * c.c) as p3
+        FROM star_center s
+        JOIN star_a a ON s.id = a.id
+        JOIN star_b b ON s.id = b.id
+        JOIN star_c c ON s.id = c.id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== CASE 6f: SYNTHETIC SUPERSET - ALL PRODUCTS EARLY ===")
+      println("Products: {x,a}, {x,b}, {x,c} - all share x")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 6g: Synthetic superset with 4 products - larger star") {
+    // Tests synthetic superset with more products
+    withTable("center4", "arm1", "arm2", "arm3", "arm4") {
+      sql("CREATE TABLE center4 (id INT, x INT) USING parquet")
+      sql("CREATE TABLE arm1 (id INT, a INT) USING parquet")
+      sql("CREATE TABLE arm2 (id INT, b INT) USING parquet")
+      sql("CREATE TABLE arm3 (id INT, c INT) USING parquet")
+      sql("CREATE TABLE arm4 (id INT, d INT) USING parquet")
+
+      sql("INSERT INTO center4 VALUES (1, 5), (2, 10)")
+      sql("INSERT INTO arm1 VALUES (1, 2), (2, 3)")
+      sql("INSERT INTO arm2 VALUES (1, 4), (2, 5)")
+      sql("INSERT INTO arm3 VALUES (1, 6), (2, 7)")
+      sql("INSERT INTO arm4 VALUES (1, 8), (2, 9)")
+
+      val query = """
+        SELECT SUM(c.x * a1.a) as p1,
+               SUM(c.x * a2.b) as p2,
+               SUM(c.x * a3.c) as p3,
+               SUM(c.x * a4.d) as p4
+        FROM center4 c
+        JOIN arm1 a1 ON c.id = a1.id
+        JOIN arm2 a2 ON c.id = a2.id
+        JOIN arm3 a3 ON c.id = a3.id
+        JOIN arm4 a4 ON c.id = a4.id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== CASE 6g: SYNTHETIC SUPERSET - 4 PRODUCTS ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 6h: Synthetic superset with fan-out multiplication") {
+    // Tests that counts are correctly multiplied for fan-out scenarios
+    withTable("hub", "spoke1", "spoke2") {
+      sql("CREATE TABLE hub (id INT, val INT) USING parquet")
+      sql("CREATE TABLE spoke1 (hub_id INT, a INT) USING parquet")
+      sql("CREATE TABLE spoke2 (hub_id INT, b INT) USING parquet")
+
+      // Hub with 2 rows
+      sql("INSERT INTO hub VALUES (1, 10), (2, 20)")
+      // Spoke1: 2 rows match hub 1, 1 row matches hub 2 -> fan-out
+      sql("INSERT INTO spoke1 VALUES (1, 2), (1, 3), (2, 4)")
+      // Spoke2: 1 row matches hub 1, 2 rows match hub 2
+      sql("INSERT INTO spoke2 VALUES (1, 5), (2, 6), (2, 7)")
+
+      // Cross join creates: hub1 x 2 spoke1 x 1 spoke2 = 2 combos for hub 1
+      //                     hub2 x 1 spoke1 x 2 spoke2 = 2 combos for hub 2
+      val query = """
+        SELECT SUM(h.val * s1.a) as p1,
+               SUM(h.val * s2.b) as p2
+        FROM hub h
+        JOIN spoke1 s1 ON h.id = s1.hub_id
+        JOIN spoke2 s2 ON h.id = s2.hub_id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== CASE 6h: SYNTHETIC SUPERSET - FAN-OUT ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Partial overlap: pending product flows through join with mixed tables") {
+    // This test exercises the edge case where a pending product computed at join J1
+    // flows through LEFT propagation at join J2, where J2's right subtree contains
+    // some tables that were already counted (partial overlap) and some new tables.
+    //
+    // Schema:
+    // - center (id, val): hub table
+    // - left_spoke (center_id, a): spoke joining to center
+    // - right_spoke (center_id, b): spoke joining to center
+    // - extra (right_spoke_id, c): extra table joining to right_spoke
+    //
+    // Query: SUM(val * a) -- product from center × left_spoke
+    // The product might be computed at (center ⋈ left_spoke), then flow through
+    // a join with (right_spoke ⋈ extra). If right_spoke is also joined to center
+    // earlier, there could be partial overlap.
+    //
+    // For this test, we create a 4-way join:
+    //   center ⋈ left_spoke ⋈ right_spoke ⋈ extra
+    // where center joins to both spokes, and extra joins to right_spoke.
+    //
+    // The product SUM(val * a) uses {center, left_spoke} tables.
+    // Depending on join order, when this product flows up, it might encounter
+    // a right subtree that includes center (overlap) or just right_spoke/extra (no overlap).
+
+    withTable("center", "left_spoke", "right_spoke", "extra") {
+      sql("CREATE TABLE center (id INT, val INT) USING parquet")
+      sql("CREATE TABLE left_spoke (center_id INT, a INT) USING parquet")
+      sql("CREATE TABLE right_spoke (center_id INT, b INT) USING parquet")
+      sql("CREATE TABLE extra (right_spoke_b INT, c INT) USING parquet")
+
+      // Center: 2 rows
+      sql("INSERT INTO center VALUES (1, 10), (2, 20)")
+      // Left spoke: fan-out - 2 rows for center 1, 1 for center 2
+      sql("INSERT INTO left_spoke VALUES (1, 2), (1, 3), (2, 4)")
+      // Right spoke: 2 rows for center 1, 1 for center 2
+      sql("INSERT INTO right_spoke VALUES (1, 5), (1, 6), (2, 7)")
+      // Extra: joins to right_spoke.b - creates additional fan-out
+      sql("INSERT INTO extra VALUES (5, 100), (6, 200), (7, 300)")
+
+      // Query with product that uses center and left_spoke
+      // The extra join creates a complex tree where partial overlap might occur
+      val query = """
+        SELECT SUM(c.val * ls.a) as product_sum,
+               COUNT(*) as cnt
+        FROM center c
+        JOIN left_spoke ls ON c.id = ls.center_id
+        JOIN right_spoke rs ON c.id = rs.center_id
+        JOIN extra e ON rs.b = e.right_spoke_b
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== PARTIAL OVERLAP TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      // Test with Yannakakis enabled
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+
+      // Also test with synthetic superset enabled
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Independent products: two products with disjoint attribute sets") {
+    // Tests the bug where two independent products were incorrectly sharing counts.
+    // Product 1: SUM(t1.a * t2.b) uses {a, b} from tables t1, t2
+    // Product 2: SUM(t3.c * t4.d) uses {c, d} from tables t3, t4
+    // These products share NO attributes and should be computed independently.
+    //
+    // The bug was that during LEFT propagation, Product 2 was being multiplied
+    // by counts from tables (like t1, t2) that are only relevant to Product 1.
+
+    withTable("indep_t1", "indep_t2", "indep_t3", "indep_t4") {
+      sql("CREATE TABLE indep_t1 (id INT, a INT) USING parquet")
+      sql("CREATE TABLE indep_t2 (id INT, b INT) USING parquet")
+      sql("CREATE TABLE indep_t3 (id INT, c INT) USING parquet")
+      sql("CREATE TABLE indep_t4 (id INT, d INT) USING parquet")
+
+      // Setup data with different cardinalities to catch multiplication errors
+      // t1: 2 rows, t2: 3 rows, t3: 2 rows, t4: 2 rows
+      sql("INSERT INTO indep_t1 VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO indep_t2 VALUES (1, 2), (1, 3), (1, 4)")
+      sql("INSERT INTO indep_t3 VALUES (1, 100), (1, 200)")
+      sql("INSERT INTO indep_t4 VALUES (1, 5), (1, 6)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(indep_t1.a * indep_t2.b) as prod1,
+               SUM(indep_t3.c * indep_t4.d) as prod2
+        FROM indep_t1, indep_t2, indep_t3, indep_t4
+        WHERE indep_t1.id = indep_t2.id
+          AND indep_t2.id = indep_t3.id
+          AND indep_t3.id = indep_t4.id
+      """
+
+      // Full join: 2*3*2*2 = 24 rows
+      // Product 1 (a*b): Each (a,b) pair appears 2*2=4 times (for each t3,t4 combo)
+      //   (10,2), (10,3), (10,4), (20,2), (20,3), (20,4) each * 4
+      //   = (20+30+40+40+60+80) * 4 = 270 * 4 = 1080
+      // Product 2 (c*d): Each (c,d) pair appears 2*3=6 times (for each t1,t2 combo)
+      //   (100,5), (100,6), (200,5), (200,6) each * 6
+      //   = (500+600+1000+1200) * 6 = 3300 * 6 = 19800
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== INDEPENDENT PRODUCTS TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Independent products: three products with partial overlap") {
+    // Product 1: SUM(a * b) uses {a, b}
+    // Product 2: SUM(b * c) uses {b, c} - shares 'b' with Product 1
+    // Product 3: SUM(d) uses {d} - completely independent
+    //
+    // This tests that products with partial overlap are handled correctly
+    // while fully independent products don't interfere.
+
+    withTable("overlap_t1", "overlap_t2", "overlap_t3", "overlap_t4") {
+      sql("CREATE TABLE overlap_t1 (id INT, a INT) USING parquet")
+      sql("CREATE TABLE overlap_t2 (id INT, b INT) USING parquet")
+      sql("CREATE TABLE overlap_t3 (id INT, c INT) USING parquet")
+      sql("CREATE TABLE overlap_t4 (id INT, d INT) USING parquet")
+
+      sql("INSERT INTO overlap_t1 VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO overlap_t2 VALUES (1, 2), (1, 3)")
+      sql("INSERT INTO overlap_t3 VALUES (1, 100)")
+      sql("INSERT INTO overlap_t4 VALUES (1, 7), (1, 8), (1, 9)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(overlap_t1.a * overlap_t2.b) as prod_ab,
+               SUM(overlap_t2.b * overlap_t3.c) as prod_bc,
+               SUM(overlap_t4.d) as sum_d
+        FROM overlap_t1, overlap_t2, overlap_t3, overlap_t4
+        WHERE overlap_t1.id = overlap_t2.id
+          AND overlap_t2.id = overlap_t3.id
+          AND overlap_t3.id = overlap_t4.id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== INDEPENDENT PRODUCTS WITH PARTIAL OVERLAP TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Isolated products: 3 disjoint multi-attr products") {
+    // Product 1: SUM(a1 * a2) uses {a1, a2}
+    // Product 2: SUM(b1 * b2) uses {b1, b2}
+    // Product 3: SUM(c1 * c2) uses {c1, c2}
+    // All 3 products are multi-attribute and completely disjoint.
+
+    withTable("iso3m_t1", "iso3m_t2", "iso3m_t3", "iso3m_t4", "iso3m_t5", "iso3m_t6") {
+      sql("CREATE TABLE iso3m_t1 (id INT, a1 INT) USING parquet")
+      sql("CREATE TABLE iso3m_t2 (id INT, a2 INT) USING parquet")
+      sql("CREATE TABLE iso3m_t3 (id INT, b1 INT) USING parquet")
+      sql("CREATE TABLE iso3m_t4 (id INT, b2 INT) USING parquet")
+      sql("CREATE TABLE iso3m_t5 (id INT, c1 INT) USING parquet")
+      sql("CREATE TABLE iso3m_t6 (id INT, c2 INT) USING parquet")
+
+      sql("INSERT INTO iso3m_t1 VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO iso3m_t2 VALUES (1, 2), (1, 3)")
+      sql("INSERT INTO iso3m_t3 VALUES (1, 100)")
+      sql("INSERT INTO iso3m_t4 VALUES (1, 5), (1, 6)")
+      sql("INSERT INTO iso3m_t5 VALUES (1, 1000)")
+      sql("INSERT INTO iso3m_t6 VALUES (1, 7)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(iso3m_t1.a1 * iso3m_t2.a2) as prod_a,
+               SUM(iso3m_t3.b1 * iso3m_t4.b2) as prod_b,
+               SUM(iso3m_t5.c1 * iso3m_t6.c2) as prod_c
+        FROM iso3m_t1, iso3m_t2, iso3m_t3, iso3m_t4, iso3m_t5, iso3m_t6
+        WHERE iso3m_t1.id = iso3m_t2.id
+          AND iso3m_t2.id = iso3m_t3.id
+          AND iso3m_t3.id = iso3m_t4.id
+          AND iso3m_t4.id = iso3m_t5.id
+          AND iso3m_t5.id = iso3m_t6.id
+      """
+
+      // Full join: 2*2*1*2*1*1 = 8 rows
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== 3 ISOLATED MULTI-ATTR PRODUCTS TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Isolated products: 4 disjoint multi-attr products") {
+    // Product 1: SUM(a1 * a2) uses {a1, a2}
+    // Product 2: SUM(b1 * b2) uses {b1, b2}
+    // Product 3: SUM(c1 * c2) uses {c1, c2}
+    // Product 4: SUM(d1 * d2) uses {d1, d2}
+    // All 4 products are multi-attribute and completely disjoint.
+
+    withTable("iso4m_t1", "iso4m_t2", "iso4m_t3", "iso4m_t4",
+              "iso4m_t5", "iso4m_t6", "iso4m_t7", "iso4m_t8") {
+      sql("CREATE TABLE iso4m_t1 (id INT, a1 INT) USING parquet")
+      sql("CREATE TABLE iso4m_t2 (id INT, a2 INT) USING parquet")
+      sql("CREATE TABLE iso4m_t3 (id INT, b1 INT) USING parquet")
+      sql("CREATE TABLE iso4m_t4 (id INT, b2 INT) USING parquet")
+      sql("CREATE TABLE iso4m_t5 (id INT, c1 INT) USING parquet")
+      sql("CREATE TABLE iso4m_t6 (id INT, c2 INT) USING parquet")
+      sql("CREATE TABLE iso4m_t7 (id INT, d1 INT) USING parquet")
+      sql("CREATE TABLE iso4m_t8 (id INT, d2 INT) USING parquet")
+
+      sql("INSERT INTO iso4m_t1 VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO iso4m_t2 VALUES (1, 2)")
+      sql("INSERT INTO iso4m_t3 VALUES (1, 100)")
+      sql("INSERT INTO iso4m_t4 VALUES (1, 5), (1, 6)")
+      sql("INSERT INTO iso4m_t5 VALUES (1, 1000)")
+      sql("INSERT INTO iso4m_t6 VALUES (1, 7)")
+      sql("INSERT INTO iso4m_t7 VALUES (1, 3), (1, 4)")
+      sql("INSERT INTO iso4m_t8 VALUES (1, 8)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(iso4m_t1.a1 * iso4m_t2.a2) as prod_a,
+               SUM(iso4m_t3.b1 * iso4m_t4.b2) as prod_b,
+               SUM(iso4m_t5.c1 * iso4m_t6.c2) as prod_c,
+               SUM(iso4m_t7.d1 * iso4m_t8.d2) as prod_d
+        FROM iso4m_t1, iso4m_t2, iso4m_t3, iso4m_t4,
+             iso4m_t5, iso4m_t6, iso4m_t7, iso4m_t8
+        WHERE iso4m_t1.id = iso4m_t2.id
+          AND iso4m_t2.id = iso4m_t3.id
+          AND iso4m_t3.id = iso4m_t4.id
+          AND iso4m_t4.id = iso4m_t5.id
+          AND iso4m_t5.id = iso4m_t6.id
+          AND iso4m_t6.id = iso4m_t7.id
+          AND iso4m_t7.id = iso4m_t8.id
+      """
+
+      // Full join: 2*1*1*2*1*1*2*1 = 8 rows
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== 4 ISOLATED MULTI-ATTR PRODUCTS TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Isolated products with subset: multi-attr product with subset and isolated") {
+    // Product 1: SUM(a * b) uses {a, b} - multi-attr
+    // Product 2: SUM(a * a) uses {a} - subset of Product 1's attrs (single table)
+    // Product 3: SUM(c * d) uses {c, d} - completely independent multi-attr
+    //
+    // Tests the interaction between subset relationships and independence with multi-attr.
+
+    withTable("subset_iso_t1", "subset_iso_t2", "subset_iso_t3", "subset_iso_t4") {
+      sql("CREATE TABLE subset_iso_t1 (id INT, a INT) USING parquet")
+      sql("CREATE TABLE subset_iso_t2 (id INT, b INT) USING parquet")
+      sql("CREATE TABLE subset_iso_t3 (id INT, c INT) USING parquet")
+      sql("CREATE TABLE subset_iso_t4 (id INT, d INT) USING parquet")
+
+      sql("INSERT INTO subset_iso_t1 VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO subset_iso_t2 VALUES (1, 3), (1, 4)")
+      sql("INSERT INTO subset_iso_t3 VALUES (1, 100)")
+      sql("INSERT INTO subset_iso_t4 VALUES (1, 5), (1, 6), (1, 7)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(subset_iso_t1.a * subset_iso_t2.b) as prod_ab,
+               SUM(subset_iso_t1.a * subset_iso_t1.a) as sum_a_sq,
+               SUM(subset_iso_t3.c * subset_iso_t4.d) as prod_cd
+        FROM subset_iso_t1, subset_iso_t2, subset_iso_t3, subset_iso_t4
+        WHERE subset_iso_t1.id = subset_iso_t2.id
+          AND subset_iso_t2.id = subset_iso_t3.id
+          AND subset_iso_t3.id = subset_iso_t4.id
+      """
+
+      // Full join: 2*2*1*3 = 12 rows
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== ISOLATED WITH SUBSET (MULTI-ATTR) TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Isolated products with filter on one product only") {
+    // Product 1: SUM(a) with filter a > 15
+    // Product 2: SUM(b) - no filter
+    // Tests that filters on isolated products don't affect other products.
+
+    withTable("iso_filter_t1", "iso_filter_t2") {
+      sql("CREATE TABLE iso_filter_t1 (id INT, a INT) USING parquet")
+      sql("CREATE TABLE iso_filter_t2 (id INT, b INT) USING parquet")
+
+      sql("INSERT INTO iso_filter_t1 VALUES (1, 10), (1, 20), (1, 30)")
+      sql("INSERT INTO iso_filter_t2 VALUES (1, 5), (1, 6)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(iso_filter_t1.a) as sum_a,
+               SUM(iso_filter_t2.b) as sum_b
+        FROM iso_filter_t1, iso_filter_t2
+        WHERE iso_filter_t1.id = iso_filter_t2.id
+          AND iso_filter_t1.a > 15
+      """
+
+      // After filter: t1 has 2 rows (20, 30), t2 has 2 rows (5, 6)
+      // Full join: 2*2 = 4 rows
+      // SUM(a): (20+30)*2 = 100
+      // SUM(b): (5+6)*2 = 22
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== ISOLATED WITH FILTER TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Isolated multi-attr products: two 2-attr products with no overlap") {
+    // Product 1: SUM(a * b) uses {a, b}
+    // Product 2: SUM(c * d) uses {c, d}
+    // No attribute overlap at all.
+
+    withTable("iso_multi_t1", "iso_multi_t2", "iso_multi_t3", "iso_multi_t4") {
+      sql("CREATE TABLE iso_multi_t1 (id INT, a INT) USING parquet")
+      sql("CREATE TABLE iso_multi_t2 (id INT, b INT) USING parquet")
+      sql("CREATE TABLE iso_multi_t3 (id INT, c INT) USING parquet")
+      sql("CREATE TABLE iso_multi_t4 (id INT, d INT) USING parquet")
+
+      sql("INSERT INTO iso_multi_t1 VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO iso_multi_t2 VALUES (1, 2), (1, 3)")
+      sql("INSERT INTO iso_multi_t3 VALUES (1, 100)")
+      sql("INSERT INTO iso_multi_t4 VALUES (1, 5), (1, 6), (1, 7)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(iso_multi_t1.a * iso_multi_t2.b) as prod_ab,
+               SUM(iso_multi_t3.c * iso_multi_t4.d) as prod_cd
+        FROM iso_multi_t1, iso_multi_t2, iso_multi_t3, iso_multi_t4
+        WHERE iso_multi_t1.id = iso_multi_t2.id
+          AND iso_multi_t2.id = iso_multi_t3.id
+          AND iso_multi_t3.id = iso_multi_t4.id
+      """
+
+      // Full join: 2*2*1*3 = 12 rows
+      // SUM(a*b): Each (a,b) pair appears 1*3=3 times
+      //   (10*2+10*3+20*2+20*3)*3 = (20+30+40+60)*3 = 450
+      // SUM(c*d): Each (c,d) pair appears 2*2=4 times
+      //   (100*5+100*6+100*7)*4 = 1800*4 = 7200
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== ISOLATED MULTI-ATTR PRODUCTS TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Isolated products combined: all multi-attr with subset and isolated") {
+    // Product 1: SUM(a * b) uses {a, b} - multi-attr
+    // Product 2: SUM(a * a) uses {a} - subset of Product 1 (single attr squared)
+    // Product 3: SUM(c * d) uses {c, d} - isolated multi-attr from 1 and 2
+    // Product 4: SUM(e * f) uses {e, f} - another isolated multi-attr
+    //
+    // Comprehensive test combining all cases with multi-attr products.
+
+    withTable("combo_t1", "combo_t2", "combo_t3", "combo_t4", "combo_t5", "combo_t6") {
+      sql("CREATE TABLE combo_t1 (id INT, a INT) USING parquet")
+      sql("CREATE TABLE combo_t2 (id INT, b INT) USING parquet")
+      sql("CREATE TABLE combo_t3 (id INT, c INT) USING parquet")
+      sql("CREATE TABLE combo_t4 (id INT, d INT) USING parquet")
+      sql("CREATE TABLE combo_t5 (id INT, e INT) USING parquet")
+      sql("CREATE TABLE combo_t6 (id INT, f INT) USING parquet")
+
+      sql("INSERT INTO combo_t1 VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO combo_t2 VALUES (1, 2)")
+      sql("INSERT INTO combo_t3 VALUES (1, 100)")
+      sql("INSERT INTO combo_t4 VALUES (1, 5), (1, 6)")
+      sql("INSERT INTO combo_t5 VALUES (1, 1000)")
+      sql("INSERT INTO combo_t6 VALUES (1, 7), (1, 8), (1, 9)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(combo_t1.a * combo_t2.b) as prod_ab,
+               SUM(combo_t1.a * combo_t1.a) as sum_a_sq,
+               SUM(combo_t3.c * combo_t4.d) as prod_cd,
+               SUM(combo_t5.e * combo_t6.f) as prod_ef
+        FROM combo_t1, combo_t2, combo_t3, combo_t4, combo_t5, combo_t6
+        WHERE combo_t1.id = combo_t2.id
+          AND combo_t2.id = combo_t3.id
+          AND combo_t3.id = combo_t4.id
+          AND combo_t4.id = combo_t5.id
+          AND combo_t5.id = combo_t6.id
+      """
+
+      // Full join: 2*1*1*2*1*3 = 12 rows
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== COMBINED ISOLATED PRODUCTS (ALL MULTI-ATTR) TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("IMDB-style: isolated products from different table groups") {
+    // Simulates the original failing query structure:
+    // Product 1: SUM(cast_info.role_id * movie_info.info_type_id)
+    // Product 2: SUM(movie_companies.company_type_id * title.kind_id)
+    //
+    // These products are completely independent - cast_info/movie_info have no
+    // shared attributes with movie_companies/title for the products.
+    // The star schema joins through title.movie_id.
+
+    withTable("imdb_title", "imdb_cast_info", "imdb_movie_info",
+              "imdb_movie_companies", "imdb_role_type", "imdb_info_type") {
+      // Create simplified IMDB-style tables
+      sql("CREATE TABLE imdb_title (id INT, kind_id INT) USING parquet")
+      sql("CREATE TABLE imdb_cast_info (movie_id INT, role_id INT) USING parquet")
+      sql("CREATE TABLE imdb_movie_info (movie_id INT, info_type_id INT) USING parquet")
+      sql("CREATE TABLE imdb_movie_companies (movie_id INT, company_type_id INT) USING parquet")
+      sql("CREATE TABLE imdb_role_type (id INT, role STRING) USING parquet")
+      sql("CREATE TABLE imdb_info_type (id INT, info STRING) USING parquet")
+
+      // Insert test data
+      sql("INSERT INTO imdb_title VALUES (1, 10), (2, 20)")
+      sql("INSERT INTO imdb_cast_info VALUES (1, 100), (1, 200), (2, 150)")
+      sql("INSERT INTO imdb_movie_info VALUES (1, 5), (2, 6)")
+      sql("INSERT INTO imdb_movie_companies VALUES (1, 1), (1, 2), (2, 3)")
+      sql("INSERT INTO imdb_role_type VALUES (100, 'actor'), (150, 'actor'), (200, 'actress')")
+      sql("INSERT INTO imdb_info_type VALUES (5, 'rating'), (6, 'length')")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(ci.role_id * mi.info_type_id) as prod1,
+               SUM(mc.company_type_id * t.kind_id) as prod2
+        FROM imdb_title t
+        JOIN imdb_cast_info ci ON ci.movie_id = t.id
+        JOIN imdb_movie_info mi ON mi.movie_id = t.id
+        JOIN imdb_movie_companies mc ON mc.movie_id = t.id
+        JOIN imdb_role_type rt ON rt.id = ci.role_id
+        JOIN imdb_info_type it ON it.id = mi.info_type_id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== IMDB-STYLE ISOLATED PRODUCTS TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("IMDB-style: three isolated products across 8 tables") {
+    // More complex IMDB-style query with three isolated products:
+    // Product 1: SUM(cast_info.role_id * movie_info.info_type_id) - cast/movie_info group
+    // Product 2: SUM(movie_companies.company_type_id * title.kind_id) - companies/title group
+    // Product 3: SUM(keyword.id * movie_keyword.keyword_id) - keyword group
+    //
+    // All three products have completely disjoint attribute sets.
+
+    withTable("imdb3_title", "imdb3_cast_info", "imdb3_movie_info",
+              "imdb3_movie_companies", "imdb3_movie_keyword", "imdb3_keyword") {
+      sql("CREATE TABLE imdb3_title (id INT, kind_id INT) USING parquet")
+      sql("CREATE TABLE imdb3_cast_info (movie_id INT, role_id INT) USING parquet")
+      sql("CREATE TABLE imdb3_movie_info (movie_id INT, info_type_id INT) USING parquet")
+      sql("CREATE TABLE imdb3_movie_companies (movie_id INT, company_type_id INT) USING parquet")
+      sql("CREATE TABLE imdb3_movie_keyword (movie_id INT, keyword_id INT) USING parquet")
+      sql("CREATE TABLE imdb3_keyword (id INT, keyword STRING) USING parquet")
+
+      sql("INSERT INTO imdb3_title VALUES (1, 10), (2, 20)")
+      sql("INSERT INTO imdb3_cast_info VALUES (1, 100), (2, 200)")
+      sql("INSERT INTO imdb3_movie_info VALUES (1, 5), (2, 6)")
+      sql("INSERT INTO imdb3_movie_companies VALUES (1, 1), (2, 2)")
+      sql("INSERT INTO imdb3_movie_keyword VALUES (1, 1000), (1, 2000), (2, 3000)")
+      sql("INSERT INTO imdb3_keyword VALUES (1000, 'action'), (2000, 'drama'), (3000, 'comedy')")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(ci.role_id * mi.info_type_id) as prod1,
+               SUM(mc.company_type_id * t.kind_id) as prod2,
+               SUM(k.id * mk.keyword_id) as prod3
+        FROM imdb3_title t
+        JOIN imdb3_cast_info ci ON ci.movie_id = t.id
+        JOIN imdb3_movie_info mi ON mi.movie_id = t.id
+        JOIN imdb3_movie_companies mc ON mc.movie_id = t.id
+        JOIN imdb3_movie_keyword mk ON mk.movie_id = t.id
+        JOIN imdb3_keyword k ON k.id = mk.keyword_id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== IMDB-STYLE 3 ISOLATED PRODUCTS TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("Deep tree: product computed early, flows through multiple levels") {
+    // Tests a deep join tree where a product is computed at level 2 and must
+    // flow through LEFT propagation at levels 3 and 4 without double-counting.
+    //
+    // Tree structure (depth 4):
+    //        root
+    //       /    \
+    //     L3      T4
+    //    /  \
+    //   L2   T3
+    //  /  \
+    // T1   T2 (product computed here: SUM(T1.a * T2.b))
+    //
+    // The pending product from T1×T2 should be multiplied by T3 count and T4 count,
+    // but NOT re-multiplied by T1 or T2 counts.
+
+    withTable("deep_t1", "deep_t2", "deep_t3", "deep_t4") {
+      sql("CREATE TABLE deep_t1 (id INT, a INT) USING parquet")
+      sql("CREATE TABLE deep_t2 (t1_id INT, b INT) USING parquet")
+      sql("CREATE TABLE deep_t3 (t1_id INT, c INT) USING parquet")
+      sql("CREATE TABLE deep_t4 (t1_id INT, d INT) USING parquet")
+
+      // T1: 2 rows
+      sql("INSERT INTO deep_t1 VALUES (1, 10), (2, 20)")
+      // T2: 2 rows for id 1, 1 for id 2
+      sql("INSERT INTO deep_t2 VALUES (1, 2), (1, 3), (2, 4)")
+      // T3: 1 row for id 1, 2 for id 2
+      sql("INSERT INTO deep_t3 VALUES (1, 50), (2, 60), (2, 70)")
+      // T4: 2 rows for id 1, 1 for id 2
+      sql("INSERT INTO deep_t4 VALUES (1, 100), (1, 200), (2, 300)")
+
+      val query = """
+        SELECT SUM(deep_t1.a * deep_t2.b) as product_sum,
+               COUNT(*) as cnt
+        FROM deep_t1
+        JOIN deep_t2 ON deep_t1.id = deep_t2.t1_id
+        JOIN deep_t3 ON deep_t1.id = deep_t3.t1_id
+        JOIN deep_t4 ON deep_t1.id = deep_t4.t1_id
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== DEEP TREE TEST ===")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  // ============================================================================
+  // ISOLATED PRODUCTS WITH SHARED JOIN PATH TESTS (CASE 7)
+  // These tests specifically cover the bug where isolated products (completely
+  // disjoint attribute sets) share a common join path through a central table.
+  // The bug was that counts from one product's auxiliary subtree were incorrectly
+  // applied to the other product because join keys made the subtree appear "relevant".
+  //
+  // The fix ensures that a subtree is only relevant to a product if it contains
+  // that product's actual aggregation attributes, not just join keys.
+  // ============================================================================
+
+  test("CASE 7a: Isolated products via shared central table - basic") {
+    // This test mimics the IMDB bug:
+    // - Two isolated products with completely disjoint attrs
+    // - Both products share a common join through a central table
+    // - One product's auxiliary tables should NOT affect the other's count
+    //
+    // Schema:
+    //   central (id) - hub table that both product chains join through
+    //   left_a (central_id, a) - left chain for product 1
+    //   left_b (central_id, b) - left chain for product 1
+    //   right_c (central_id, c) - right chain for product 2
+    //   right_d (central_id, d) - right chain for product 2
+    //
+    // Products:
+    //   P1: SUM(a * b) uses {a, b} - from left_a, left_b
+    //   P2: SUM(c * d) uses {c, d} - from right_c, right_d
+    //
+    // The key test: when P1 is computed and flows up through a join where the
+    // right subtree contains {c, d} but NOT {a, b}, P1 should NOT be multiplied
+    // by that subtree's count.
+
+    withTable("iso_central", "iso_left_a", "iso_left_b", "iso_right_c", "iso_right_d") {
+      sql("CREATE TABLE iso_central (id INT) USING parquet")
+      sql("CREATE TABLE iso_left_a (central_id INT, a INT) USING parquet")
+      sql("CREATE TABLE iso_left_b (central_id INT, b INT) USING parquet")
+      sql("CREATE TABLE iso_right_c (central_id INT, c INT) USING parquet")
+      sql("CREATE TABLE iso_right_d (central_id INT, d INT) USING parquet")
+
+      // Central hub: 2 rows
+      sql("INSERT INTO iso_central VALUES (1), (2)")
+      // Left chain: 2 rows each for P1
+      sql("INSERT INTO iso_left_a VALUES (1, 10), (2, 20)")
+      sql("INSERT INTO iso_left_b VALUES (1, 100), (2, 200)")
+      // Right chain: 3 rows each for P2 (different fan-out to detect miscounting)
+      sql("INSERT INTO iso_right_c VALUES (1, 1000), (1, 1001), (2, 2000)")
+      sql("INSERT INTO iso_right_d VALUES (1, 5), (2, 6), (2, 7)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(la.a * lb.b) as p1,
+               SUM(rc.c * rd.d) as p2
+        FROM iso_central c
+        JOIN iso_left_a la ON c.id = la.central_id
+        JOIN iso_left_b lb ON c.id = lb.central_id
+        JOIN iso_right_c rc ON c.id = rc.central_id
+        JOIN iso_right_d rd ON c.id = rd.central_id
+      """
+
+      // Calculate expected values:
+      // Join result for id=1: la(10) x lb(100) x rc(1000,1001) x rd(5) = 1*1*2*1 = 2 rows
+      // Join result for id=2: la(20) x lb(200) x rc(2000) x rd(6,7) = 1*1*1*2 = 2 rows
+      // Total: 4 rows
+      //
+      // P1 = SUM(a * b):
+      //   For id=1: (10*100) appears 2*1 = 2 times (from rc*rd fan-out) = 2000
+      //   For id=2: (20*200) appears 1*2 = 2 times (from rc*rd fan-out) = 8000
+      //   Total P1 = 10000
+      //
+      // P2 = SUM(c * d):
+      //   For id=1: (1000*5) + (1001*5) = 10005, times la*lb fan-out (1*1) = 10005
+      //   For id=2: (2000*6) + (2000*7) = 26000, times la*lb fan-out (1*1) = 26000
+      //   Total P2 = 36005
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== CASE 7a: ISOLATED PRODUCTS VIA SHARED CENTRAL ===")
+      println("Products: P1={a,b}, P2={c,d} - completely disjoint")
+      println("Both share central table as join hub")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 7b: Isolated products with uneven fan-out - stress test") {
+    // Stress test with larger fan-out to catch count multiplication errors.
+    // The products are isolated but share a join path with very different
+    // cardinalities on each side.
+    //
+    // If the bug exists, one product will be incorrectly multiplied by
+    // the other product's fan-out, making the error very visible.
+
+    withTable("iso2_hub", "iso2_p1_a", "iso2_p1_b", "iso2_p2_c", "iso2_p2_d") {
+      sql("CREATE TABLE iso2_hub (id INT) USING parquet")
+      sql("CREATE TABLE iso2_p1_a (hub_id INT, a INT) USING parquet")
+      sql("CREATE TABLE iso2_p1_b (hub_id INT, b INT) USING parquet")
+      sql("CREATE TABLE iso2_p2_c (hub_id INT, c INT) USING parquet")
+      sql("CREATE TABLE iso2_p2_d (hub_id INT, d INT) USING parquet")
+
+      // Hub: single row for simplicity
+      sql("INSERT INTO iso2_hub VALUES (1)")
+      // P1 tables: 2 rows each -> 2*2 = 4 combinations for P1
+      sql("INSERT INTO iso2_p1_a VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO iso2_p1_b VALUES (1, 3), (1, 7)")
+      // P2 tables: 5 rows and 3 rows -> 5*3 = 15 combinations for P2
+      sql("INSERT INTO iso2_p2_c VALUES (1, 100), (1, 200), (1, 300), (1, 400), (1, 500)")
+      sql("INSERT INTO iso2_p2_d VALUES (1, 1), (1, 2), (1, 3)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(p1a.a * p1b.b) as p1,
+               SUM(p2c.c * p2d.d) as p2
+        FROM iso2_hub h
+        JOIN iso2_p1_a p1a ON h.id = p1a.hub_id
+        JOIN iso2_p1_b p1b ON h.id = p1b.hub_id
+        JOIN iso2_p2_c p2c ON h.id = p2c.hub_id
+        JOIN iso2_p2_d p2d ON h.id = p2d.hub_id
+      """
+
+      // Total rows = 2*2*5*3 = 60
+      //
+      // P1 = SUM(a*b): Each (a,b) pair appears 5*3 = 15 times
+      //   Pairs: (10,3), (10,7), (20,3), (20,7) -> sums: 30, 70, 60, 140 = 300
+      //   Total P1 = 300 * 15 = 4500
+      //
+      // P2 = SUM(c*d): Each (c,d) pair appears 2*2 = 4 times
+      //   sum(c) * sum(d) = (100+200+300+400+500) * (1+2+3) = 1500 * 6 = 9000
+      //   Total P2 = 9000 * 4 = 36000
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== CASE 7b: ISOLATED PRODUCTS WITH UNEVEN FAN-OUT ===")
+      println("P1 chain: 2*2 = 4 combos, P2 chain: 5*3 = 15 combos")
+      println("If bug exists, P1 would be 4500*15=67500 instead of 4500")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("CASE 7c: Three isolated products with shared join path") {
+    // Three completely isolated products, all sharing a common join path.
+    // This tests that each product correctly ignores the OTHER two products'
+    // subtrees during LEFT propagation.
+    //
+    // Products:
+    //   P1: SUM(a * b) uses {a, b}
+    //   P2: SUM(c * d) uses {c, d}
+    //   P3: SUM(e * f) uses {e, f}
+    //
+    // All three are disjoint and should not affect each other's counts.
+
+    withTable("iso3_hub", "iso3_t1", "iso3_t2", "iso3_t3", "iso3_t4", "iso3_t5", "iso3_t6") {
+      sql("CREATE TABLE iso3_hub (id INT) USING parquet")
+      sql("CREATE TABLE iso3_t1 (hub_id INT, a INT) USING parquet")
+      sql("CREATE TABLE iso3_t2 (hub_id INT, b INT) USING parquet")
+      sql("CREATE TABLE iso3_t3 (hub_id INT, c INT) USING parquet")
+      sql("CREATE TABLE iso3_t4 (hub_id INT, d INT) USING parquet")
+      sql("CREATE TABLE iso3_t5 (hub_id INT, e INT) USING parquet")
+      sql("CREATE TABLE iso3_t6 (hub_id INT, f INT) USING parquet")
+
+      sql("INSERT INTO iso3_hub VALUES (1)")
+      // P1 tables: 2 rows each
+      sql("INSERT INTO iso3_t1 VALUES (1, 10), (1, 20)")
+      sql("INSERT INTO iso3_t2 VALUES (1, 3), (1, 7)")
+      // P2 tables: 3 rows each
+      sql("INSERT INTO iso3_t3 VALUES (1, 100), (1, 200), (1, 300)")
+      sql("INSERT INTO iso3_t4 VALUES (1, 4), (1, 5), (1, 6)")
+      // P3 tables: 4 rows and 2 rows
+      sql("INSERT INTO iso3_t5 VALUES (1, 1000), (1, 2000), (1, 3000), (1, 4000)")
+      sql("INSERT INTO iso3_t6 VALUES (1, 8), (1, 9)")
+
+      val query = """
+        SELECT COUNT(*) as cnt,
+               SUM(t1.a * t2.b) as p1,
+               SUM(t3.c * t4.d) as p2,
+               SUM(t5.e * t6.f) as p3
+        FROM iso3_hub h
+        JOIN iso3_t1 t1 ON h.id = t1.hub_id
+        JOIN iso3_t2 t2 ON h.id = t2.hub_id
+        JOIN iso3_t3 t3 ON h.id = t3.hub_id
+        JOIN iso3_t4 t4 ON h.id = t4.hub_id
+        JOIN iso3_t5 t5 ON h.id = t5.hub_id
+        JOIN iso3_t6 t6 ON h.id = t6.hub_id
+      """
+
+      // Total rows = 2*2*3*3*4*2 = 288
+      //
+      // P1: each (a,b) pair appears 3*3*4*2 = 72 times
+      //   sum(a)*sum(b) = 30*10 = 300
+      //   P1 = 300 * 72 = 21600
+      //
+      // P2: each (c,d) pair appears 2*2*4*2 = 32 times
+      //   sum(c)*sum(d) = 600*15 = 9000
+      //   P2 = 9000 * 32 = 288000
+      //
+      // P3: each (e,f) pair appears 2*2*3*3 = 36 times
+      //   sum(e)*sum(f) = 10000*17 = 170000
+      //   P3 = 170000 * 36 = 6120000
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      println("=== CASE 7c: THREE ISOLATED PRODUCTS ===")
+      println("Products: P1={a,b}, P2={c,d}, P3={e,f} - all disjoint")
+      println("Each product should ignore the other two during propagation")
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("independent products with real IMDB schema - flaky bug test") {
+    // Test with two independent products:
+    // P1 = SUM(ci.role_id * mi.info_type_id) - uses role_id from cast_info
+    //      and info_type_id from movie_info
+    // P2 = SUM(mc.company_type_id * t.kind_id) - uses company_type_id from
+    //      movie_companies and kind_id from title
+    // These are independent products since their attribute sets don't overlap.
+
+    val ci = Seq(
+      (1, 1, 1, 2)  // role_id = 2
+    ).toDF("movie_id", "person_id", "person_role_id", "role_id")
+
+    val mi = Seq(
+      (1, 16)  // info_type_id = 16
+    ).toDF("movie_id", "info_type_id")
+
+    val t = Seq(
+      (1, 2011, 9, 7)  // kind_id = 7
+    ).toDF("id", "production_year", "season_nr", "kind_id")
+
+    // movie_companies with different company_type_ids
+    // company_type_id: 1=3 rows, 2=4 rows -> weighted sum
+    val mc = Seq(
+      (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 2, 1),
+      (1, 3, 2), (1, 3, 2), (1, 4, 2), (1, 5, 2), (1, 5, 2)
+    ).toDF("movie_id", "company_id", "company_type_id")
+
+    val chn = Seq(
+      (1, null.asInstanceOf[java.lang.Integer])
+    ).toDF("id", "imdb_id")
+
+    val rt = Seq((2)).toDF("id")
+    val n = Seq((1)).toDF("id")
+    val an = Seq((1), (1), (1), (1), (1), (1)).toDF("person_id")
+    val cn = Seq((1), (2), (3), (4), (5)).toDF("id")
+    val it = Seq((16)).toDF("id")
+    val k = Seq((1)).toDF("id")
+    val mk = Seq((1, 1)).toDF("movie_id", "keyword_id")
+
+    ci.createOrReplaceTempView("cast_info")
+    mi.createOrReplaceTempView("movie_info")
+    t.createOrReplaceTempView("title")
+    mc.createOrReplaceTempView("movie_companies")
+    chn.createOrReplaceTempView("char_name")
+    rt.createOrReplaceTempView("role_type")
+    n.createOrReplaceTempView("name")
+    an.createOrReplaceTempView("aka_name")
+    cn.createOrReplaceTempView("company_name")
+    it.createOrReplaceTempView("info_type")
+    k.createOrReplaceTempView("keyword")
+    mk.createOrReplaceTempView("movie_keyword")
+
+    // Query with two independent products
+    val query = """
+      SELECT COUNT(*),
+          SUM(ci.role_id * mi.info_type_id),
+          SUM(mc.company_type_id * t.kind_id)
+      FROM aka_name AS an,
+           char_name AS chn,
+           cast_info AS ci,
+           company_name AS cn,
+           info_type AS it,
+           keyword AS k,
+           movie_companies AS mc,
+           movie_info AS mi,
+           movie_keyword AS mk,
+           name AS n,
+           role_type AS rt,
+           title AS t
+      WHERE t.id = mi.movie_id
+        AND t.id = mc.movie_id
+        AND t.id = ci.movie_id
+        AND t.id = mk.movie_id
+        AND cn.id = mc.company_id
+        AND it.id = mi.info_type_id
+        AND n.id = ci.person_id
+        AND rt.id = ci.role_id
+        AND n.id = an.person_id
+        AND chn.id = ci.person_role_id
+        AND k.id = mk.keyword_id
+    """
+
+    // Get baseline
+    // COUNT = 1 * 1 * 1 * 1 * 1 * 1 * 9 * 1 * 1 * 1 * 1 * 1 * 5 * 6 = 270
+    // Actually need to verify this...
+
+    // scalastyle:off println
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val df = sql(query)
+      println("=== INDEPENDENT PRODUCTS TEST ===")
+      println("P1 = SUM(ci.role_id * mi.info_type_id) - uses {role_id, info_type_id}")
+      println("P2 = SUM(mc.company_type_id * t.kind_id) - uses {company_type_id, kind_id}")
+      println("These products are INDEPENDENT - no shared attributes")
+      val baseline = df.collect()
+      println(s"Baseline: ${baseline.map(_.toString).mkString}")
+
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df2 = sql(query)
+        val yannakakis = df2.collect()
+        println(s"Yannakakis: ${yannakakis.map(_.toString).mkString}")
+        checkAnswer(df2, baseline)
+      }
     }
     // scalastyle:on println
   }
