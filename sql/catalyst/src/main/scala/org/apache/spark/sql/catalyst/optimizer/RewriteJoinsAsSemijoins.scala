@@ -1280,18 +1280,28 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           // - Strategy 3 fallback: Pick ONE product to compute early (the "winner")
           //   - Winner is selected based on position in join tree (highest = fewest ancestors)
           //   - Other products defer to final aggregate
-          // When there are 2+ products, defer ALL of them to final aggregate
-          // for correctness. Early computation of individual products in the presence
-          // of other products can lead to incorrect results due to count propagation.
+          // Strategy for multiple products:
+          // When there are 2+ products, ALL must defer to final aggregate.
+          //
+          // Why even "independent" products (no shared attrs) can't compute early together:
+          // - When P1 computes early, its attrs are added to grouping
+          // - The count flowing through the tree becomes grouped by P1's attrs
+          // - When P2 computes at a later join, it sees this grouped count
+          // - P2 multiplies by the grouped count instead of the total count
+          // - This causes incorrect results
+          //
+          // The fundamental issue is that count propagation is affected by ALL
+          // product groupings, not just products that share attributes.
+          // Even independent products affect each other's counts.
           val conflictingProductAttrs =
             if (productComputations.size >= 2) {
-              val allProductAttrs = productComputations.flatMap(_.resultAttr).toSet
-              debugLog(s"Multiple products (${productComputations.size}) - deferring all")
-              for (prod <- productComputations) {
+              // ALL products are conflicting when there are 2+ products
+              val products = productComputations.toSeq
+              for (prod <- products) {
                 val attrsStr = prod.attrs.map(_.name).mkString(",")
-                debugLog(s"  Product {$attrsStr}: DEFER")
+                debugLog(s"  Product {$attrsStr}: CONFLICT (2+ products) -> DEFER")
               }
-              allProductAttrs
+              products.flatMap(_.resultAttr).toSet
             } else {
               Set.empty[Attribute]
             }
@@ -2297,11 +2307,18 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // of one-winner selection.
               val isConflictingProduct = conflictingProductAttrs.contains(agg.resultAttribute)
 
-              // When there are 2+ products, use conservative deferral:
-              // All products defer if there's any conflict (foreign grouping OR other unseen)
-              // This ensures correctness at the cost of some optimization opportunity.
-              // The winner selection only matters for logging/debugging purposes.
-              val mustDeferForGrouping = hasConflict && !isLeafNode
+              // For independent products (not in conflictingProductAttrs):
+              // - Only hasForeignGrouping matters
+              // - otherProductsHaveUnseenAttrs doesn't affect them (disjoint attrs)
+              // For conflicting products:
+              // - Full hasConflict check applies
+              val mustDeferForGrouping = if (isConflictingProduct) {
+                // Conflicting product: full check
+                hasConflict && !isLeafNode
+              } else {
+                // Independent product: only foreign grouping blocks it
+                hasForeignGrouping && !isLeafNode
+              }
 
               dbg(s"Conflict check for ${agg}: hasForeign=$hasForeignGrouping " +
                 s"otherUnseen=$otherProductsHaveUnseenAttrs isLeaf=$isLeafNode " +
