@@ -2952,8 +2952,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "false"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6: SYNTHETIC SUPERSET (disabled) ===")
@@ -2962,16 +2961,15 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
         checkAnswer(df, baseline)
       }
 
-      // Test with synthetic superset ENABLED
+      // Test with join-tree-aware analysis (replaces synthetic superset)
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
-        println("=== CASE 6: SYNTHETIC SUPERSET (enabled) ===")
-        println("Star pattern: {a,b}, {a,c}, {a,d} -> Synthetic: {a,b,c,d}")
+        println("=== CASE 6: JOIN-TREE-AWARE ANALYSIS ===")
+        println("Star pattern: {a,b}, {a,c}, {a,d} -> Uses join-tree-aware conflict detection")
         println(s"Result: ${df.collect().map(_.toString).mkString}")
         checkAnswer(df, baseline)
       }
@@ -3013,8 +3011,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6b: SYNTHETIC TOO LARGE ===")
@@ -3056,8 +3053,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6c: DUPLICATE ROWS - COUNT ACCURACY ===")
@@ -3094,8 +3090,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6d: NO COMMON CENTER ===")
@@ -3153,8 +3148,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3206,8 +3200,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3256,8 +3249,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3303,8 +3295,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3388,8 +3379,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_SYNTHETIC_SUPERSET_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")

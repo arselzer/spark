@@ -117,58 +117,27 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
    * IMPLEMENTATION STATUS
    * ----------------------
    * WORKING (tested and verified):
-   *   [x] CASE 1 - Independent Products: disjoint attrs computed early
+   *   [x] CASE 1 - Independent Products: disjoint attrs computed early (if join tree allows)
    *   [x] CASE 2 - Containment Hierarchy: subset products use derived counts
    *   [x] CASE 3 - Universal Superset: all products derive from common superset
    *   [x] CASE 4 - Connected Components: independent groups optimized separately
    *   [x] CASE 5 - Star Pattern (deferred): correctly defers to final aggregate
-   *   [x] CASE 6 - Synthetic Superset (optional): create synthetic for star pattern
-   *               Enable with: spark.sql.yannakakis.syntheticSupersetEnabled=true
-   *   [x] CASE 7 - Isolated Products: products with completely disjoint attribute sets
-   *               computed early without affecting each other's counts
    *
-   * ISOLATED PRODUCTS FIX (CASE 7)
-   * ------------------------------
-   * Bug: When multiple products have COMPLETELY DISJOINT attribute sets, they should
-   * be independent - each product's count should only multiply by tables relevant to
-   * that specific product. However, the original implementation would incorrectly
-   * multiply a product by counts from tables in OTHER products' subtrees.
+   * JOIN-TREE-AWARE CONFLICT DETECTION
+   * -----------------------------------
+   * For multiple products, we analyze the concrete join tree to determine which
+   * products can compute early vs. must defer to the final aggregate.
    *
-   * Example (IMDB-style query):
-   *   Product 1: SUM(role_id * info_type_id) - from cast_info, movie_info
-   *   Product 2: SUM(company_type_id * kind_id) - from movie_companies, title
-   *   These products share NO attributes (completely disjoint).
+   * A product P can compute early if:
+   *   1. All its attributes become available at some join J
+   *   2. At all subsequent joins (ancestors of J), the grouping doesn't contain
+   *      attributes FOREIGN to P (not in P's attribute set)
    *
-   * Original bug: During LEFT propagation, Product 2 was being multiplied by
-   * the count from the `name` table (which is only relevant to Product 1).
+   * Foreign grouping causes the product's pending value to be replicated across
+   * groups, leading to overcounting when summed at the final aggregate.
    *
-   * Fix: Track each pending product's ORIGINAL attribute references via
-   * `pendingProductOriginalAttrs`. During LEFT propagation, check if the right
-   * subtree is relevant to this specific product:
-   *   - Relevant if: right subtree contains THIS product's attrs, OR
-   *                  right subtree has attrs not in ANY pending product
-   *   - Irrelevant if: right subtree ONLY contains OTHER products' attrs
-   *
-   * When a right subtree is irrelevant to a product, skip the multiplication.
-   *
-   * SYNTHETIC SUPERSET OPTIMIZATION
-   * -------------------------------
-   * For conflicting products with no natural superset (e.g., star pattern),
-   * create a synthetic "universal" product when enabled:
-   *   - Union all attributes from conflicting products
-   *   - Compute count at that granularity
-   *   - Derive each product's count via GROUP BY
-   *
-   * Example: {a,b}, {a,c}, {a,d} (star pattern)
-   *   - Synthetic: {a,b,c,d}
-   *   - Compute count at this granularity
-   *   - P1 count = SUM(c) GROUP BY a, b
-   *   - P2 count = SUM(c) GROUP BY a, c
-   *   - P3 count = SUM(c) GROUP BY a, d
-   *
-   * Trade-off: Extra GROUP BY aggregations vs. simpler final multiplication.
-   * Default behavior uses final multiplication (simpler, often efficient).
-   * Enable synthetic superset when early count computation is beneficial.
+   * Strategy 3 fallback: If ALL products would defer, pick ONE "winner" to compute
+   * early (the one computed highest in the tree, to minimize propagation issues).
    *
    * IMPLEMENTATION
    * --------------
@@ -433,6 +402,181 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     components.toSeq
   }
 
+  // =====================================================================
+  // JOIN-TREE-AWARE PRODUCT CONFLICT DETECTION
+  // =====================================================================
+  //
+  // For each product, determine if it can compute early given the concrete join tree.
+  //
+  // A product P can compute early if:
+  // 1. All its attributes become available at some join J
+  // 2. At all subsequent joins (ancestors of J), the grouping doesn't contain
+  //    attributes FOREIGN to P (not in P's attribute set)
+  //
+  // Foreign grouping causes the product's pending value to be replicated across
+  // groups, leading to overcounting when summed at the final aggregate.
+  //
+  // Strategy 3 fallback: If all products would defer, pick ONE "winner" to compute
+  // early (the one computed highest in the tree, to minimize propagation issues).
+
+  /**
+   * Analyze which products can compute early given the concrete join tree.
+   *
+   * @param root The root of the join tree (HTNode)
+   * @param productComputations The products to analyze
+   * @return Map from product resultAttr to whether it can compute early
+   */
+  def analyzeProductsForJoinTree(
+      root: HTNode,
+      productComputations: Seq[DeferredComputation]
+  ): Map[Attribute, Boolean] = {
+
+    if (productComputations.size < 2) {
+      // Single product or none - no conflicts possible
+      return productComputations.flatMap(_.resultAttr.map(_ -> true)).toMap
+    }
+
+    // Step 1: Build a map of each node's subtree output attributes
+    val subtreeOutputs = mutable.Map[HTNode, AttributeSet]()
+    def computeSubtreeOutput(node: HTNode): AttributeSet = {
+      if (subtreeOutputs.contains(node)) return subtreeOutputs(node)
+      val ownOutput = node.edges.flatMap(_.outputSet)
+      val childOutput = node.children.flatMap(c => computeSubtreeOutput(c))
+      val result = AttributeSet(ownOutput ++ childOutput)
+      subtreeOutputs(node) = result
+      result
+    }
+    computeSubtreeOutput(root)
+
+    // Step 2: Find computation point for each product
+    // (the deepest node where all its attributes first become available)
+    def findComputationNode(node: HTNode, attrs: Set[Attribute]): HTNode = {
+      // Check if any single child contains all attrs
+      for (child <- node.children) {
+        val childOutput = subtreeOutputs(child)
+        if (attrs.forall(childOutput.contains)) {
+          return findComputationNode(child, attrs)
+        }
+      }
+      // No single child has all attrs - this node is the computation point
+      node
+    }
+
+    val productInfos = productComputations.flatMap { prod =>
+      prod.resultAttr.map { resultAttr =>
+        val computeNode = findComputationNode(root, prod.attrs)
+        (prod, prod.attrs, resultAttr, computeNode)
+      }
+    }
+
+    // Step 3: Compute what grouping attributes will be active at each node
+    // Grouping at node N = union of attrs from products computed BELOW N
+    // that need to be carried through N (from N's children)
+    val nodeGroupings = mutable.Map[HTNode, Set[Attribute]]()
+
+    def computeNodeGrouping(node: HTNode): Set[Attribute] = {
+      if (nodeGroupings.contains(node)) return nodeGroupings(node)
+
+      var grouping = Set.empty[Attribute]
+
+      // For each product computed strictly below this node:
+      // If its attrs come partly from this node's children, those attrs need grouping
+      for ((prod, attrs, _, computeNode) <- productInfos) {
+        if (computeNode != node && isDescendantOf(computeNode, node)) {
+          // Product computed below this node
+          // Check which of its attrs come from this node's children (right side)
+          for (child <- node.children) {
+            val childOutput = subtreeOutputs(child)
+            val attrsFromChild = attrs.filter(childOutput.contains)
+            grouping ++= attrsFromChild
+          }
+        }
+      }
+
+      nodeGroupings(node) = grouping
+      grouping
+    }
+
+    // Compute groupings for all nodes
+    def visitAll(node: HTNode): Unit = {
+      computeNodeGrouping(node)
+      node.children.foreach(visitAll)
+    }
+    visitAll(root)
+
+    // Step 4: For each product, check if any ancestor has foreign grouping
+    def getAncestors(node: HTNode): Seq[HTNode] = {
+      val ancestors = mutable.ArrayBuffer[HTNode]()
+      var current = node.parent
+      while (current != null) {
+        ancestors += current
+        current = current.parent
+      }
+      ancestors.toSeq
+    }
+
+    val results = mutable.Map[Attribute, Boolean]()
+
+    for ((prod, attrs, resultAttr, computeNode) <- productInfos) {
+      val ancestors = getAncestors(computeNode)
+      var canComputeEarly = true
+
+      for (ancestor <- ancestors if canComputeEarly) {
+        val groupingAtAncestor = nodeGroupings.getOrElse(ancestor, Set.empty[Attribute])
+        val foreignGrouping = groupingAtAncestor -- attrs
+
+        if (foreignGrouping.nonEmpty) {
+          // This ancestor has grouping attributes foreign to this product
+          canComputeEarly = false
+          debugLog(s"Product {${attrs.map(_.name).mkString(",")}} cannot compute early: " +
+            s"foreign grouping {${foreignGrouping.map(_.name).mkString(",")}} at ancestor")
+        }
+      }
+
+      results(resultAttr) = canComputeEarly
+    }
+
+    // Step 5: Strategy 3 fallback - if ALL products would defer, pick one winner
+    if (results.nonEmpty && results.values.forall(_ == false)) {
+      // All products would defer - pick the one with computation point highest in tree
+      // (smallest depth = fewer ancestors = less chance of grouping conflicts)
+      def getDepth(node: HTNode): Int = {
+        var depth = 0
+        var current = node.parent
+        while (current != null) {
+          depth += 1
+          current = current.parent
+        }
+        depth
+      }
+
+      val byDepth = productInfos.map { case (prod, attrs, resultAttr, computeNode) =>
+        (prod, attrs, resultAttr, computeNode, getDepth(computeNode))
+      }.sortBy(_._5)  // Sort by depth ascending (smallest depth = highest in tree)
+
+      if (byDepth.nonEmpty) {
+        val (winnerProd, winnerAttrs, winnerResultAttr, _, _) = byDepth.head
+        debugLog(s"Strategy 3 fallback: selecting winner product " +
+          s"{${winnerAttrs.map(_.name).mkString(",")}}")
+        results(winnerResultAttr) = true
+      }
+    }
+
+    results.toMap
+  }
+
+  /**
+   * Check if 'descendant' is a strict descendant of 'ancestor'.
+   */
+  private def isDescendantOf(descendant: HTNode, ancestor: HTNode): Boolean = {
+    var current = descendant.parent
+    while (current != null) {
+      if (current == ancestor) return true
+      current = current.parent
+    }
+    false
+  }
+
   /**
    * Determine the count track strategy for each product in a component.
    *
@@ -448,9 +592,72 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
   case object DirectCount extends CountTrackStrategy
   case class DerivedCount(source: DeferredComputation) extends CountTrackStrategy
   case object DeferredToFinal extends CountTrackStrategy
-  // Synthetic superset strategies for star-pattern conflicts
-  case class SyntheticSupersetCount(syntheticAttrs: Set[Attribute]) extends CountTrackStrategy
-  case class DerivedFromSynthetic(syntheticAttrs: Set[Attribute]) extends CountTrackStrategy
+
+  /**
+   * Select one "winner" product to compute early when there are multiple products.
+   *
+   * The winner is selected based on:
+   * 1. Position in join tree - products computed highest (smallest depth) preferred
+   * 2. This minimizes the chance of foreign grouping conflicts
+   *
+   * @param root The root of the join tree (HTNode)
+   * @param productComputations The products to choose from
+   * @return Some(winner) if a winner can be selected, None otherwise
+   */
+  def selectWinnerProduct(
+      root: HTNode,
+      productComputations: Seq[DeferredComputation]
+  ): Option[DeferredComputation] = {
+    if (productComputations.isEmpty) return None
+
+    // Build a map of each node's subtree output attributes
+    val subtreeOutputs = mutable.Map[HTNode, AttributeSet]()
+    def computeSubtreeOutput(node: HTNode): AttributeSet = {
+      if (subtreeOutputs.contains(node)) return subtreeOutputs(node)
+      val ownOutput = node.edges.flatMap(_.outputSet)
+      val childOutput = node.children.flatMap(c => computeSubtreeOutput(c))
+      val result = AttributeSet(ownOutput ++ childOutput)
+      subtreeOutputs(node) = result
+      result
+    }
+    computeSubtreeOutput(root)
+
+    // Find computation point for each product
+    def findComputationNode(node: HTNode, attrs: Set[Attribute]): HTNode = {
+      for (child <- node.children) {
+        val childOutput = subtreeOutputs(child)
+        if (attrs.forall(childOutput.contains)) {
+          return findComputationNode(child, attrs)
+        }
+      }
+      node
+    }
+
+    // Get depth of a node (root = 0)
+    def getDepth(node: HTNode): Int = {
+      var depth = 0
+      var current = node.parent
+      while (current != null) {
+        depth += 1
+        current = current.parent
+      }
+      depth
+    }
+
+    // Compute depth for each product
+    val productDepths = productComputations.map { prod =>
+      val computeNode = findComputationNode(root, prod.attrs)
+      (prod, getDepth(computeNode))
+    }
+
+    // Select the product with smallest depth (computed highest in tree)
+    // Use stable ordering: sort by (depth, attr names) to ensure deterministic selection
+    val sorted = productDepths.sortBy { case (prod, depth) =>
+      (depth, prod.attrs.map(_.name).toSeq.sorted.mkString(","))
+    }
+    val (winner, _) = sorted.head
+    Some(winner)
+  }
 
   def assignCountTrackStrategies(component: Set[DeferredComputation]):
       Map[DeferredComputation, CountTrackStrategy] = {
@@ -493,55 +700,10 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }.toMap
 
         case None =>
-          // True conflicts without universal superset
-          // Check if synthetic superset optimization is enabled and applicable
-          if (SQLConf.get.yannakakisSyntheticSupersetEnabled &&
-              canUseSyntheticSuperset(computations)) {
-            // Create synthetic superset containing all attributes
-            val syntheticAttrs = computations.flatMap(_.attrs).toSet
-            // The largest product computes the synthetic count, others derive from it
-            val sorted = computations.sortBy(_.attrs.size).reverse
-            val primary = sorted.head
-
-            computations.map { c =>
-              if (c == primary) {
-                c -> SyntheticSupersetCount(syntheticAttrs)
-              } else {
-                c -> DerivedFromSynthetic(syntheticAttrs)
-              }
-            }.toMap
-          } else {
-            // Fallback: defer all to final
-            computations.map(c => c -> DeferredToFinal).toMap
-          }
+          // True conflicts without universal superset - defer all to final
+          computations.map(c => c -> DeferredToFinal).toMap
       }
     }
-  }
-
-  /**
-   * Check if synthetic superset optimization is beneficial for conflicting products.
-   *
-   * Criteria for using synthetic superset:
-   * 1. All products share at least one common attribute (star pattern)
-   * 2. Synthetic superset size is reasonable relative to product sizes
-   *
-   * @param computations Products to analyze
-   * @return true if synthetic superset should be used
-   */
-  def canUseSyntheticSuperset(computations: Seq[DeferredComputation]): Boolean = {
-    if (computations.size < 2) return false
-
-    // Find common attributes (center of star pattern)
-    val commonAttrs = computations.map(_.attrs).reduce(_ intersect _)
-    if (commonAttrs.isEmpty) return false  // No star pattern - products are disconnected
-
-    // Synthetic superset is union of all attributes
-    val syntheticSize = computations.flatMap(_.attrs).toSet.size
-    val maxProductSize = computations.map(_.attrs.size).max
-
-    // Heuristic: synthetic shouldn't be more than 2x the largest product
-    // This avoids creating excessively fine-grained counts
-    syntheticSize <= maxProductSize * 2
   }
 
   /**
@@ -583,15 +745,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     val strategies = components.flatMap(c => assignCountTrackStrategies(c)).toMap
 
     // Check if hierarchical optimization is applicable
-    // DirectCount and SyntheticSupersetCount are both "root" strategies
     val directProducts = strategies.filter {
       case (_, DirectCount) => true
-      case (_, _: SyntheticSupersetCount) => true
       case _ => false
     }.keys.toSeq
     val derivedProducts = strategies.collect {
       case (p, DerivedCount(_)) => p
-      case (p, _: DerivedFromSynthetic) => p
     }.toSeq
 
     if (directProducts.isEmpty) return None
@@ -626,8 +785,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
    * For conflicting products without containment, we group by the union
    * of all product attrs (to defer to final aggregate with count multiplication).
    *
-   * For synthetic superset, we group by the synthetic attrs (union of all).
-   *
    * @param products Products to analyze
    * @return Set of attrs that should be included in grouping
    */
@@ -641,25 +798,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     components.flatMap { component =>
       val strategies = assignCountTrackStrategies(component)
 
-      // Check for synthetic superset strategy
-      val syntheticSuperset = strategies.collectFirst {
-        case (_, SyntheticSupersetCount(attrs)) => attrs
-      }
-
-      syntheticSuperset match {
-        case Some(syntheticAttrs) =>
-          // For synthetic superset: use the synthetic attrs
-          syntheticAttrs
-
-        case None =>
-          // For hierarchical case: use maximal product's attrs
-          val directProducts = strategies.filter(_._2 == DirectCount).keys
-          if (directProducts.nonEmpty) {
-            directProducts.maxBy(_.attrs.size).attrs
-          } else {
-            // For conflict case (deferred): union of all attrs
-            component.flatMap(_.attrs)
-          }
+      // For hierarchical case: use maximal product's attrs
+      val directProducts = strategies.filter(_._2 == DirectCount).keys
+      if (directProducts.nonEmpty) {
+        directProducts.maxBy(_.attrs.size).attrs
+      } else {
+        // For conflict case (deferred): union of all attrs
+        component.flatMap(_.attrs)
       }
     }.toSet
   }
@@ -808,8 +953,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       agg.aggregateFunction match {
         case Sum(child, _) if child.references.nonEmpty =>
           // Filter out count-like attributes to identify true product attributes
+          // Count attrs typically have names like "c#123" or synthetic long IDs
           val refs = child.references.filter(a =>
-            !a.name.startsWith("c#") && a.name != "c").toSet
+            !a.name.startsWith("c#")).toSet
           if (refs.size >= 2) {
             Some(DeferredComputation(refs, child, ProductAggregate, Some(agg.resultAttribute)))
           } else None
@@ -1126,96 +1272,28 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             }
           }
 
-          // Build conflict graph using DeferredComputation.conflictsWith
-          // Products that conflict need special handling (deferred or separate count tracks)
-          //
-          // HIERARCHICAL OPTIMIZATION: If products have containment relationships,
-          // we can use hierarchical count derivation instead of deferring all to final.
-          val (conflictingProductAttrs, countDerivationPlanOpt, syntheticSupersetAttrs) =
+          // =====================================================================
+          // CONSERVATIVE CONFLICT DETECTION WITH ONE-WINNER FALLBACK
+          // =====================================================================
+          // When there are 2+ products, we use a conservative strategy:
+          // - All products are marked as conflicting (deferred) by default
+          // - Strategy 3 fallback: Pick ONE product to compute early (the "winner")
+          //   - Winner is selected based on position in join tree (highest = fewest ancestors)
+          //   - Other products defer to final aggregate
+          // When there are 2+ products, defer ALL of them to final aggregate
+          // for correctness. Early computation of individual products in the presence
+          // of other products can lead to incorrect results due to count propagation.
+          val conflictingProductAttrs =
             if (productComputations.size >= 2) {
-              // Try hierarchical count derivation first
-              val derivationPlan = computeCountDerivationPlan(productComputations)
-
-              derivationPlan match {
-                case Some(plan) =>
-                  // Check for multiple independent components - this is also problematic
-                  // Independent products (disjoint attrs in separate components) can cause
-                  // count multiplication issues due to non-deterministic join order.
-                  val components = findConflictComponents(productComputations)
-
-                  if (components.size > 1) {
-                    // Multiple independent components - mark ALL as conflicting
-                    // This is the same treatment as case None, because independent
-                    // products also suffer from join-order-dependent count issues.
-                    val allProductAttrs = productComputations.flatMap(_.resultAttr).toSet
-                    debugLog(s"Marking ALL ${allProductAttrs.size} products as conflicting " +
-                      s"(${components.size} independent components)")
-                    (allProductAttrs, None, Set.empty[Attribute])
-                  } else {
-                    // Single component - hierarchical optimization applicable
-                    debugLog(s"Hierarchical count derivation enabled")
-                    val rootAttrsStr = plan.rootProduct.attrs.map(_.name).mkString(",")
-                    debugLog(s"  Root product: {$rootAttrsStr}")
-                    plan.derivations.foreach { case (prod, deriv) =>
-                      val groupStr = deriv.groupByAttrs.map(_.name).mkString(",")
-                      debugLog(s"  Derived: {${prod.attrs.map(_.name).mkString(",")}} " +
-                        s"via GROUP BY {$groupStr}")
-                    }
-                    // With hierarchical, only products that must defer are truly conflicting
-                    val strategies = components.flatMap(c => assignCountTrackStrategies(c)).toMap
-
-                    // Synthetic or DerivedFromSynthetic products are NOT conflicting
-                    // Only DeferredToFinal products are truly conflicting
-                    val deferredProducts = strategies.filter(_._2 == DeferredToFinal).keys
-                    val deferredAttrs = deferredProducts.flatMap(_.resultAttr).toSet
-
-                    // Log synthetic superset usage and extract synthetic superset attrs
-                    val syntheticProducts = strategies.filter {
-                      case (_, _: SyntheticSupersetCount) => true
-                      case (_, _: DerivedFromSynthetic) => true
-                      case _ => false
-                    }
-                    // Extract the synthetic superset attrs (union of all product attrs)
-                    val syntheticSupersetAttrs: Set[Attribute] = strategies.collectFirst {
-                      case (_, SyntheticSupersetCount(attrs)) => attrs
-                      case (_, DerivedFromSynthetic(attrs)) => attrs
-                    }.getOrElse(Set.empty)
-
-                    if (syntheticProducts.nonEmpty) {
-                      val cnt = syntheticProducts.size
-                      debugLog(s"Synthetic superset enabled for $cnt products")
-                      debugLog(s"Synthetic superset attrs: " +
-                        s"{${syntheticSupersetAttrs.map(_.name).mkString(",")}}")
-                      syntheticProducts.foreach { case (prod, strategy) =>
-                        val strategyName = strategy match {
-                          case SyntheticSupersetCount(attrs) =>
-                            s"SyntheticSuperset(${attrs.map(_.name).mkString(",")})"
-                          case DerivedFromSynthetic(attrs) =>
-                            s"Derived(${attrs.map(_.name).mkString(",")})"
-                          case _ => strategy.toString
-                        }
-                        val prodAttrs = prod.attrs.map(_.name).mkString(",")
-                        debugLog(s"  ${prod.expr}[$prodAttrs] -> $strategyName")
-                      }
-                    }
-
-                    (deferredAttrs, derivationPlan, syntheticSupersetAttrs)
-                  }
-
-                case None =>
-                  // No hierarchical structure - mark ALL products as conflicting
-                  // when there are 2+ products. This ensures correct count semantics
-                  // regardless of non-deterministic join order.
-                  // Even "independent" products (disjoint attrs) can cause issues
-                  // because join order affects when counts are computed.
-                  val allProductAttrs = productComputations.flatMap(_.resultAttr).toSet
-                  debugLog(s"Marking ALL ${allProductAttrs.size} products as conflicting " +
-                    s"(no hierarchical structure with 2+ products)")
-
-                  (allProductAttrs, None, Set.empty[Attribute])
+              val allProductAttrs = productComputations.flatMap(_.resultAttr).toSet
+              debugLog(s"Multiple products (${productComputations.size}) - deferring all")
+              for (prod <- productComputations) {
+                val attrsStr = prod.attrs.map(_.name).mkString(",")
+                debugLog(s"  Product {$attrsStr}: DEFER")
               }
+              allProductAttrs
             } else {
-              (Set.empty[Attribute], None, Set.empty[Attribute])
+              Set.empty[Attribute]
             }
 
           // Log cross-relation filters (handled uniformly with products)
@@ -1239,8 +1317,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               conf.yannakakisCountGroupInLeavesEnabled,
               usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
               crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
-              conflictingProductAttrs = conflictingProductAttrs,
-              syntheticSupersetAttrs = syntheticSupersetAttrs)
+              conflictingProductAttrs = conflictingProductAttrs)
 
           debugLog("lastAggMap: " + lastAggMap)
           debugLog("lastSumMap: " + lastSumMap)
@@ -1366,6 +1443,22 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }
           else {
             // Guarded but not 0MA
+            // Detect product aggregates for one-winner conflict detection
+            val guardedDeferredComputations = extractDeferredComputations(
+              aggregateExpressions, hg.crossRelationFilters)
+            val guardedProductComputations = guardedDeferredComputations.filter(
+              _.computationType == ProductAggregate)
+
+            // When there are 2+ products, defer ALL to final aggregate for correctness
+            val guardedConflictingAttrs =
+              if (guardedProductComputations.size >= 2) {
+                val allProductAttrs = guardedProductComputations.flatMap(_.resultAttr).toSet
+                debugLog(s"Guarded: Multiple products - deferring all")
+                allProductAttrs
+              } else {
+                Set.empty[Attribute]
+              }
+
             val (yannakakisJoins, countingAttribute, _, _) =
               root.buildBottomUpJoinsCounting(aggregateAttributes,
                 groupingExpressions,
@@ -1375,7 +1468,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                 conf.yannakakisCountGroupInLeavesEnabled,
                 usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
                 crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
-                conflictingProductAttrs = Set.empty)
+                conflictingProductAttrs = guardedConflictingAttrs)
 
             val rewrittenResultExpressions = resultExpressions.map {
               expr =>
@@ -1648,8 +1741,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                                  usePhysicalCountJoin: Boolean = false,
                                  crossRelationFilters: mutable.Set[Expression] =
                                    mutable.Set.empty,
-                                 conflictingProductAttrs: Set[Attribute] = Set.empty,
-                                 syntheticSupersetAttrs: Set[Attribute] = Set.empty):
+                                 conflictingProductAttrs: Set[Attribute] = Set.empty):
   (LogicalPlan, NamedExpression, Boolean, Boolean) = {
     // scalastyle:on argcount
 
@@ -1710,8 +1802,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
           pendingProductOriginalAttrs, keyRefs, uniqueConstraints,
           groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin,
           crossRelationFilters = crossRelationFilters,
-          conflictingProductAttrs = conflictingProductAttrs,
-          syntheticSupersetAttrs = syntheticSupersetAttrs)
+          conflictingProductAttrs = conflictingProductAttrs)
 
       val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
       val countExpressionRight = Alias(
@@ -2199,13 +2290,18 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // Products will be computed at the final aggregate where counts are correct.
 
               val hasConflict = hasForeignGrouping || otherProductsHaveUnseenAttrs
-              // If there's a conflict, defer product unless this is a leaf join.
-              // For conflicting products, we can safely compute at leaf joins because
-              // there's no grouping yet. After that, we must defer to final agg.
-              val mustDeferForGrouping = hasConflict && !isLeafNode
 
               // Phase 1-2: Per-product conflict check using conflict graph
+              // The winner product (not in conflictingProductAttrs) is allowed to compute early
+              // even if there are other products with unseen attrs - that's the whole point
+              // of one-winner selection.
               val isConflictingProduct = conflictingProductAttrs.contains(agg.resultAttribute)
+
+              // When there are 2+ products, use conservative deferral:
+              // All products defer if there's any conflict (foreign grouping OR other unseen)
+              // This ensures correctness at the cost of some optimization opportunity.
+              // The winner selection only matters for logging/debugging purposes.
+              val mustDeferForGrouping = hasConflict && !isLeafNode
 
               dbg(s"Conflict check for ${agg}: hasForeign=$hasForeignGrouping " +
                 s"otherUnseen=$otherProductsHaveUnseenAttrs isLeaf=$isLeafNode " +
@@ -2225,6 +2321,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 // Check if right-side product attributes are grouped at THIS join
                 val rightRefsGroupedHere = refsOnRight.exists(a =>
                   applicableGroupAttributes.exists(g => g.references.contains(a)))
+
 
                 var productExpr: Expression = sumChild
 
