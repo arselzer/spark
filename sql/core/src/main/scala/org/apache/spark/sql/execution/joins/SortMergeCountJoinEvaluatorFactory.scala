@@ -183,9 +183,6 @@ class SortMergeCountJoinEvaluatorFactory(
       val groupingProjection: UnsafeProjection =
         UnsafeProjection.create(groupRight, right.output)
 
-      val aggRowProjection: UnsafeProjection =
-        UnsafeProjection.create(groupRight, right.output)
-
 //      logWarning("agregate functions: " + aggregateFunctions.mkString("Array(", ", ", ")"))
 //      logWarning("groupRight: " + groupRight)
 //      logWarning("right output: " + right.output)

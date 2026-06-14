@@ -849,4 +849,40 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       }
     }
   }
+
+  test("cross-relation filter: correct under shuffle and sort-merge operators") {
+    Seq((1, 100, 5), (1, 200, 50), (2, 300, 1)).toDF("k", "v", "x")
+      .createOrReplaceTempView("cf_a")
+    Seq((1, 10), (1, 60), (2, 0)).toDF("k", "y").createOrReplaceTempView("cf_b")
+    val query = "select sum(v) as s from cf_a a, cf_b b where a.k = b.k and a.x < b.y"
+    for (op <- countJoinOperators) {
+      withSQLConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> op) {
+        assertSameResults(query, s"cross-relation filter a.x < b.y, operator=$op")
+      }
+    }
+  }
+
+  test("grouped count-join correct under sort-merge spill (tiny in-memory threshold)") {
+    // Force the SortMergeCountJoin buffered-matches array onto its spillable path by capping the
+    // in-memory threshold at 1 row, with multiple matches per key (the Q9 nation-rooted shape).
+    createQ9Tables()
+    val fromOrder = Seq("supplier_t9", "lineitem_t9", "partsupp_t9",
+      "orders_t9", "nation_t9", "part_t9")
+    val query = s"""
+      select nation, o_year, sum(amount) as sum_profit
+      from (
+        select n_name as nation, extract(year from o_orderdate) as o_year,
+               l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
+        from ${fromOrder.mkString(", ")}
+        where s_suppkey = l_suppkey and ps_suppkey = l_suppkey
+          and ps_partkey = l_partkey and p_partkey = l_partkey
+          and o_orderkey = l_orderkey and s_nationkey = n_nationkey
+          and p_name like '%green%'
+      ) as profit group by nation, o_year"""
+    withSQLConf(
+      SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> "sortMerge",
+      SQLConf.SORT_MERGE_JOIN_EXEC_BUFFER_IN_MEMORY_THRESHOLD.key -> "1") {
+      assertSameResults(query, "grouped count-join under sort-merge spill")
+    }
+  }
 }

@@ -2920,12 +2920,22 @@ class Hypergraph (private val items: Seq[LogicalPlan],
   // These need to be applied at the appropriate join point
   var crossRelationFilters: Seq[Expression] = Seq.empty
 
+  // An equi-join edge is only valid when each side is a single attribute (possibly wrapped in
+  // casts). For a compound/expression key (e.g. a + b = c, or substr(x) = y), .references.head
+  // would pick an arbitrary attribute and build a wrong equivalence class, so route those to
+  // the cross-relation-filter branch instead.
+  def isSingleAttributeKey(e: Expression): Boolean = e match {
+    case _: Attribute => true
+    case c: Cast => isSingleAttributeKey(c.child)
+    case _ => false
+  }
+
   for (cond <- conditions) {
     if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) {
       logWarning("condition: " + cond + ", refs: " + cond.references)
     }
     cond match {
-      case EqualTo(lhs, rhs) =>
+      case EqualTo(lhs, rhs) if isSingleAttributeKey(lhs) && isSingleAttributeKey(rhs) =>
         // logWarning("equality condition: " + lhs.references + " , " + rhs.references)
         val lAtt = lhs.references.head
         val rAtt = rhs.references.head
