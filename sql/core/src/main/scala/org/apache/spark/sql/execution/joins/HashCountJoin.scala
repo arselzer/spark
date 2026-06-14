@@ -364,7 +364,7 @@ trait HashCountJoin extends JoinCodegenSupport {
     val doAggregation = aggregatesRight.nonEmpty
     val doGrouping = groupRight.nonEmpty
 
-    val aggregateFunctions = aggregatesRight.map(_.aggregateFunction).toArray
+    val aggregateFunctions = aggregatesRight.map(_.aggregateFunction).toIndexedSeq
 
     // Aggregate functions can only be DeclarativeAggregates (such as Sum, Min, Max)
     val expressionAggInitialProjection = {
@@ -379,7 +379,7 @@ trait HashCountJoin extends JoinCodegenSupport {
     val useUnsafeBuffer = bufferSchema
       .map(_.dataType).forall(UnsafeRow.isMutable)
     val unsafeProjection =
-      UnsafeProjection.create(bufferSchema.map(_.dataType))
+      UnsafeProjection.create(bufferSchema.map(_.dataType).toArray)
 
     def newBuffer(): InternalRow = {
       val bufferRow = new SpecificInternalRow(bufferSchema.map(_.dataType))

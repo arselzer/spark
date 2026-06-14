@@ -124,10 +124,15 @@ case class SortMergeCountJoinExec(
     }
   }
 
+  private def getSizeInBytesSpillThreshold: Long = {
+    conf.sortMergeJoinExecBufferSpillSizeThreshold
+  }
+
   protected override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = longMetric("numOutputRows")
     val spillSize = longMetric("spillSize")
     val spillThreshold = getSpillThreshold
+    val sizeInBytesSpillThreshold = getSizeInBytesSpillThreshold
     val inMemoryThreshold = getInMemoryThreshold
     val opId = ExplainUtils.getOpId(this)
     val evaluatorFactory = new SortMergeCountJoinEvaluatorFactory(
@@ -144,6 +149,7 @@ case class SortMergeCountJoinExec(
       output,
       inMemoryThreshold,
       spillThreshold,
+      sizeInBytesSpillThreshold,
       numOutputRows,
       spillSize,
       onlyBufferFirstMatchedRow,

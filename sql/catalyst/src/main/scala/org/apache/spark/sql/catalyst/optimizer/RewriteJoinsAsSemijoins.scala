@@ -1651,8 +1651,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                         // and square the count for products of two attributes.
                         val sumAggregateExpr = aggFn.transformUp {
                           case a@Average(c, evalMode) =>
-                            Sum(Multiply(c, Cast(countingAttribute, c.dataType), evalMode),
-                              evalMode)
+                            Sum(Multiply(c, Cast(countingAttribute, c.dataType),
+                              NumericEvalContext(evalMode)), NumericEvalContext(evalMode))
                         }.asInstanceOf[AggregateFunction].toAggregateExpression()
 
                         val countAggregateExpr = Sum(
@@ -3008,14 +3008,14 @@ class Hypergraph (private val items: Seq[LogicalPlan],
       for (e <- ordered(gyoEdges)) {
         // logWarning("gyo edge: " + e)
         // Remove vertices that only occur in this edge
-        val allOtherVertices = (gyoEdges - e).map(o => o.vertices)
+        val allOtherVertices = gyoEdges.diff(Set(e)).map(o => o.vertices)
           .reduce((o1, o2) => o1 union o2)
         val singleNodeVertices = e.vertices -- allOtherVertices
 
         // logWarning("single vertices: " + singleNodeVertices)
 
         val eNew = e.copy(newVertices = e.vertices -- singleNodeVertices)
-        gyoEdges = (gyoEdges - e) + eNew
+        gyoEdges = gyoEdges.diff(Set(e)) ++ Set(eNew)
 
         // logWarning("removed single vertices: " + gyoEdges)
       }

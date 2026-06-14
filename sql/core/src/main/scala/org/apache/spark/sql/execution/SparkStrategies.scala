@@ -51,7 +51,6 @@ import org.apache.spark.sql.execution.streaming.runtime.{StreamingExecutionRelat
 import org.apache.spark.sql.execution.streaming.sources.MemoryPlan
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.OutputMode
-import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
 
 /**
@@ -604,6 +603,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
                   .orElse(createShuffleHashCountJoin(true))
                   .getOrElse(createCountJoinWithoutHint())
             }
+          // CountJoin always extracts equi-join keys; this only satisfies exhaustiveness.
+          case _ => Nil
         }
 
       // --- Cases where this strategy does not apply ---------------------------------------------

@@ -44,6 +44,7 @@ class SortMergeCountJoinEvaluatorFactory(
     output: Seq[Attribute],
     inMemoryThreshold: Int,
     spillThreshold: Int,
+    sizeInBytesSpillThreshold: Long,
     numOutputRows: SQLMetric,
     spillSize: SQLMetric,
     onlyBufferFirstMatchedRow: Boolean,
@@ -109,7 +110,7 @@ class SortMergeCountJoinEvaluatorFactory(
       val doAggregation = aggregatesRight.nonEmpty
       val doGrouping = groupRight.nonEmpty
 
-      val aggregateFunctions = aggregatesRight.map(_.aggregateFunction).toArray
+      val aggregateFunctions = aggregatesRight.map(_.aggregateFunction).toIndexedSeq
 
       // Aggregate functions can only be DeclarativeAggregates (Sum, Min, Max)
       val expressionAggInitialProjection = {
@@ -121,7 +122,7 @@ class SortMergeCountJoinEvaluatorFactory(
 
       val bufferSchema = aggregateFunctions.flatMap(_.aggBufferAttributes)
       val initialAggregationBuffer: UnsafeRow =
-        UnsafeProjection.create(bufferSchema.map(_.dataType))
+        UnsafeProjection.create(bufferSchema.map(_.dataType).toArray)
         .apply(new GenericInternalRow(bufferSchema.length))
       // Initialize declarative aggregates' buffer values
       expressionAggInitialProjection.target(initialAggregationBuffer)(EmptyRow)
@@ -130,7 +131,7 @@ class SortMergeCountJoinEvaluatorFactory(
         .map(_.dataType).forall(UnsafeRow.isMutable)
 
       val unsafeProjection =
-        UnsafeProjection.create(bufferSchema.map(_.dataType))
+        UnsafeProjection.create(bufferSchema.map(_.dataType).toArray)
 
       def newBuffer(): InternalRow = {
         val bufferRow = new SpecificInternalRow(bufferSchema.map(_.dataType))
@@ -203,6 +204,7 @@ class SortMergeCountJoinEvaluatorFactory(
               RowIterator.fromScala(rightIter),
               inMemoryThreshold,
               spillThreshold,
+              sizeInBytesSpillThreshold,
               spillSize,
               cleanupResources)
             private[this] val joinRow = new JoinedRow
@@ -415,6 +417,7 @@ class SortMergeCountJoinEvaluatorFactory(
             bufferedIter = RowIterator.fromScala(rightIter),
             inMemoryThreshold,
             spillThreshold,
+            sizeInBytesSpillThreshold,
             spillSize,
             cleanupResources)
           val rightNullRow = new GenericInternalRow(right.output.length)
@@ -434,6 +437,7 @@ class SortMergeCountJoinEvaluatorFactory(
             bufferedIter = RowIterator.fromScala(leftIter),
             inMemoryThreshold,
             spillThreshold,
+            sizeInBytesSpillThreshold,
             spillSize,
             cleanupResources)
           val leftNullRow = new GenericInternalRow(left.output.length)
@@ -470,6 +474,7 @@ class SortMergeCountJoinEvaluatorFactory(
               RowIterator.fromScala(rightIter),
               inMemoryThreshold,
               spillThreshold,
+              sizeInBytesSpillThreshold,
               spillSize,
               cleanupResources,
               onlyBufferFirstMatchedRow)
@@ -507,6 +512,7 @@ class SortMergeCountJoinEvaluatorFactory(
               RowIterator.fromScala(rightIter),
               inMemoryThreshold,
               spillThreshold,
+              sizeInBytesSpillThreshold,
               spillSize,
               cleanupResources,
               onlyBufferFirstMatchedRow)
@@ -551,6 +557,7 @@ class SortMergeCountJoinEvaluatorFactory(
               RowIterator.fromScala(rightIter),
               inMemoryThreshold,
               spillThreshold,
+              sizeInBytesSpillThreshold,
               spillSize,
               cleanupResources,
               onlyBufferFirstMatchedRow)
