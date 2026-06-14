@@ -45,7 +45,7 @@ import org.apache.spark.sql.types.{BooleanType, IntegralType, LongType, StructFi
 
 trait HashCountJoin extends JoinCodegenSupport {
   // Toggle to enable detailed debug logging for CountJoin operations
-  private val DEBUG_COUNTJOIN = true
+  private val DEBUG_COUNTJOIN = false
 
   // Unique ID for this operator instance (for debugging)
   private lazy val opId: String = ExplainUtils.getOpId(this)
@@ -464,9 +464,11 @@ trait HashCountJoin extends JoinCodegenSupport {
         val joinKey = joinKeys(srow)
         val matches = hashedRelation.get(joinKey)
 
-        // Could merge these into a single buffer/map
-        val sumMap = new mutable.LinkedHashMap[UnsafeRow, Long]
-        val bufferMap = new mutable.LinkedHashMap[UnsafeRow, InternalRow]
+        // Only the grouping path uses these per-group maps; skip the allocation otherwise
+        // (the non-grouped count/SUM path - the common case - never touches them).
+        val sumMap = if (doGrouping) new mutable.LinkedHashMap[UnsafeRow, Long] else null
+        val bufferMap =
+          if (doGrouping) new mutable.LinkedHashMap[UnsafeRow, InternalRow] else null
         var buffer: InternalRow = null
 
         if (matches != null) {
@@ -496,7 +498,6 @@ trait HashCountJoin extends JoinCodegenSupport {
               }
 
               matchCount += 1
-              dbg(s"  Processing match $matchCount: rightCount=$rightCount")
 
               if (doAggregation || doGrouping) {
                 if (doGrouping) {
@@ -541,6 +542,15 @@ trait HashCountJoin extends JoinCodegenSupport {
               // when producing multiple rows for the same left input
               resultProjection(joinedRow).copy()
             }).toSeq
+          }
+          else if (rightCountSum == 0) {
+            // Every key-matching build row failed the residual (non-equi) condition, so this
+            // stream row has no real match: emit nothing rather than a phantom count-0 row.
+            // Carried counts start at 1 and only sum upward, so rightCountSum == 0 can only mean
+            // "all matches filtered out", never a genuine zero-count group. Correct-by-construction
+            // - the rewrite currently bails on cross-relation filters so this is not yet reachable
+            // from SQL, but it makes the operator safe for future residual-filter support.
+            Seq.empty
           }
           else {
             val sumRow = new SpecificInternalRow(sumRowSchema)
@@ -632,15 +642,12 @@ trait HashCountJoin extends JoinCodegenSupport {
 //    val output = left.output ++ Seq(countRight.get.toAttribute) ++
 //      aggregatesRight.map(_.resultAttribute)
 
-    val output = left.output ++ Seq(countRight.get.toAttribute) ++
-      aggregatesRight.map(_.resultAttribute) ++ groupRight.map(_.toAttribute)
-//    logWarning("output: " + output)
-
-    val resultProj = UnsafeProjection.create(output, output)
-    // val resultProj = createResultProjection
+    // countJoin already emits fully-formed UnsafeRows (the grouped path copies per group,
+    // the non-grouped path returns one reused row per stream row), so re-projecting here
+    // with an identical input/output schema was a redundant per-output-row copy.
     joinedIter.map { r =>
       numOutputRows += 1
-      resultProj(r)
+      r
     }
   }
 

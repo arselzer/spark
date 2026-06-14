@@ -2595,35 +2595,35 @@ object SQLConf {
   val YANNAKAKIS_ENABLED =
     buildConf("spark.sql.yannakakis.enabled")
       .doc("Enables semi-join rewriting")
-      .version("2.3.0")
+      .version("3.5.0")
       .booleanConf
       .createWithDefault(false)
 
   val YANNAKAKIS_COUNT_GROUP_LEAVES =
     buildConf("spark.sql.yannakakis.countGroupInLeaves")
       .doc("Perform grouping directly in the leaves")
-      .version("2.3.0")
+      .version("3.5.0")
       .booleanConf
       .createWithDefault(false)
 
   val YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED =
     buildConf("spark.sql.yannakakis.physicalCountJoinEnabled")
       .doc("Apply a physical operator combining the join and aggregation steps")
-      .version("2.3.0")
+      .version("3.5.0")
       .booleanConf
       .createWithDefault(false)
 
   val YANNAKAKIS_UNGUARDED_ENABLED =
     buildConf("spark.sql.yannakakis.unguardedEnabled")
       .doc("Optimize unguarded queries")
-      .version("2.3.0")
+      .version("3.5.0")
       .booleanConf
       .createWithDefault(false)
 
   val YANNAKAKIS_DEFER_PRODUCTS_ENABLED =
     buildConf("spark.sql.yannakakis.deferProductsEnabled")
       .doc("Defer all product aggregates to final aggregate instead of computing early")
-      .version("2.3.0")
+      .version("3.5.0")
       .booleanConf
       .createWithDefault(false)
 
@@ -2631,7 +2631,7 @@ object SQLConf {
     buildConf("spark.sql.yannakakis.distinctEnabled")
       .doc("Optimize non-guarded duplicate-insensitive (DISTINCT count/sum/avg) aggregates " +
         "via a single bottom-up carry-reduced join instead of falling back to the original plan")
-      .version("2.3.0")
+      .version("3.5.0")
       .booleanConf
       .createWithDefault(true)
 
@@ -2640,7 +2640,7 @@ object SQLConf {
       .doc("Skip the count-join rewrite when vanilla Spark would broadcast every base " +
         "relation except the largest (a broadcast-friendly star schema), where the " +
         "interpreted count-join only adds cost with no reduction benefit")
-      .version("2.3.0")
+      .version("3.5.0")
       .booleanConf
       .createWithDefault(true)
 
@@ -2650,7 +2650,7 @@ object SQLConf {
         "\"sortMerge\") instead of letting the planner choose. The empty default uses the normal " +
         "broadcast->shuffle->sortMerge selection. Needed because count joins otherwise plan as " +
         "broadcast (or shuffle) at unit-test scale and the sort-merge path is never exercised.")
-      .version("2.3.0")
+      .version("3.5.0")
       .stringConf
       .createWithDefault("")
 

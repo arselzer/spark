@@ -1222,7 +1222,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                   .getOrElse(jointree)
               val reducedJoin = distinctRoot.buildBottomUpDistinctJoin(needed, isTop = true)
               val newAgg = Aggregate(groupingExpressions, resultExpressions, reducedJoin)
-              logWarning("new aggregate (distinct-reduced): " + newAgg)
+              logWarning("new aggregate (distinct-reduced)")
               debugLog("time difference: " + (System.nanoTime() - startTime))
               return newAgg
             }
@@ -1549,7 +1549,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             rewrittenResultExpressions,
             Project(prunedOutput ++ equivalenceAliases, joinsWithWindowCounts))
           val queryClass = if (piecewiseGuarded) "piecewise-guarded" else "unguarded"
-          logWarning(f"new aggregate ($queryClass): " + newAgg)
+          logWarning(f"new aggregate ($queryClass)")
           debugLog("time difference: " + (System.nanoTime() - startTime))
           newAgg
         }
@@ -1575,7 +1575,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
 
             val newAgg = Aggregate(groupingExpressions, resultExpressions,
               yannakakisJoins)
-            logWarning("new aggregate (0MA): " + newAgg)
+            logWarning("new aggregate (0MA)")
             debugLog("time difference: " + (System.nanoTime() - startTime))
             newAgg
           }
@@ -1689,7 +1689,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             val newAgg = Aggregate(groupingExpressions,
               rewrittenResultExpressions, yannakakisJoins)
 
-            logWarning("new aggregate (guarded): " + newAgg)
+            logWarning("new aggregate (guarded)")
             debugLog("time difference: " + (System.nanoTime() - startTime))
             newAgg
           }
