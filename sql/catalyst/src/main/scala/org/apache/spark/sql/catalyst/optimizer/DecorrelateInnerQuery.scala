@@ -42,6 +42,7 @@ import org.apache.spark.util.collection.Utils
  * :- Outer Query
  * +- Inner Query
  *
+ *
  * If the [[OuterReference]]s are bound to the same value, the inner query will return the same
  * result. Based on this, we can reduce the times to evaluate the inner query by first getting
  * all distinct values of the [[OuterReference]]s.

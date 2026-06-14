@@ -3599,6 +3599,68 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val YANNAKAKIS_ENABLED =
+    buildConf("spark.sql.yannakakis.enabled")
+      .doc("Enables semi-join rewriting")
+      .version("3.5.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val YANNAKAKIS_COUNT_GROUP_LEAVES =
+    buildConf("spark.sql.yannakakis.countGroupInLeaves")
+      .doc("Perform grouping directly in the leaves")
+      .version("3.5.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED =
+    buildConf("spark.sql.yannakakis.physicalCountJoinEnabled")
+      .doc("Apply a physical operator combining the join and aggregation steps")
+      .version("3.5.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val YANNAKAKIS_UNGUARDED_ENABLED =
+    buildConf("spark.sql.yannakakis.unguardedEnabled")
+      .doc("Optimize unguarded queries")
+      .version("3.5.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val YANNAKAKIS_DEFER_PRODUCTS_ENABLED =
+    buildConf("spark.sql.yannakakis.deferProductsEnabled")
+      .doc("Defer all product aggregates to final aggregate instead of computing early")
+      .version("3.5.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  val YANNAKAKIS_DISTINCT_ENABLED =
+    buildConf("spark.sql.yannakakis.distinctEnabled")
+      .doc("Optimize non-guarded duplicate-insensitive (DISTINCT count/sum/avg) aggregates " +
+        "via a single bottom-up carry-reduced join instead of falling back to the original plan")
+      .version("3.5.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val YANNAKAKIS_COST_GATE_ENABLED =
+    buildConf("spark.sql.yannakakis.costGateEnabled")
+      .doc("Skip the count-join rewrite when vanilla Spark would broadcast every base " +
+        "relation except the largest (a broadcast-friendly star schema), where the " +
+        "interpreted count-join only adds cost with no reduction benefit")
+      .version("3.5.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR =
+    buildConf("spark.sql.yannakakis.forcePhysicalCountJoinOperator")
+      .doc("Test-only: force the physical count-join operator (\"broadcast\", \"shuffle\" or " +
+        "\"sortMerge\") instead of letting the planner choose. The empty default uses the normal " +
+        "broadcast->shuffle->sortMerge selection. Needed because count joins otherwise plan as " +
+        "broadcast (or shuffle) at unit-test scale and the sort-merge path is never exercised.")
+      .version("3.5.0")
+      .stringConf
+      .createWithDefault("")
+
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
       .doc("Enables CBO for estimation of plan statistics when set true.")
@@ -7370,6 +7432,28 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def histogramNumBins: Int = getConf(HISTOGRAM_NUM_BINS)
 
   def percentileAccuracy: Int = getConf(PERCENTILE_ACCURACY)
+
+  def yannakakisEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_ENABLED)
+
+  def yannakakisCountGroupInLeavesEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_COUNT_GROUP_LEAVES)
+
+  def yannakakisPhysicalCountEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED)
+
+  def yannakakisUnguardedEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_UNGUARDED_ENABLED)
+
+  def yannakakisDeferProductsEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_DEFER_PRODUCTS_ENABLED)
+
+  def yannakakisDistinctEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_DISTINCT_ENABLED)
+
+  def yannakakisCostGateEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_COST_GATE_ENABLED)
+
+  def yannakakisForcePhysicalCountJoinOperator: String =
+    getConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 

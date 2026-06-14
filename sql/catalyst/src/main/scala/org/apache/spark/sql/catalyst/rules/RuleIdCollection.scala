@@ -182,7 +182,8 @@ object RuleIdCollection {
       "org.apache.spark.sql.catalyst.optimizer.SimplifyDateTimeConversions" ::
       "org.apache.spark.sql.catalyst.optimizer.SimplifyExtractValueOps" ::
       "org.apache.spark.sql.catalyst.optimizer.TransposeWindow" ::
-      "org.apache.spark.sql.catalyst.optimizer.UnwrapCastInBinaryComparison" ::  Nil
+      "org.apache.spark.sql.catalyst.optimizer.UnwrapCastInBinaryComparison" ::
+      "org.apache.spark.sql.catalyst.optimizer.RewriteJoinsAsSemijoins"::  Nil
   }
 
   if (Utils.isTesting) {

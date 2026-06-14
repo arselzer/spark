@@ -51,6 +51,8 @@ import org.apache.spark.sql.execution.streaming.runtime.{StreamingExecutionRelat
 import org.apache.spark.sql.execution.streaming.sources.MemoryPlan
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.OutputMode
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.Utils
 
 /**
  * Converts a logical plan into zero or more SparkPlans.  This API is exposed for experimenting
@@ -212,6 +214,100 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
         hintErrorHandler.joinHintNotSupported(hint.leftHint.orElse(hint.rightHint).get,
           "no equi-join keys")
       }
+    }
+
+    def getCountJoinBuildSide(
+                               canBuildLeft: Boolean,
+                               canBuildRight: Boolean,
+                               left: LogicalPlan,
+                               right: LogicalPlan): Option[BuildSide] = {
+      if (canBuildLeft && canBuildRight) {
+        // returns the smaller side base on its estimated physical size, if we want to build the
+        // both sides.
+        Some(getSmallerSide(left, right))
+      } else if (canBuildLeft) {
+        Some(BuildLeft)
+      } else if (canBuildRight) {
+        Some(BuildRight)
+      } else {
+        None
+      }
+    }
+
+    def getBroadcastCountJoinBuildSide(
+                                        left: LogicalPlan,
+                                        right: LogicalPlan,
+                                        joinType: JoinType,
+                                        hint: JoinHint,
+                                        hintOnly: Boolean,
+                                        conf: SQLConf): Option[BuildSide] = {
+      //          val buildLeft = if (hintOnly) {
+      //            hintToBroadcastLeft(hint)
+      //          } else {
+      //            canBroadcastBySize(left, conf) && !hintToNotBroadcastLeft(hint)
+      //          }
+      // Never build left in case of a count join
+      val buildLeft = false
+      val buildRight = if (hintOnly) {
+        hintToBroadcastRight(hint)
+      } else {
+        canBroadcastBySize(right, conf) && !hintToNotBroadcastRight(hint)
+      }
+      getCountJoinBuildSide(
+        canBuildBroadcastLeft(joinType) && buildLeft,
+        canBuildBroadcastRight(joinType) && buildRight,
+        left,
+        right
+      )
+    }
+
+    def canBuildLocalHashMapBySize(plan: LogicalPlan, conf: SQLConf): Boolean = {
+      plan.stats.sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
+    }
+
+    def muchSmaller(a: LogicalPlan, b: LogicalPlan, conf: SQLConf): Boolean = {
+      a.stats.sizeInBytes *
+        conf.getConf(SQLConf.SHUFFLE_HASH_JOIN_FACTOR) <= b.stats.sizeInBytes
+    }
+
+    def forceApplyShuffledHashJoin(conf: SQLConf): Boolean = {
+      // TODO temporarily disabled
+       Utils.isTesting ||
+        conf.getConfString("spark.sql.join.forceApplyShuffledHashJoin", "false") == "true"
+    }
+
+    def getShuffleHashCountJoinBuildSide(
+                                          left: LogicalPlan,
+                                          right: LogicalPlan,
+                                          joinType: JoinType,
+                                          hint: JoinHint,
+                                          hintOnly: Boolean,
+                                          conf: SQLConf): Option[BuildSide] = {
+//      val buildLeft = if (hintOnly) {
+//        hintToShuffleHashJoinLeft(hint)
+//      } else {
+//        hintToPreferShuffleHashJoinLeft(hint) ||
+//          (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(left, conf) &&
+//            muchSmaller(left, right, conf)) ||
+//          forceApplyShuffledHashJoin(conf)
+//      }
+      // Never build left
+      val buildLeft = false
+      val buildRight = if (hintOnly) {
+        hintToShuffleHashJoinRight(hint)
+      } else {
+                  hintToPreferShuffleHashJoinRight(hint) ||
+                    (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(right, conf) &&
+                      muchSmaller(right, left, conf)) ||
+                    forceApplyShuffledHashJoin(conf)
+      }
+
+      getCountJoinBuildSide(
+        canBuildShuffledHashJoinLeft(joinType) && buildLeft,
+        canBuildShuffledHashJoinRight(joinType) && buildRight,
+        left,
+        right
+      )
     }
 
     def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
@@ -411,12 +507,103 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
             }
         }
 
+
+
         if (hint.isEmpty) {
           createJoinWithoutHint()
         } else {
           createBroadcastNLJoin(true)
             .orElse { if (hintToShuffleReplicateNL(hint)) createCartesianProduct() else None }
             .getOrElse(createJoinWithoutHint())
+        }
+
+      // Selecting a CountJoin
+
+
+      case j @ logical.CountJoin(left, right, joinType, condition, countLeft, countRight,
+      aggsRight, groupRight, hint) =>
+        j match {
+          case ExtractCountJoinEquiJoinKeys(joinType, leftKeys, rightKeys, nonEquiCond,
+          _, left, right, countLeft, countRight, aggregatesRight, groupRight, hint) =>
+            def createBroadcastHashCountJoin(onlyLookingAtHint: Boolean) = {
+              val buildSide = getBroadcastCountJoinBuildSide(
+                left, right, joinType, hint, onlyLookingAtHint, conf)
+              checkHintBuildSide(onlyLookingAtHint, buildSide, joinType, hint, true)
+              buildSide.map {
+                buildSide =>
+                  Seq(joins.BroadcastHashCountJoinExec(
+                    leftKeys,
+                    rightKeys,
+                    joinType,
+                    buildSide,
+                    nonEquiCond,
+                    planLater(left),
+                    planLater(right),
+                    countLeft,
+                    countRight,
+                    aggregatesRight,
+                    groupRight))
+              }
+            }
+            def createShuffleHashCountJoin(onlyLookingAtHint: Boolean) = {
+              val buildSide = getShuffleHashCountJoinBuildSide(
+                left, right, joinType, hint, onlyLookingAtHint, conf)
+              checkHintBuildSide(onlyLookingAtHint, buildSide, joinType, hint, false)
+              buildSide.map {
+                buildSide =>
+                  Seq(joins.ShuffledHashCountJoinExec(
+                    leftKeys,
+                    rightKeys,
+                    joinType,
+                    buildSide,
+                    nonEquiCond,
+                    planLater(left),
+                    planLater(right),
+                    countLeft,
+                    countRight,
+                    aggregatesRight,
+                    groupRight))
+              }
+            }
+            def createSortMergeCountJoin() = {
+              if (RowOrdering.isOrderable(leftKeys)) {
+                Some(Seq(joins.SortMergeCountJoinExec(
+                  leftKeys,
+                  rightKeys,
+                  joinType,
+                  nonEquiCond,
+                  planLater(left),
+                  planLater(right),
+                  countLeft,
+                  countRight,
+                  aggregatesRight,
+                  groupRight)))
+              } else {
+                None
+              }
+            }
+
+            def createCountJoinWithoutHint() = {
+              createBroadcastHashCountJoin(false)
+                .orElse(createShuffleHashCountJoin(false))
+                .orElse(createSortMergeCountJoin())
+                .get
+            }
+
+            // Test-only override: force a specific physical count-join operator so the
+            // sort-merge path (otherwise never selected at unit-test scale) can be exercised.
+            conf.yannakakisForcePhysicalCountJoinOperator match {
+              case "broadcast" => createBroadcastHashCountJoin(false).get
+              case "shuffle" => createShuffleHashCountJoin(false).get
+              case "sortMerge" => createSortMergeCountJoin().get
+              case _ if hint.isEmpty =>
+                createCountJoinWithoutHint()
+              case _ =>
+                createBroadcastHashCountJoin(true)
+                  .orElse { if (hintToSortMergeJoin(hint)) createSortMergeCountJoin() else None }
+                  .orElse(createShuffleHashCountJoin(true))
+                  .getOrElse(createCountJoinWithoutHint())
+            }
         }
 
       // --- Cases where this strategy does not apply ---------------------------------------------
