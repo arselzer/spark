@@ -3622,10 +3622,10 @@ object SQLConf {
 
   val YANNAKAKIS_UNGUARDED_ENABLED =
     buildConf("spark.sql.yannakakis.unguardedEnabled")
-      .doc("Optimize unguarded queries")
+      .doc("Optimize unguarded queries (only takes effect when spark.sql.yannakakis.enabled)")
       .version("3.5.0")
       .booleanConf
-      .createWithDefault(false)
+      .createWithDefault(true)
 
   val YANNAKAKIS_DEFER_PRODUCTS_ENABLED =
     buildConf("spark.sql.yannakakis.deferProductsEnabled")

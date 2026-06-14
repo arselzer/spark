@@ -782,6 +782,26 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("unguarded count-join is enabled by default (no explicit unguardedEnabled flag)") {
+    createQ9Tables()
+    val query = """
+      select n_name as nation, extract(year from o_orderdate) as o_year,
+             sum(l_extendedprice * (1 - l_discount)) as rev
+      from part_t9, supplier_t9, lineitem_t9, partsupp_t9, orders_t9, nation_t9
+      where s_suppkey = l_suppkey and ps_suppkey = l_suppkey
+        and ps_partkey = l_partkey and p_partkey = l_partkey
+        and o_orderkey = l_orderkey and s_nationkey = n_nationkey and p_name like '%green%'
+      group by n_name, extract(year from o_orderdate)"""
+    // Enable yannakakis + the physical count join, but do NOT set unguardedEnabled explicitly:
+    // the unguarded count-join rewrite should fire because it now defaults to true.
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+                SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true") {
+      val plan = sql(query).queryExecution.executedPlan.toString
+      assert(plan.contains("CountJoin"),
+        s"an unguarded query should rewrite by default (unguardedEnabled):\n$plan")
+    }
+  }
+
   test("cross-relation filter: count-join fires and results match vanilla") {
     // a.x < b.y is a non-equi predicate spanning both relations (a cross-relation filter).
     // It must be folded into the count-join (rows failing it are dropped, not emitted as
