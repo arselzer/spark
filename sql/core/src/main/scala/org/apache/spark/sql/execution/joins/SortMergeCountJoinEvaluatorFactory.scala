@@ -51,7 +51,7 @@ class SortMergeCountJoinEvaluatorFactory(
     extends PartitionEvaluatorFactory[InternalRow, InternalRow] with Logging {
 
   // Toggle to enable detailed debug logging for CountJoin operations
-  private val DEBUG_COUNTJOIN = true
+  private val DEBUG_COUNTJOIN = false
 
   private def dbg(msg: => String): Unit = {
     if (DEBUG_COUNTJOIN) logWarning(s"[Op$opId] $msg")
@@ -135,7 +135,10 @@ class SortMergeCountJoinEvaluatorFactory(
       def newBuffer(): InternalRow = {
         val bufferRow = new SpecificInternalRow(bufferSchema.map(_.dataType))
         if (useUnsafeBuffer) {
-          unsafeProjection.apply(bufferRow)
+          // UnsafeProjection reuses its output row, so the result MUST be copied: the
+          // grouped path stores one buffer per grouping key in bufferMap, and without the
+          // copy every group would share (and overwrite) the same physical row.
+          unsafeProjection.apply(bufferRow).copy()
         } else {
           bufferRow
         }
@@ -287,17 +290,18 @@ class SortMergeCountJoinEvaluatorFactory(
                       }
                     }
                     if (doGrouping) {
-//                      logWarning("setting buffer iterator: " + bufferMap)
-                      bufferIterator = bufferMap.asScala.iterator
-
                       if (!bufferMap.isEmpty) {
+                        bufferIterator = bufferMap.asScala.iterator
                         return true
                       }
-                      else {
-                        return false
-                      }
+                      // All matches for this left row were filtered out by the join
+                      // condition, so this row contributes no groups. Continue scanning
+                      // the next left row rather than returning false, which would end
+                      // the entire join and silently drop all remaining left rows.
                     }
-                    return true
+                    else {
+                      return true
+                    }
                   }
                 }
                 false
@@ -306,9 +310,16 @@ class SortMergeCountJoinEvaluatorFactory(
 
             val aggResultAttributes = aggregatesRight.map(_.resultAttribute)
 
+            // Reference groupRight by its output attribute on BOTH sides (matching
+            // HashCountJoin): groupingProjection has already evaluated each grouping
+            // expression into the grouping key, so here we only copy those values through.
+            // Today groupRight only ever holds plain attributes (the rewrite carries the
+            // underlying columns and reconstructs derived grouping keys above the count join),
+            // so this is a no-op, but it keeps the two operators consistent and correct should
+            // an Alias ever reach groupRight.
             protected val aggProjection = UnsafeProjection.create(
-              aggResultAttributes ++ groupRight,
-              aggResultAttributes++ groupRight.map(_.toAttribute))
+              aggResultAttributes ++ groupRight.map(_.toAttribute),
+              aggResultAttributes ++ groupRight.map(_.toAttribute))
 
             protected val countAggGroupProjection = UnsafeProjection.create(
               Seq(countRight.get.toAttribute) ++ aggResultAttributes ++

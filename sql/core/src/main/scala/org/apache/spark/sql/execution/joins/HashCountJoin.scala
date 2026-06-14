@@ -384,7 +384,10 @@ trait HashCountJoin extends JoinCodegenSupport {
     def newBuffer(): InternalRow = {
       val bufferRow = new SpecificInternalRow(bufferSchema.map(_.dataType))
       if (useUnsafeBuffer) {
-        unsafeProjection.apply(bufferRow)
+        // UnsafeProjection reuses its output row, so the result MUST be copied: the
+        // grouped path stores one buffer per grouping key in bufferMap, and without the
+        // copy every group would share (and overwrite) the same physical row.
+        unsafeProjection.apply(bufferRow).copy()
       } else {
         bufferRow
       }

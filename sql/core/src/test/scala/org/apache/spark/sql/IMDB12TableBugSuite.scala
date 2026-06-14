@@ -66,6 +66,9 @@ import org.apache.spark.sql.test.SharedSparkSession
  */
 class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
+  override protected def sparkConf: org.apache.spark.SparkConf =
+    super.sparkConf.set(SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key, "false")
+
   import testImplicits._
 
   test("12-table IMDB join with real data cardinalities") {

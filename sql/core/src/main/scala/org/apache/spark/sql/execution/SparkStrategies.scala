@@ -568,19 +568,20 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
                 .get
             }
 
-            if (hint.isEmpty) {
-              createCountJoinWithoutHint()
-            } else {
-              createBroadcastHashCountJoin(true)
-                .orElse { if (hintToSortMergeJoin(hint)) createSortMergeCountJoin() else None }
-                .orElse(createShuffleHashCountJoin(true))
-                .getOrElse(createCountJoinWithoutHint())
+            // Test-only override: force a specific physical count-join operator so the
+            // sort-merge path (otherwise never selected at unit-test scale) can be exercised.
+            conf.yannakakisForcePhysicalCountJoinOperator match {
+              case "broadcast" => createBroadcastHashCountJoin(false).get
+              case "shuffle" => createShuffleHashCountJoin(false).get
+              case "sortMerge" => createSortMergeCountJoin().get
+              case _ if hint.isEmpty =>
+                createCountJoinWithoutHint()
+              case _ =>
+                createBroadcastHashCountJoin(true)
+                  .orElse { if (hintToSortMergeJoin(hint)) createSortMergeCountJoin() else None }
+                  .orElse(createShuffleHashCountJoin(true))
+                  .getOrElse(createCountJoinWithoutHint())
             }
-
-            // createCountJoinWithoutHint()
-            // createShuffleHashCountJoin(false).get
-            // createBroadcastHashCountJoin(false).get
-            // createSortMergeCountJoin().get
         }
 
       // --- Cases where this strategy does not apply ---------------------------------------------

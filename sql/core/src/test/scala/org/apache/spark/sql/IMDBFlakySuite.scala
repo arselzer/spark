@@ -21,34 +21,72 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
 /**
- * Minimal test suite to reproduce flaky bug with independent products.
- * Run with: build/sbt 'sql/testOnly org.apache.spark.sql.IMDBFlakyBugSuite'
+ * Test suite for flaky independent product tests.
+ * Run with: build/sbt 'sql/testOnly org.apache.spark.sql.IMDBFlakySuite'
  */
-class IMDBFlakyBugSuite extends QueryTest with SharedSparkSession {
+class IMDBFlakySuite extends QueryTest with SharedSparkSession {
 
   override protected def sparkConf: org.apache.spark.SparkConf =
     super.sparkConf.set(SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key, "false")
 
   import testImplicits._
 
-  test("12-table IMDB query with complete join conditions") {
-    // Test data matching the original query structure
-    // cast_info: role_id = 2, note matches filter
+  test("CASE 6c: Synthetic superset with duplicate rows - count accuracy") {
+    // Test that counts are accurate when there are duplicate rows
+    withTable("dup_t1", "dup_t2", "dup_t3") {
+      sql("CREATE TABLE dup_t1 (a INT, b INT) USING parquet")
+      sql("CREATE TABLE dup_t2 (a INT, c INT) USING parquet")
+      sql("CREATE TABLE dup_t3 (a INT, d INT) USING parquet")
+
+      // Insert duplicates to create cross-product multiplications
+      sql("INSERT INTO dup_t1 VALUES (1, 10), (1, 10), (1, 20)")  // 3 rows for a=1
+      sql("INSERT INTO dup_t2 VALUES (1, 100), (1, 100)")          // 2 rows for a=1
+      sql("INSERT INTO dup_t3 VALUES (1, 1000)")                    // 1 row for a=1
+
+      val query = """
+        SELECT SUM(t1.a * t1.b) as p1,
+               SUM(t1.a * t2.c) as p2,
+               SUM(t1.a * t3.d) as p3
+        FROM dup_t1 t1
+        JOIN dup_t2 t2 ON t1.a = t2.a
+        JOIN dup_t3 t3 ON t1.a = t3.a
+      """
+
+      var baseline: Seq[Row] = Seq.empty
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        baseline = sql(query).collect().toSeq
+      }
+
+      // scalastyle:off println
+      withSQLConf(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      ) {
+        val df = sql(query)
+        println("=== CASE 6c: DUPLICATE ROWS - COUNT ACCURACY ===")
+        println(s"Baseline: ${baseline.map(_.toString).mkString}")
+        println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
+        checkAnswer(df, baseline)
+      }
+      // scalastyle:on println
+    }
+  }
+
+  test("independent products with real IMDB schema - flaky bug test") {
+    // Mimics the actual IMDB 12-table query structure
     val ci = Seq(
       (1, 1, 1, 2, "(voice)")
     ).toDF("movie_id", "person_id", "person_role_id", "role_id", "note")
 
-    // movie_info: info_type_id = 16, info matches filter
     val mi = Seq(
       (1, 16, "USA:2011")
     ).toDF("movie_id", "info_type_id", "info")
 
-    // title: kind_id = 7, production_year > 2010
     val t = Seq(
       (1, 2011, 9, 7)
     ).toDF("id", "production_year", "season_nr", "kind_id")
 
-    // movie_companies: different company_type_ids for weighted sum
     val mc = Seq(
       (1, 1, 1), (1, 1, 1), (1, 1, 1), (1, 2, 1),
       (1, 3, 2), (1, 3, 2), (1, 4, 2), (1, 5, 2), (1, 5, 2)
@@ -81,7 +119,6 @@ class IMDBFlakyBugSuite extends QueryTest with SharedSparkSession {
     k.createOrReplaceTempView("keyword")
     mk.createOrReplaceTempView("movie_keyword")
 
-    // Complete original query with ALL join conditions and filters
     val query = """
       SELECT COUNT(*),
              SUM(ci.role_id * mi.info_type_id),
@@ -134,7 +171,7 @@ class IMDBFlakyBugSuite extends QueryTest with SharedSparkSession {
     // scalastyle:off println
     withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
       val df = sql(query)
-      println("=== 12-TABLE IMDB FLAKY BUG TEST ===")
+      println("=== INDEPENDENT PRODUCTS - FLAKY BUG TEST ===")
       println("P1 = SUM(ci.role_id * mi.info_type_id)")
       println("P2 = SUM(mc.company_type_id * t.kind_id)")
       val baseline = df.collect()

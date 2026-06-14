@@ -31,12 +31,32 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DecimalType.DoubleDecimal
 
-object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
+object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
+  with PredicateHelper with JoinSelectionHelper {
   // Set to true to enable debug logging for the GroupAggJoin optimization
-  val DEBUG_LOGGING = true
+  val DEBUG_LOGGING = false
 
   private def debugLog(msg: => String): Unit = {
     if (DEBUG_LOGGING) logWarning(msg)
+  }
+
+  /**
+   * Cost gate for the count-join rewrite. Returns true when vanilla Spark would broadcast
+   * every base relation except the single largest - a broadcast-friendly star schema where
+   * the baseline is already near-optimal and the (interpreted, codegen-disabled) count-join
+   * only adds per-row cost with no reduction benefit. In that regime the rewrite should not
+   * fire. Conservative: with no usable size stats, sizeInBytes defaults are large so the
+   * gate does not trigger and the rewrite proceeds as before.
+   */
+  private def baselineBroadcastsAllButLargest(items: Seq[LogicalPlan]): Boolean = {
+    if (!conf.yannakakisCostGateEnabled) {
+      false
+    } else if (items.size <= 1) {
+      true
+    } else {
+      val bySize = items.sortBy(_.stats.sizeInBytes)
+      bySize.dropRight(1).forall(p => canBroadcastBySize(p, conf))
+    }
   }
 
   /**
@@ -976,11 +996,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
    * by new references.
    * */
   def rewritePlan(agg: Aggregate, unnamedGroupingExpressions: Seq[Expression],
-                  resultExpressions: Seq[NamedExpression], projectList: Seq[NamedExpression],
+                  origResultExpressions: Seq[NamedExpression],
+                  projectList: Seq[NamedExpression],
                   join: Join, keyRefs: Seq[Seq[Expression]],
                   uniqueConstraints: Seq[Seq[Expression]]) : LogicalPlan = {
     val startTime = System.nanoTime()
     debugLog("applying rewriting to join: " + agg)
+    // Desugar FILTER (WHERE ...) aggregates into CASE inputs up-front (whitelisted,
+    // NULL-ignoring functions only) so all downstream logic sees plain aggregates.
+    // Bail-outs below return the original `agg`, so this is observable only when the
+    // rewrite actually applies.
+    val resultExpressions = desugarFilteredAggregates(origResultExpressions)
     // Extract the join items (including any filters, etc.)
     val (items, conditions) = extractInnerJoins(join)
 
@@ -1103,6 +1129,26 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     debugLog("aggregate exprs with aliases replaced: " + aggregateExpressionsWithAliasesReplaced)
     debugLog("result exprs with aliases replaced: " + resultExpressionsWithAliasesReplaced)
 
+    // FILTER aggregates that survived desugaring belong to functions that do not ignore
+    // NULL inputs (first/last/UDAFs) - those cannot be rewritten safely.
+    val hasFilteredAggregate = resultExpressions.exists(_.exists {
+      case ae: AggregateExpression => ae.filter.isDefined
+      case _ => false
+    })
+    if (hasFilteredAggregate) {
+      debugLog("query contains unsupported FILTER aggregates - not applicable")
+      return agg
+    }
+    // DISTINCT aggregates cannot be decomposed via count multiplication (the duplicates
+    // introduced by the join are exactly what DISTINCT removes). They are
+    // duplicate-insensitive, so guarded queries whose aggregates are ALL
+    // duplicate-insensitive take the pure-semijoin (0MA) path below; any other
+    // distinct-containing query bails out at its branch.
+    val hasDistinctAggregate = resultExpressions.exists(_.exists {
+      case ae: AggregateExpression => ae.isDistinct
+      case _ => false
+    })
+
     // 0MA queries can be evaluated purely by bottom-up semi joins
     // Currently, they are limited to Min and Max queries
     // For all aggregates (0MA or counting-based), check if there are no references to attributes
@@ -1110,7 +1156,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
     // TODO remove duplicated code. Use enum for representing query types?
     val zeroMAAggregates = resultExpressions
       .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
-      .filter(agg => is0MA(agg))
+      .filter(agg => isDuplicateInsensitive(agg))
     val percentileAggregates = resultExpressions
       .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
       .filter(agg => isPercentile(agg))
@@ -1153,7 +1199,46 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           debugLog("not guarded! there is no node containing all agg and group attributes")
           debugLog("time difference: " + (System.nanoTime() - startTime))
 
-          val nodeContainingGroupAttributes = jointree.findNodeContainingAttributes(groupAttributes)
+          // Non-guarded DUPLICATE-INSENSITIVE aggregates (DISTINCT count/sum/avg, collect_set,
+          // approx_count_distinct, bit_and/bit_or): count multiplication is invalid, but a
+          // single bottom-up carry-reduced join is correct - carry the group attrs and the
+          // aggregate argument(s) to a common node by inner-joining the connecting subtrees
+          // (semijoin-reducing the rest), then apply the ORIGINAL aggregate. No count
+          // multiplication. Pure min/max keep the existing path below.
+          val allDuplicateInsensitive = aggregateExpressions.nonEmpty &&
+            aggregateExpressions.forall(ae => isDuplicateInsensitive(ae))
+          val hasNonMinMaxDupInsensitive = aggregateExpressions.exists {
+            case AggregateExpression(_: Min, _, _, _, _) => false
+            case AggregateExpression(_: Max, _, _, _, _) => false
+            case ae => isDuplicateInsensitive(ae)
+          }
+          if (allDuplicateInsensitive && hasNonMinMaxDupInsensitive) {
+            if (hg.crossRelationFilters.isEmpty && conf.yannakakisDistinctEnabled) {
+              val needed = groupAttributes ++ aggregateAttributes
+              val distinctRoot =
+                Option(jointree.findNodeContainingAttributesEquiv(aggregateAttributes))
+                  .orElse(Option(jointree.findNodeContainingAttributesEquiv(groupAttributes)))
+                  .map(_.reroot)
+                  .getOrElse(jointree)
+              val reducedJoin = distinctRoot.buildBottomUpDistinctJoin(needed, isTop = true)
+              val newAgg = Aggregate(groupingExpressions, resultExpressions, reducedJoin)
+              logWarning("new aggregate (distinct-reduced): " + newAgg)
+              debugLog("time difference: " + (System.nanoTime() - startTime))
+              return newAgg
+            }
+            // cross-relation filters or disabled: not supported.
+            debugLog("duplicate-insensitive non-guarded aggregates not supported here")
+            return agg
+          }
+          if (hasDistinctAggregate) {
+            // DISTINCT mixed with additive (non-duplicate-insensitive) aggregates: the
+            // additive part needs count multiplication, the distinct part forbids it.
+            debugLog("DISTINCT mixed with additive aggregates - not supported")
+            return agg
+          }
+
+          val nodeContainingGroupAttributes =
+            jointree.findNodeContainingAttributesEquiv(groupAttributes)
           var root = jointree
 
           val unguardedAggAttributes = aggregateExpressionsWithAliasesReplaced.map(expr => {
@@ -1181,6 +1266,16 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
               debugLog("unguarded. plan is not changed")
               return agg
             }
+          }
+
+          // A cross-relation filter is folded into a CountJoin condition. When a stream
+          // row's matches all fail it, the non-grouping count-join still emits a phantom
+          // count-0 row (and grouping leaves a spurious group), so a row/group that should
+          // be eliminated survives. Keep the original plan, mirroring the 0MA/distinct gates.
+          if (hg.crossRelationFilters.nonEmpty) {
+            debugLog("cross-relation filters on the count-join path are not supported " +
+              "(phantom count-0 / spurious groups) - keeping original plan")
+            return agg
           }
 
           // Phase 1: Extract and analyze deferred computations using unified framework
@@ -1235,8 +1330,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           val filterComputations = deferredComputations.filter(
             _.computationType == CrossRelationFilter)
 
-          // Run comprehensive multi-count analysis
-          if (productComputations.size >= 2) {
+          // Run comprehensive multi-count analysis. Its results feed only debugLog, so skip
+          // the whole (non-trivial) computation when debug logging is off.
+          if (DEBUG_LOGGING && productComputations.size >= 2) {
             val analysisReport = analyzeMultiCountStrategy(productComputations)
             debugLog("Multi-count optimization analysis:\n" + analysisReport)
 
@@ -1292,7 +1388,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           //
           // The fundamental issue is that count propagation is affected by ALL
           // product groupings, not just products that share attributes.
-          // Even independent products affect each other's counts.
+          // Even independent products affect each other's counts because:
+          // - When P1 computes, its attrs are added to grouping
+          // - This grouping affects how counts are aggregated
+          // - When P2 computes, it sees counts grouped by P1's attrs (wrong!)
+          //
+          // SOLUTION: Defer ALL products when there are 2+, unless we implement
+          // per-product count columns (which would be a larger change).
           val conflictingProductAttrs =
             if (productComputations.size >= 2) {
               // ALL products are conflicting when there are 2+ products
@@ -1351,16 +1453,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                   debugLog("resultAtt: " + resultAtt)
                   ae.aggregateFunction match {
                     case a: Count =>
-                      // TODO temp change
-//                      if (lastSumMap.contains(resultAtt)) {
-//                        val lastSumAtt = lastSumMap(resultAtt)
-//                        Sum(lastSumAtt).toAggregateExpression()
-//                      }
-//                      else {
-                        Sum(Multiply(
-                          a.children.head, Cast(countingAttribute, a.children.head.dataType)))
-                          .toAggregateExpression()
-//                      }
+                      // count(x) adds the row's count when x is non-NULL and skips the
+                      // row otherwise; the old Multiply(children.head, count) form was
+                      // only correct for count(1)-style children
+                      val nullableInputs = a.children.filter(_.nullable)
+                      val countInput: Expression = if (nullableInputs.isEmpty) {
+                        countingAttribute
+                      } else {
+                        If(nullableInputs.map(IsNull(_): Expression).reduce(Or),
+                          Literal(0L, LongType), countingAttribute)
+                      }
+                      Sum(countInput).toAggregateExpression()
                     case _ =>
                       // The final aggregation buffer's attributes will be
                       // `finalAggregationAttributes`,
@@ -1425,9 +1528,26 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           val allOutputs = joinsWithWindowCounts.output ++ groupAliasProjections
           val prunedOutput = allOutputs.filter(attr => neededAttrs.contains(attr))
 
+          // When piecewise-guardedness was established via join equivalences, the final
+          // aggregate may reference attributes (e.g. l_orderkey) that the rewritten join
+          // only provides through an equivalent attribute (e.g. o_orderkey). Re-expose
+          // them under their original ExprIds.
+          val presentIds = prunedOutput.map(_.exprId).toSet
+          val equivalenceAliases = neededAttrs.toSeq
+            .filterNot(att => presentIds.contains(att.exprId))
+            .flatMap(att => hg.getAttributeToVertex.get(att.exprId).flatMap(v =>
+              joinsWithWindowCounts.output.find(out =>
+                hg.getAttributeToVertex.get(out.exprId).contains(v))
+                .map(out => Alias(out, att.name)(exprId = att.exprId))))
+
+          if (baselineBroadcastsAllButLargest(items)) {
+            debugLog("cost gate: baseline broadcasts all but the largest relation - " +
+              "keeping original plan (count-join would only add cost)")
+            return agg
+          }
           val newAgg = Aggregate(groupingExpressions,
             rewrittenResultExpressions,
-            Project(prunedOutput, joinsWithWindowCounts))
+            Project(prunedOutput ++ equivalenceAliases, joinsWithWindowCounts))
           val queryClass = if (piecewiseGuarded) "piecewise-guarded" else "unguarded"
           logWarning(f"new aggregate ($queryClass): " + newAgg)
           debugLog("time difference: " + (System.nanoTime() - startTime))
@@ -1442,7 +1562,15 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
             && percentileAggregates.isEmpty
             && sumAggregates.isEmpty
             && averageAggregates.isEmpty) {
-            // If the query is a 0MA query, only perform bottom-up semijoins
+            // If the query is a 0MA query (all aggregates duplicate-insensitive:
+            // min/max and DISTINCT count/sum/avg), only perform bottom-up semijoins
+            if (hg.crossRelationFilters.nonEmpty) {
+              // buildBottomUpJoins applies only the equi-join conditions; a non-equi
+              // predicate spanning relations would be silently dropped, changing the
+              // set of participating guard tuples.
+              debugLog("0MA query with cross-relation filters - not applicable")
+              return agg
+            }
             val yannakakisJoins = root.buildBottomUpJoins
 
             val newAgg = Aggregate(groupingExpressions, resultExpressions,
@@ -1453,6 +1581,18 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
           }
           else {
             // Guarded but not 0MA
+            if (hasDistinctAggregate) {
+              // Mixed DISTINCT + plain aggregates: the plain part needs counting, the
+              // distinct part must not be count-multiplied. Not supported (phase 2).
+              debugLog("mixed DISTINCT and plain aggregates - not applicable")
+              return agg
+            }
+            if (hg.crossRelationFilters.nonEmpty) {
+              // Same phantom count-0 / spurious-group hazard as the unguarded path above.
+              debugLog("cross-relation filters on the guarded count-join path are not " +
+                "supported (phantom count-0 / spurious groups) - keeping original plan")
+              return agg
+            }
             // Detect product aggregates for one-winner conflict detection
             val guardedDeferredComputations = extractDeferredComputations(
               aggregateExpressions, hg.crossRelationFilters)
@@ -1486,8 +1626,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                   case aggExpr @ AggregateExpression(aggFn, mode, isDistinct, filter, resultId) =>
                     aggFn match {
                       case a: Count =>
+                        // count must skip rows whose input is NULL: count(x) with
+                        // nullable x, and the CASE-desugared count(...) FILTER form
+                        val nullableInputs = a.children.filter(_.nullable)
+                        val countInput: Expression = if (nullableInputs.isEmpty) {
+                          countingAttribute
+                        } else {
+                          If(nullableInputs.map(IsNull(_): Expression).reduce(Or),
+                            Literal(0L, LongType), countingAttribute)
+                        }
                         AggregateExpression(
-                        Sum(countingAttribute), mode, isDistinct, filter, resultId)
+                        Sum(countInput), mode, isDistinct, filter, resultId)
 
                       case Percentile(c, percExp, freqExp, mutableAggBufferOffset,
                       inputAggBufferOffset, reverse) =>
@@ -1496,18 +1645,18 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                           Percentile(c, percExp, freqExpr, mutableAggBufferOffset,
                             inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
 
-                      case Average(_, _) =>
-                        val aggAttribute = aggFn.references.head
+                      case Average(avgInput, _) =>
+                        // Multiply the whole input by the count exactly once. A
+                        // per-attribute multiplication would corrupt CASE predicates
+                        // and square the count for products of two attributes.
                         val sumAggregateExpr = aggFn.transformUp {
                           case a@Average(c, evalMode) =>
-                            Sum(c.transformUp {
-                              case att: Attribute => Multiply(att,
-                                Cast(countingAttribute, att.dataType), evalMode)
-                            }, evalMode)
+                            Sum(Multiply(c, Cast(countingAttribute, c.dataType), evalMode),
+                              evalMode)
                         }.asInstanceOf[AggregateFunction].toAggregateExpression()
 
                         val countAggregateExpr = Sum(
-                          If(aggAttribute.isNull,
+                          If(avgInput.isNull,
                             Literal(0L, LongType), countingAttribute))
                           .toAggregateExpression()
                         Cast(
@@ -1521,17 +1670,22 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
                           }, aggExpr.dataType)
 
                       case Sum(_, _) =>
+                        // Multiply the whole input by the count exactly once (see the
+                        // Average case above).
                         AggregateExpression(aggFn.transformUp {
                           case s @ Sum(c, evalMode) =>
-                            Sum(c.transformUp {
-                              case att: Attribute => Multiply(att,
-                                Cast(countingAttribute, att.dataType), evalMode)
-                            }, evalMode)
+                            Sum(Multiply(c, Cast(countingAttribute, c.dataType), evalMode),
+                              evalMode)
                         }.asInstanceOf[AggregateFunction], mode, isDistinct, filter, resultId)
                     }
                 }.asInstanceOf[NamedExpression]
             }
 
+            if (baselineBroadcastsAllButLargest(items)) {
+              debugLog("cost gate: baseline broadcasts all but the largest relation - " +
+                "keeping original plan (count-join would only add cost)")
+              return agg
+            }
             val newAgg = Aggregate(groupingExpressions,
               rewrittenResultExpressions, yannakakisJoins)
 
@@ -1557,24 +1711,50 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
         join@Join(_, _, Inner, _, _))) =>
-          rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-            join, keyRefs = Seq(), uniqueConstraints = Seq())
+          validateOrFallback(agg,
+            rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+              join, keyRefs = Seq(), uniqueConstraints = Seq()))
           // FK/PK optimizations (to be removed at some point)
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
         FKHint(join@Join(_, _, Inner, _, _), keyRefs, uniqueConstraints))) =>
-          rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-            join, keyRefs, uniqueConstraints)
+          validateOrFallback(agg,
+            rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+              join, keyRefs, uniqueConstraints))
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
         FKHint(
         project2@Project(projectList2,
         join@Join(_, _, Inner, _, _)), keyRefs, uniqueConstraints))) =>
-          rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-            join, keyRefs, uniqueConstraints)
+          validateOrFallback(agg,
+            rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+              join, keyRefs, uniqueConstraints))
         case agg@Aggregate(_, _, _) =>
           debugLog("not applicable to aggregate: " + agg)
           agg
+      }
+    }
+  }
+
+  /**
+   * The rewrite assumes every attribute referenced by the new aggregate is still produced
+   * by the rewritten join tree. If that assumption is violated (e.g. an attribute was
+   * consumed by a count join without being carried), the plan would fail at physical
+   * planning with "Couldn't find <attr>". Fall back to the original plan instead.
+   */
+  private def validateOrFallback(original: Aggregate, rewritten: LogicalPlan): LogicalPlan = {
+    if (rewritten eq original) {
+      original
+    } else {
+      val invalidNode = rewritten.collectFirst {
+        case p if p.missingInput.nonEmpty => p
+      }
+      invalidNode match {
+        case Some(p) =>
+          logWarning("yannakakis rewrite dropped attributes " + p.missingInput +
+            " required by " + p.nodeName + "; falling back to the original plan")
+          original
+        case None => rewritten
       }
     }
   }
@@ -1591,12 +1771,76 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case _ => false
     }
   }
+
+  /**
+   * Duplicate-insensitive aggregates produce identical results over the semijoin-reduced
+   * join: the duplicates introduced by join fan-out are exactly what they ignore. This
+   * covers min/max (the 0MA class) and DISTINCT count/sum/average. Queries whose
+   * aggregates are all duplicate-insensitive can use the pure-semijoin path and never
+   * need count multiplication.
+   */
+  def isDuplicateInsensitive(expr: Expression): Boolean = {
+    expr match {
+      case Alias(child, _) => isDuplicateInsensitive(child)
+      case ToPrettyString(child, _) => isDuplicateInsensitive(child)
+      case AggregateExpression(aggFn, _, isDistinct, _, _) => aggFn match {
+        case Min(_) | Max(_) => true
+        case Count(_) => isDistinct
+        case Sum(_, _) => isDistinct
+        case Average(_, _) => isDistinct
+        // Inherently duplicate-insensitive regardless of DISTINCT: set collection,
+        // distinct-count sketch, and idempotent bitwise reductions. (collect_list and
+        // bit_xor are duplicate-SENSITIVE and intentionally excluded.)
+        case _: CollectSet | _: HyperLogLogPlusPlus | _: BitAndAgg | _: BitOrAgg => true
+        case _ => false
+      }
+      case _: Attribute => true
+      case _ => false
+    }
+  }
+
+  /**
+   * Desugars FILTER-clause aggregates into equivalent CASE WHEN inputs so the rest of the
+   * rule never needs to reason about filters:
+   *   sum(x) FILTER (WHERE p)    => sum(CASE WHEN p THEN x END)
+   *   count(xs) FILTER (WHERE p) => count(CASE WHEN p AND xs not null THEN 1 END)
+   * Only NULL-ignoring aggregate functions are desugared (the 1-valued CASE form for
+   * count keeps the count rewrites, which consume the count input, correct on all paths).
+   * Filtered aggregates of any other function keep their filter and are rejected by the
+   * bail-out in rewritePlan.
+   */
+  def desugarFilteredAggregates(
+      resultExpressions: Seq[NamedExpression]): Seq[NamedExpression] = {
+    def filteredInput(pred: Expression, value: Expression): Expression =
+      CaseWhen(Seq((pred, value)), None)
+    resultExpressions.map(_.transformDown {
+      case ae @ AggregateExpression(aggFn, _, false, Some(pred), _) =>
+        aggFn match {
+          case Sum(child, evalMode) =>
+            ae.copy(aggregateFunction = Sum(filteredInput(pred, child), evalMode),
+              filter = None)
+          case Min(child) =>
+            ae.copy(aggregateFunction = Min(filteredInput(pred, child)), filter = None)
+          case Max(child) =>
+            ae.copy(aggregateFunction = Max(filteredInput(pred, child)), filter = None)
+          case Average(child, evalMode) =>
+            ae.copy(aggregateFunction = Average(filteredInput(pred, child), evalMode),
+              filter = None)
+          case cnt: Count =>
+            val notNullPred = (pred +: cnt.children.filter(_.nullable)
+              .map(IsNotNull(_): Expression)).reduce(And)
+            ae.copy(aggregateFunction = Count(filteredInput(notNullPred, Literal(1L))),
+              filter = None)
+          case _ => ae
+        }
+    }.asInstanceOf[NamedExpression])
+  }
   def isCounting(expr: Expression): Boolean = {
     expr match {
       case Alias(child, name) => isCounting(child)
       case ToPrettyString(child, tz) => isCounting(child)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
-        case Count(s) => true
+        case Count(s) => !isDistinct
         case _ => false
       }
       case _ => false
@@ -1612,7 +1856,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case Add(l, r, _) => isPercentile(l) || isPercentile(r)
       case Subtract(l, r, _) => isPercentile(l) || isPercentile(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
-        case Percentile(_, _, _, _, _, _) => true
+        case Percentile(_, _, _, _, _, _) => !isDistinct
         case _ => false
       }
       case _ => false
@@ -1628,7 +1872,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case Add(l, r, _ ) => isSum(l) || isSum(r)
       case Subtract(l, r, _) => isSum(l) || isSum(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
-        case Sum(_, _) => true
+        case Sum(_, _) => !isDistinct
         case _ => false
       }
       case _ => false
@@ -1644,7 +1888,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case Add(l, r, _) => isAverage(l) || isAverage(r)
       case Subtract(l, r, _) => isAverage(l) || isAverage(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
-        case Average(_, _) => true
+        case Average(_, _) => !isDistinct
         case _ => false
       }
       case _ => false
@@ -1680,6 +1924,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan] with PredicateHelper {
       case Project(projectList, j@Join(_, _, _: InnerLike, Some(cond), _))
         if projectList.forall(_.isInstanceOf[Attribute]) =>
         extractInnerJoins(j)
+      // Anything that is not an inner-join (or attribute-only projection over one) is
+      // intentionally treated as an opaque leaf relation. In particular a LeftSemi/LeftAnti
+      // join, or a not-yet-decorrelated IN/EXISTS Filter subquery (TPC-H Q16's
+      // `ps_suppkey NOT IN (...)`), is kept whole as this leaf's planReference - the rewrite
+      // never reaches inside it, which preserves its semantics.
       case _ =>
         (Seq(plan), ExpressionSet())
     }
@@ -1714,12 +1963,22 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) logWarning(msg)
   }
 
+  // HTNode and HGEdge use identity hashCodes, so Set iteration order varies between JVM
+  // runs, which makes join order (and thus plans and results) nondeterministic. Always
+  // iterate children in a stable order based on the edge names (E1, E2, ...).
+  private def orderedChildren: Seq[HTNode] = {
+    children.toSeq.sortBy(c => {
+      val name = c.edges.map(_.name).min
+      (name.length, name)
+    })
+  }
+
   def buildBottomUpJoins: LogicalPlan = {
     val edge = edges.head
     val scanPlan = edge.planReference
     val vertices = edge.vertices
     var prevJoin: LogicalPlan = scanPlan
-    for (c <- children) {
+    for (c <- orderedChildren) {
       val childEdge = c.edges.head
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
@@ -1732,6 +1991,60 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       prevJoin = semijoin
     }
     prevJoin
+  }
+
+  /** All attributes produced by this node's subtree. */
+  def subtreeOutputSet: AttributeSet =
+    children.foldLeft(edges.map(_.planReference.outputSet).reduce(_ ++ _))(
+      (acc, c) => acc ++ c.subtreeOutputSet)
+
+  /**
+   * Single bottom-up pass for non-guarded duplicate-insensitive aggregates
+   * (DISTINCT count/sum/avg, min/max). The attributes in `needed` (the group attrs and the
+   * distinct/aggregate arguments) are carried to this node by INNER-joining every child
+   * subtree that contains one of them, while subtrees that contain none are LEFT-SEMI joined
+   * (pure dangling-tuple reduction). After the carry, the result is de-duplicated on the
+   * carried attributes plus this node's own join keys: because the aggregate is
+   * duplicate-insensitive, this DISTINCT is lossless and bounds intermediate size to the
+   * distinct (needed, join-key) projection. No count multiplication is performed - the
+   * original aggregate runs over the carried (group, distinct-arg) pairs at the top.
+   */
+  def buildBottomUpDistinctJoin(needed: AttributeSet, isTop: Boolean = false): LogicalPlan = {
+    val edge = edges.head
+    val vertices = edge.vertices
+    val nodeKeyAttrs = AttributeSet(vertices.map(v => edge.vertexToAttribute(v)))
+    var plan: LogicalPlan = edge.planReference
+    var carried = false
+    for (c <- orderedChildren) {
+      val childEdge = c.edges.head
+      val overlappingVertices = vertices intersect childEdge.vertices
+      val joinConditions = overlappingVertices
+        .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
+        .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
+        .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
+      if ((needed intersect c.subtreeOutputSet).nonEmpty) {
+        // child carries a needed attribute: inner-join to bring it up
+        plan = Join(plan, c.buildBottomUpDistinctJoin(needed),
+          Inner, Option(joinConditions), JoinHint(Option.empty, Option.empty))
+        carried = true
+      } else {
+        // off-path subtree: reduce dangling tuples only
+        plan = Join(plan, c.buildBottomUpJoins,
+          LeftSemi, Option(joinConditions), JoinHint(Option.empty, Option.empty))
+      }
+    }
+    // De-duplicate on the needed attributes plus this node's join keys (so the parent can
+    // join), bounding intermediate size to the distinct projection. Lossless for
+    // duplicate-insensitive aggregates. Skipped at the top node: the caller's final
+    // Aggregate (a duplicate-insensitive count/sum/avg DISTINCT grouped by G) already
+    // dedups the same columns, so the top DISTINCT would be a redundant extra shuffle.
+    if (carried && !isTop) {
+      val keep = plan.output.filter(a => needed.contains(a) || nodeKeyAttrs.contains(a))
+      if (keep.nonEmpty) {
+        plan = Aggregate(keep, keep, plan)
+      }
+    }
+    plan
   }
 
   // scalastyle:off argcount
@@ -1801,7 +2114,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     var prevSemijoined = false
 
     var prevChildEdge: HGEdge = edge
-    for (c <- children) {
+    for (c <- orderedChildren) {
       val childEdge = c.edges.head
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
@@ -2084,16 +2397,19 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // Use isPendingProduct checked earlier (before RIGHT modified the set)
               dbg(s"LEFT propagation isPending=$isPendingProduct for $lastSumAtt")
 
-              // For pending products: skip multiplication if right-side is already accounted
-              // The pendingProductAccountedAttrs tracks which tables' counts have been
-              // incorporated. If right side has NEW (unaccounted) tables, multiply by them.
-              val accountedAttrs = pendingProductAccountedAttrs.get(agg.resultAttribute)
-              val rightAlreadyAccounted = accountedAttrs.exists { accounted =>
-                rightPlan.outputSet.subsetOf(accounted)
+              // For pending products: skip multiplication if right subtree contains
+              // any of the product's original attributes. This means the right subtree
+              // is "relevant" to this product - its rows contribute to the product's SUM.
+              // We use exprId matching which is stable (unlike outputSet comparison).
+              val productOriginalAttrs = pendingProductOriginalAttrs.get(agg.resultAttribute)
+              val rightContainsProductAttr = productOriginalAttrs.exists { origAttrs =>
+                val productExprIds = origAttrs.map(_.exprId).toSet
+                rightPlan.outputSet.exists(a => productExprIds.contains(a.exprId))
               }
-              dbg(s"  accountedAttrs=$accountedAttrs rightAlreadyAccounted=$rightAlreadyAccounted")
+              dbg(s"  productOriginalAttrs=$productOriginalAttrs " +
+                s"rightContainsProductAttr=$rightContainsProductAttr")
 
-              val skipMultiplication = isPendingProduct && rightAlreadyAccounted
+              val skipMultiplication = isPendingProduct && rightContainsProductAttr
               if (skipMultiplication) {
                 // Skip: right-side tables are already in the pending product's count
                 dbg(s"LEFT propagation: SKIPPING (right already accounted) $lastSumAtt")
@@ -2116,15 +2432,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 dbg(s"LEFT propagation: $lastSumAtt * count -> $newSum")
                 lastSumMap.put(agg.resultAttribute, newSum.toAttribute)
                 dbg(s"  updated lastSumMap -> ${newSum.toAttribute}")
-
-                // Update accounted attrs to include the right side we just multiplied by
-                if (isPendingProduct) {
-                  accountedAttrs.foreach { accounted =>
-                    val newAccounted = accounted ++ rightPlan.outputSet
-                    pendingProductAccountedAttrs.put(agg.resultAttribute, newAccounted)
-                    dbg(s"  updated accountedAttrs to include rightPlan")
-                  }
-                }
+                // Note: We no longer update pendingProductAccountedAttrs here.
+                // The exprId-based relevance check doesn't need tracking of accounted tables.
               }
             }
           }
@@ -2375,20 +2684,15 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
                 lastSumMap.put(agg.resultAttribute, productAlias.toAttribute)
                 pendingProductSumSet.add(agg.resultAttribute)
-                // Track which tables' counts have been accounted for in this pending product.
-                // This is the union of left and right output sets at the point of computation.
-                // When the product flows to higher joins, we only multiply by counts from
-                // NEW tables (tables not in this set).
-                val accountedAttrs = AttributeSet(leftPlan.outputSet ++ rightPlan.outputSet)
-                pendingProductAccountedAttrs.put(agg.resultAttribute, accountedAttrs)
-                // Track this product's original attribute references for relevance check
+                // Track this product's original attribute references for relevance check.
+                // Note: We no longer track accountedAttrs - the exprId-based relevance check
+                // uses the product's original attrs to determine if right subtree is relevant.
                 val productOriginalRefs = agg.references.filter(a =>
                   !a.name.startsWith("c#") && a.name != "c")
                 val origRefSet = AttributeSet(productOriginalRefs)
                 pendingProductOriginalAttrs.put(agg.resultAttribute, origRefSet)
                 dbg(s"Added pending product ($numProductAttrs attrs): $productExpr")
                 dbg(s"  productAlias=${productAlias.toAttribute}")
-                dbg(s"  accountedAttrs=${accountedAttrs.map(_.name)}")
                 dbg(s"  originalRefs=${productOriginalRefs.map(_.name)}")
               } else {
                 // Defer to final aggregate: uncovered right attr (right attr not in grouping)
@@ -2549,8 +2853,35 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     if (aggAttributes subsetOf nodeAttributes) {
       this
     } else {
-      for (c <- children) {
+      for (c <- orderedChildren) {
         val node = c.findNodeContainingAttributes(aggAttributes)
+        if (node != null) {
+          return node
+        }
+      }
+      null
+    }
+  }
+
+  /**
+   * Like findNodeContainingAttributes, but an attribute also counts as contained when the
+   * node has a join-equivalent attribute (same hypergraph vertex). E.g. for TPC-H Q3 the
+   * orders relation contains l_orderkey via the join equivalence l_orderkey = o_orderkey.
+   */
+  def findNodeContainingAttributesEquiv(aggAttributes: AttributeSet): HTNode = {
+    val nodeAttributes = edges
+      .map(e => e.planReference.outputSet)
+      .reduce((e1, e2) => e1 ++ e2)
+    val attributeToVertex = edges.head.attributeToVertex
+    val nodeVertices = edges.flatMap(e => e.vertices)
+    val covered = aggAttributes.forall(att =>
+      nodeAttributes.contains(att) ||
+        attributeToVertex.get(att.exprId).exists(v => nodeVertices.contains(v)))
+    if (covered) {
+      this
+    } else {
+      for (c <- orderedChildren) {
+        val node = c.findNodeContainingAttributesEquiv(aggAttributes)
         if (node != null) {
           return node
         }
@@ -2581,6 +2912,8 @@ class Hypergraph (private val items: Seq[LogicalPlan],
   private var edges: mutable.Set[HGEdge] = mutable.Set.empty
   private var vertexToAttributes: mutable.Map[String, Set[Attribute]] = mutable.Map.empty
   private var attributeToVertex: mutable.Map[ExprId, String] = mutable.Map.empty
+
+  def getAttributeToVertex: mutable.Map[ExprId, String] = attributeToVertex
 
   private var equivalenceClasses: Set[Set[Attribute]] = Set.empty
 
@@ -2681,9 +3014,15 @@ class Hypergraph (private val items: Seq[LogicalPlan],
       gyoEdges.add(edge.copy())
     }
 
+    // Iterate edges in a stable order (E1, E2, ...): HGEdge uses identity hashCodes, so
+    // raw Set iteration order varies between JVM runs and would make the join tree shape
+    // and root nondeterministic.
+    def ordered(es: mutable.Set[HGEdge]): Seq[HGEdge] =
+      es.toSeq.sortBy(e => (e.name.length, e.name))
+
     var progress = true
     while (gyoEdges.size > 1 && progress) {
-      for (e <- gyoEdges) {
+      for (e <- ordered(gyoEdges)) {
         // logWarning("gyo edge: " + e)
         // Remove vertices that only occur in this edge
         val allOtherVertices = (gyoEdges - e).map(o => o.vertices)
@@ -2699,7 +3038,7 @@ class Hypergraph (private val items: Seq[LogicalPlan],
       }
 
       var nodeAdded = false
-      for (e <- gyoEdges) {
+      for (e <- ordered(gyoEdges) if gyoEdges.contains(e)) {
 //        logWarning("gyo edge: " + e)
         val supersets = gyoEdges.filter(o => o containsNotEqual e)
 //        logWarning("supersets: " + supersets)

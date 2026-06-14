@@ -2627,6 +2627,33 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val YANNAKAKIS_DISTINCT_ENABLED =
+    buildConf("spark.sql.yannakakis.distinctEnabled")
+      .doc("Optimize non-guarded duplicate-insensitive (DISTINCT count/sum/avg) aggregates " +
+        "via a single bottom-up carry-reduced join instead of falling back to the original plan")
+      .version("2.3.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val YANNAKAKIS_COST_GATE_ENABLED =
+    buildConf("spark.sql.yannakakis.costGateEnabled")
+      .doc("Skip the count-join rewrite when vanilla Spark would broadcast every base " +
+        "relation except the largest (a broadcast-friendly star schema), where the " +
+        "interpreted count-join only adds cost with no reduction benefit")
+      .version("2.3.0")
+      .booleanConf
+      .createWithDefault(true)
+
+  val YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR =
+    buildConf("spark.sql.yannakakis.forcePhysicalCountJoinOperator")
+      .doc("Test-only: force the physical count-join operator (\"broadcast\", \"shuffle\" or " +
+        "\"sortMerge\") instead of letting the planner choose. The empty default uses the normal " +
+        "broadcast->shuffle->sortMerge selection. Needed because count joins otherwise plan as " +
+        "broadcast (or shuffle) at unit-test scale and the sort-merge path is never exercised.")
+      .version("2.3.0")
+      .stringConf
+      .createWithDefault("")
+
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
       .doc("Enables CBO for estimation of plan statistics when set true.")
@@ -4928,6 +4955,15 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def yannakakisDeferProductsEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_DEFER_PRODUCTS_ENABLED)
+
+  def yannakakisDistinctEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_DISTINCT_ENABLED)
+
+  def yannakakisCostGateEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_COST_GATE_ENABLED)
+
+  def yannakakisForcePhysicalCountJoinOperator: String =
+    getConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 
