@@ -60,6 +60,23 @@ class JOBBenchmarkSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  private def median(xs: Seq[Long]): Long = {
+    val s = xs.sorted
+    if (s.isEmpty) 0L else s(s.size / 2)
+  }
+
+  /**
+   * Turns a JOB query (`SELECT MIN(...) ... FROM ... WHERE ...`) into an ungrouped
+   * `SELECT count(*) ... FROM ... WHERE ...` over the same join graph. count(*) has no grouping
+   * and references no attribute, so the rewrite produces a chain of non-grouping inner count
+   * joins - exactly the path codegenCountInner handles - instead of the 0MA LeftSemi reduction.
+   */
+  private def toCountStar(sqlText: String): String = {
+    val lower = sqlText.toLowerCase(java.util.Locale.ROOT)
+    val fromIdx = lower.indexOf("from")
+    if (fromIdx < 0) sqlText else s"SELECT count(*) AS c ${sqlText.substring(fromIdx)}"
+  }
+
   test("JOB benchmark: yannakakis on vs off") {
     assume(new File(imdbDir).isDirectory, s"IMDB parquet dataset not present at $imdbDir")
     loadImdb()
@@ -102,6 +119,65 @@ class JOBBenchmarkSuite extends QueryTest with SharedSparkSession {
         }
         println(s"JOB-BENCH: $q | off=$offStr | on=$onStr | speedup=$speedup | " +
           s"applied=$applied | match=$matched")
+      }
+    }
+    // scalastyle:on println
+  }
+
+  test("JOB count(*) benchmark: count-join whole-stage codegen on vs off") {
+    assume(new File(imdbDir).isDirectory, s"IMDB parquet dataset not present at $imdbDir")
+    loadImdb()
+    // A spread of join sizes; count(*) over each routes through the non-grouping count-join.
+    val queries = Seq("1a", "6a", "8a", "17a", "26a")
+    val iters = 5
+    // Pin AQE off so the WholeStageCodegen `*(n)` markers are visible in the static plan and the
+    // codegen on/off comparison is not perturbed by adaptive replanning.
+    val aqeOff = Seq(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+    val offConf = aqeOff :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false")
+    val interpConf = aqeOff ++ yannakakisOn :+
+      (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false")
+    val codegenConf = aqeOff ++ yannakakisOn :+
+      (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
+    // scalastyle:off println
+    println("JOB-CG: query | off | on(interp) | on(codegen) | cg-marker | match")
+    for (q <- queries) {
+      val file = new File(s"$jobDir/$q.sql")
+      if (!file.exists()) {
+        println(s"JOB-CG: $q | (no sql file)")
+      } else {
+        val src = scala.io.Source.fromFile(file)
+        val raw = try src.mkString.trim.stripSuffix(";") finally src.close()
+        val cq = toCountStar(raw)
+        // Warm up once per variant (JIT / caches), results discarded.
+        Seq(offConf, interpConf, codegenConf).foreach { c =>
+          withSQLConf(c: _*) { try sql(cq).collect() catch { case _: Throwable => } }
+        }
+        val cgMarker = withSQLConf(codegenConf: _*) {
+          try {
+            sql(cq).queryExecution.executedPlan.toString.linesIterator
+              .exists(_.matches(".*\\*\\(\\d+\\).*HashCountJoin.*"))
+          } catch { case _: Throwable => false }
+        }
+        val offTs = scala.collection.mutable.ArrayBuffer[Long]()
+        val intTs = scala.collection.mutable.ArrayBuffer[Long]()
+        val cgTs = scala.collection.mutable.ArrayBuffer[Long]()
+        var offRows: Seq[Row] = null
+        var cgRows: Seq[Row] = null
+        // Alternate the three variants each iteration so drift hits them evenly.
+        for (_ <- 0 until iters) {
+          val (o, oMs) = withSQLConf(offConf: _*) { timeMs(sql(cq).collect().toSeq) }
+          val (i, iMs) = withSQLConf(interpConf: _*) { timeMs(sql(cq).collect().toSeq) }
+          val (c, cMs) = withSQLConf(codegenConf: _*) { timeMs(sql(cq).collect().toSeq) }
+          o.foreach { r => offTs += oMs; offRows = r }
+          i.foreach { _ => intTs += iMs }
+          c.foreach { r => cgTs += cMs; cgRows = r }
+        }
+        val matched = (offRows != null && cgRows != null &&
+          offRows.map(_.toString) == cgRows.map(_.toString))
+        println(s"JOB-CG: $q | off=${median(offTs.toSeq)}ms | " +
+          s"interp=${median(intTs.toSeq)}ms | codegen=${median(cgTs.toSeq)}ms | " +
+          s"cg-marker=$cgMarker | match=$matched")
+        assert(matched, s"count(*) codegen result must match vanilla for $q")
       }
     }
     // scalastyle:on println

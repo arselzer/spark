@@ -935,6 +935,33 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
   }
 
+  test("codegen: two count-joins on the same key fuse into one stage without colliding") {
+    // f joins d1 and d2 BOTH on k, so the two count-joins are co-partitioned on k - no exchange
+    // between them, so whole-stage codegen fuses them into one stage. Each count-join builds its
+    // hash relation from inputs[1]; without forcing the children to separate codegen stages (as
+    // CollapseCodegenStages does for ShuffledHashJoin) the two relations collide on that slot and
+    // the outer join reads the inner's build (wrong-width row / wrong count). d1 and d2 have
+    // DIFFERENT multiplicities so a collision changes the result: count = 1 * 2 * 3 = 6.
+    Seq(1).toDF("k").createOrReplaceTempView("ssk_f")
+    Seq(1, 1).toDF("k").createOrReplaceTempView("ssk_d1")
+    Seq(1, 1, 1).toDF("k").createOrReplaceTempView("ssk_d2")
+    val query = "select count(*) as c from ssk_f f, ssk_d1 d1, ssk_d2 d2 " +
+      "where f.k = d1.k and f.k = d2.k"
+    withSQLConf((yannakakisOn ++ Seq(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      val on = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        sql(query).collect().toSeq.map(_.toString)
+      }
+      val off = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+        sql(query).collect().toSeq.map(_.toString)
+      }
+      assert(on == off, s"codegen $on != interp $off")
+      assert(on == Seq("[6]"), s"expected count 6, got $on")
+    }
+    assertSameResults(query, "two count-joins on same key (shuffled, fused)")
+  }
+
   test("codegen: count-join with a unique build key (getValue branch) matches interpreted") {
     // Build (right) side keys are unique -> the broadcast relation reports keyIsUnique=true, so
     // codegen takes the getValue branch rather than the iterator branch.

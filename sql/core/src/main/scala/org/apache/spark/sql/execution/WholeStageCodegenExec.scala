@@ -34,7 +34,7 @@ import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
-import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, ShuffledHashJoinExec, SortMergeJoinExec}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, ShuffledHashCountJoinExec, ShuffledHashJoinExec, SortMergeCountJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.metric.SQLMetrics
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -940,6 +940,13 @@ case class CollapseCodegenStages(
           child => InputAdapter(insertWholeStageCodegen(child))))
       case j: ShuffledHashJoinExec =>
         // The children of ShuffledHashJoin should do codegen separately.
+        j.withNewChildren(j.children.map(
+          child => InputAdapter(insertWholeStageCodegen(child))))
+      case j @ (_: ShuffledHashCountJoinExec | _: SortMergeCountJoinExec) =>
+        // Like ShuffledHashJoin/SortMergeJoin, the children of a shuffled/sort-merge count join
+        // must codegen separately. Otherwise two stacked count joins both read their build
+        // relation from the shared inputs[1] slot and collide (the inner join's build and the
+        // outer join's build land at the same index), producing wrong-width row access / counts.
         j.withNewChildren(j.children.map(
           child => InputAdapter(insertWholeStageCodegen(child))))
       case p => p.withNewChildren(p.children.map(insertInputAdapter))
