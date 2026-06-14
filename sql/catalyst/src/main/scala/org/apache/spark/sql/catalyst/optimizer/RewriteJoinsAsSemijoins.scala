@@ -900,30 +900,49 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     else {
       plan.transformDownWithPruning(_.containsPattern(TreePattern.AGGREGATE), ruleId) {
         case agg@Aggregate(groupingExpressions, aggExpressions,
-        join@Join(_, _, Inner, _, _), _) => agg
-        case agg@Aggregate(groupingExpressions, aggExpressions,
-        filter@Filter(filterConds,
-        join@Join(_, _, Inner, _, _)), _) => agg
-        case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
-        join@Join(_, _, Inner, _, _)), _) =>
-          // Defense-in-depth: the rewrite explicitly falls back on shapes it cannot handle, but
-          // any unforeseen unhandled case (e.g. an aggregate function with no rewrite branch)
-          // must degrade to the original plan rather than fail the whole query.
-          try {
-            validateOrFallback(agg,
-              rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-                join, keyRefs = Seq(), uniqueConstraints = Seq()))
-          } catch {
-            case scala.util.control.NonFatal(e) =>
-              logWarning("yannakakis rewrite failed; falling back to the original plan: " +
-                e.getMessage)
-              agg
-          }
+        join@Join(_, _, _: InnerLike, _, _)), _) =>
+          // InnerLike also matches Cross: a cross join whose join predicates were normalised into
+          // its condition (or that has none) is semantically an inner join here.
+          rewriteOrFallback(agg, groupingExpressions, aggExpressions, projectList, join)
+        case agg@Aggregate(groupingExpressions, aggExpressions,
+        join@Join(_, _, _: InnerLike, _, _), _) =>
+          // No Project wrapper (e.g. column pruning removed a redundant one): the aggregate
+          // references the join columns directly, so pass an identity projectList. Note: a
+          // residual Filter ABOVE the join is intentionally NOT handled - by the time this rule
+          // runs, predicate pushdown has folded join predicates into the join condition and
+          // pushed single-relation filters below it, so folding a surviving Filter back into the
+          // join condition would risk dropping a single-relation predicate (the hypergraph only
+          // models equi-edges and multi-relation filters), a silent wrong result.
+          rewriteOrFallback(agg, groupingExpressions, aggExpressions, join.output, join)
         case agg@Aggregate(_, _, _, _) =>
           debugLog("not applicable to aggregate: " + agg)
           agg
       }
+    }
+  }
+
+  /**
+   * Runs the rewrite for one Aggregate-over-(inner-)join shape and degrades to the original plan
+   * on any failure. Defense-in-depth: the rewrite explicitly falls back on shapes it cannot
+   * handle, but any unforeseen unhandled case (e.g. an aggregate function with no rewrite branch)
+   * must not fail the whole query.
+   */
+  private def rewriteOrFallback(
+      agg: Aggregate,
+      groupingExpressions: Seq[Expression],
+      aggExpressions: Seq[NamedExpression],
+      projectList: Seq[NamedExpression],
+      join: Join): LogicalPlan = {
+    try {
+      validateOrFallback(agg,
+        rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+          join, keyRefs = Seq(), uniqueConstraints = Seq()))
+    } catch {
+      case scala.util.control.NonFatal(e) =>
+        logWarning("yannakakis rewrite failed; falling back to the original plan: " +
+          e.getMessage)
+        agg
     }
   }
 

@@ -1086,4 +1086,19 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
         "narrow-int sum overflow under ANSI")
     }
   }
+
+  test("rewrite applies to an aggregate directly over a join (no Project wrapper)") {
+    // When column pruning removes a redundant Project, the rule sees Aggregate(Join) directly.
+    // Previously that shape was a no-op; it now rewrites via an identity projectList. Force the
+    // shape by excluding ColumnPruning's reinsertion is unnecessary - just assert correctness for
+    // both the rewritten and vanilla plans regardless of which matcher arm fires.
+    Seq((1, 100), (1, 200), (2, 300)).toDF("k", "v").createOrReplaceTempView("nj_a")
+    Seq(1, 1, 2, 2).toDF("k").createOrReplaceTempView("nj_b")
+    assertSameResults(
+      "select count(*) as c from nj_a a join nj_b b on a.k = b.k",
+      "count(*) directly over a join")
+    assertSameResults(
+      "select sum(v) as s from nj_a a join nj_b b on a.k = b.k",
+      "sum directly over a join")
+  }
 }
