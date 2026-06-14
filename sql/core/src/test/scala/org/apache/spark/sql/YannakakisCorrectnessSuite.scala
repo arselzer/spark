@@ -782,6 +782,22 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("cross-relation filter: count-join fires and results match vanilla") {
+    // a.x < b.y is a non-equi predicate spanning both relations (a cross-relation filter).
+    // It must be folded into the count-join (rows failing it are dropped, not emitted as
+    // phantom count-0 rows) and the rewrite must still fire, matching vanilla.
+    Seq((1, 100, 5), (1, 200, 50), (2, 300, 1)).toDF("k", "v", "x")
+      .createOrReplaceTempView("cf_a")
+    Seq((1, 10), (1, 60), (2, 0)).toDF("k", "y").createOrReplaceTempView("cf_b")
+    val query = "select sum(v) as s from cf_a a, cf_b b where a.k = b.k and a.x < b.y"
+    withSQLConf(yannakakisOn: _*) {
+      val plan = sql(query).queryExecution.executedPlan.toString
+      assert(plan.contains("CountJoin"),
+        s"expected the count-join rewrite to fire for a cross-relation filter:\n$plan")
+    }
+    assertSameResults(query, "cross-relation filter a.x < b.y")
+  }
+
   test("ANSI: count-multiplied SUM must equal vanilla and not overflow the value type") {
     // The rewrite emits SUM(v * count). If that product is computed in v's (narrow) type it can
     // overflow where vanilla's promoted Sum accumulator would not - throwing under ANSI=true and

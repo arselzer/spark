@@ -1268,15 +1268,10 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             }
           }
 
-          // A cross-relation filter is folded into a CountJoin condition. When a stream
-          // row's matches all fail it, the non-grouping count-join still emits a phantom
-          // count-0 row (and grouping leaves a spurious group), so a row/group that should
-          // be eliminated survives. Keep the original plan, mirroring the 0MA/distinct gates.
-          if (hg.crossRelationFilters.nonEmpty) {
-            debugLog("cross-relation filters on the count-join path are not supported " +
-              "(phantom count-0 / spurious groups) - keeping original plan")
-            return agg
-          }
+          // Cross-relation filters are folded into the CountJoin condition; rows whose matches
+          // all fail the filter are now correctly dropped by the operator (the non-grouping
+          // path emits nothing when rightCountSum == 0, and the grouping path produces no group),
+          // so the unguarded count-join path no longer bails on them.
 
           // Phase 1: Extract and analyze deferred computations using unified framework
           // This includes both product aggregates and cross-relation filters
@@ -1587,12 +1582,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
               debugLog("mixed DISTINCT and plain aggregates - not applicable")
               return agg
             }
-            if (hg.crossRelationFilters.nonEmpty) {
-              // Same phantom count-0 / spurious-group hazard as the unguarded path above.
-              debugLog("cross-relation filters on the guarded count-join path are not " +
-                "supported (phantom count-0 / spurious groups) - keeping original plan")
-              return agg
-            }
+            // Cross-relation filters are folded into the CountJoin condition and rows whose
+            // matches all fail them are dropped by the operator (see the unguarded path); the
+            // guarded counting path no longer bails on them.
             // Detect product aggregates for one-winner conflict detection
             val guardedDeferredComputations = extractDeferredComputations(
               aggregateExpressions, hg.crossRelationFilters)
