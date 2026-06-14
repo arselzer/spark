@@ -1557,19 +1557,30 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             && percentileAggregates.isEmpty
             && sumAggregates.isEmpty
             && averageAggregates.isEmpty) {
-            // If the query is a 0MA query (all aggregates duplicate-insensitive:
-            // min/max and DISTINCT count/sum/avg), only perform bottom-up semijoins
-            if (hg.crossRelationFilters.nonEmpty) {
-              // buildBottomUpJoins applies only the equi-join conditions; a non-equi
-              // predicate spanning relations would be silently dropped, changing the
-              // set of participating guard tuples.
-              debugLog("0MA query with cross-relation filters - not applicable")
-              return agg
+            // 0MA query: all aggregates are duplicate-insensitive (min/max and DISTINCT
+            // count/sum/avg), so a bottom-up semijoin reduction suffices.
+            val newAgg = if (hg.crossRelationFilters.nonEmpty) {
+              // buildBottomUpJoins (pure LeftSemi reduction) cannot apply a non-equi predicate
+              // spanning relations. Instead carry the filter's referenced attributes to the top
+              // by inner-joining the connecting subtrees (semijoin-reducing the rest and deduping
+              // intermediates), then apply the filters there. 0MA aggregates are
+              // duplicate-insensitive, so the inner carries and the dedup are lossless.
+              val filterRefs = AttributeSet(hg.crossRelationFilters.flatMap(_.references))
+              val needed = groupAttributes ++ aggregateAttributes ++ filterRefs
+              val reducedJoin = root.buildBottomUpDistinctJoin(needed, isTop = true)
+              if (!filterRefs.subsetOf(reducedJoin.outputSet)) {
+                // A filter references an attribute that could not be carried to a common node
+                // (e.g. it spans relations the reduction never inner-joins together) - fall back.
+                debugLog("0MA: cross-relation filter refs not all carried - keeping original plan")
+                return agg
+              }
+              val filtered = hg.crossRelationFilters.foldLeft[LogicalPlan](reducedJoin)(
+                (p, f) => Filter(f, p))
+              Aggregate(groupingExpressions, resultExpressions, filtered)
+            } else {
+              val yannakakisJoins = root.buildBottomUpJoins
+              Aggregate(groupingExpressions, resultExpressions, yannakakisJoins)
             }
-            val yannakakisJoins = root.buildBottomUpJoins
-
-            val newAgg = Aggregate(groupingExpressions, resultExpressions,
-              yannakakisJoins)
             logWarning("new aggregate (0MA)")
             debugLog("time difference: " + (System.nanoTime() - startTime))
             newAgg

@@ -818,6 +818,24 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertSameResults(query, "cross-relation filter a.x < b.y")
   }
 
+  test("0MA cross-relation filter: max with a.x < b.y rewrites and matches vanilla") {
+    Seq((1, 100, 5), (1, 200, 50), (2, 300, 1)).toDF("k", "v", "x")
+      .createOrReplaceTempView("cf_a")
+    Seq((1, 10), (1, 60), (2, 0)).toDF("k", "y").createOrReplaceTempView("cf_b")
+    // max is duplicate-insensitive (0MA path), and a.x < b.y is a cross-relation filter.
+    val query = "select max(v) as m from cf_a a, cf_b b where a.k = b.k and a.x < b.y"
+    val appender = new LogAppender("0MA rewrite with cross-relation filter")
+    withLogAppender(appender) {
+      withSQLConf(yannakakisOn: _*) {
+        sql(query).collect()
+      }
+    }
+    val fired = appender.loggingEvents.exists(
+      _.getMessage.getFormattedMessage.contains("new aggregate (0MA)"))
+    assert(fired, "expected the 0MA rewrite to fire for a cross-relation filter")
+    assertSameResults(query, "0MA max with cross-relation filter a.x < b.y")
+  }
+
   test("ANSI: count-multiplied SUM must equal vanilla and not overflow the value type") {
     // The rewrite emits SUM(v * count). If that product is computed in v's (narrow) type it can
     // overflow where vanilla's promoted Sum accumulator would not - throwing under ANSI=true and
