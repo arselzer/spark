@@ -890,6 +890,23 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("cross-relation filter: a fully-filtered group emits no phantom row (every operator)") {
+    // k=2's only match (x=1, y=0) fails a.x < b.y, so its rightCountSum is 0. An ungrouped sum
+    // hides a phantom count-0 row (it contributes v*0=0), but grouped count(*) does not: vanilla
+    // yields only k=1 (count 3); a phantom row would add a spurious k=2 group. Exercises the
+    // rightCountSum==0 guard on the grouping path of every physical operator (esp. SMJ).
+    Seq((1, 100, 5), (1, 200, 50), (2, 300, 1)).toDF("k", "v", "x")
+      .createOrReplaceTempView("cf_a")
+    Seq((1, 10), (1, 60), (2, 0)).toDF("k", "y").createOrReplaceTempView("cf_b")
+    val query = "select a.k as k, count(*) as c from cf_a a, cf_b b " +
+      "where a.k = b.k and a.x < b.y group by a.k"
+    for (op <- countJoinOperators) {
+      withSQLConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> op) {
+        assertSameResults(query, s"fully-filtered group, operator=$op")
+      }
+    }
+  }
+
   test("grouped count-join correct under sort-merge spill (tiny in-memory threshold)") {
     // Force the SortMergeCountJoin buffered-matches array onto its spillable path by capping the
     // in-memory threshold at 1 row, with multiple matches per key (the Q9 nation-rooted shape).

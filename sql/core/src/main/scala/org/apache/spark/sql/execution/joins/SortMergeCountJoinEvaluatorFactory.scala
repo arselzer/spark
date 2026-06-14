@@ -304,9 +304,12 @@ class SortMergeCountJoinEvaluatorFactory(
                       // the next left row rather than returning false, which would end
                       // the entire join and silently drop all remaining left rows.
                     }
-                    else {
+                    else if (rightCountSum != 0L) {
                       return true
                     }
+                    // Non-grouping: when every match failed the residual condition the real
+                    // count is 0, so emit nothing rather than a phantom count-0 row (matching
+                    // HashCountJoin); fall through to scan the next left row.
                   }
                 }
                 false
