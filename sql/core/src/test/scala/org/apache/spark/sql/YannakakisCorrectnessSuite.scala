@@ -781,4 +781,18 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       }
     }
   }
+
+  test("ANSI: count-multiplied SUM must equal vanilla and not overflow the value type") {
+    // The rewrite emits SUM(v * count). If that product is computed in v's (narrow) type it can
+    // overflow where vanilla's promoted Sum accumulator would not - throwing under ANSI=true and
+    // silently wrapping (wrong result) under ANSI=false. Stress it: v near Int.MAX, multiplicity 2.
+    Seq((1, 2000000000)).toDF("k", "v").createOrReplaceTempView("fact_ov")
+    Seq(1, 1).toDF("k").createOrReplaceTempView("dim_ov")
+    val query = "select sum(v) as s from fact_ov f, dim_ov d where f.k = d.k"
+    for (ansi <- Seq("false", "true")) {
+      withSQLConf(SQLConf.ANSI_ENABLED.key -> ansi) {
+        assertSameResults(query, s"ANSI=$ansi: count-multiplied SUM(v) over multiplicity 2")
+      }
+    }
+  }
 }

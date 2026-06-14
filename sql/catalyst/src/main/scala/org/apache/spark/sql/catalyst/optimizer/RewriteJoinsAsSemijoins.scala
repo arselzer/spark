@@ -1651,7 +1651,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                         // and square the count for products of two attributes.
                         val sumAggregateExpr = aggFn.transformUp {
                           case a@Average(c, evalMode) =>
-                            Sum(Multiply(c, Cast(countingAttribute, c.dataType),
+                            // Multiply the numerator in SUM(c)'s type to avoid overflow.
+                            val wideType = Sum(c).dataType
+                            Sum(Multiply(Cast(c, wideType), Cast(countingAttribute, wideType),
                               NumericEvalContext(evalMode)), NumericEvalContext(evalMode))
                         }.asInstanceOf[AggregateFunction].toAggregateExpression()
 
@@ -1674,8 +1676,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                         // Average case above).
                         AggregateExpression(aggFn.transformUp {
                           case s @ Sum(c, evalMode) =>
-                            Sum(Multiply(c, Cast(countingAttribute, c.dataType), evalMode),
-                              evalMode)
+                            // Multiply in the type SUM(c) would use so the count multiplication
+                            // does not overflow c's narrow type (e.g. Int) where vanilla's
+                            // promoted Sum accumulator would not.
+                            val wideType = Sum(c).dataType
+                            Sum(Multiply(Cast(c, wideType), Cast(countingAttribute, wideType),
+                              evalMode), evalMode)
                         }.asInstanceOf[AggregateFunction], mode, isDistinct, filter, resultId)
                     }
                 }.asInstanceOf[NamedExpression]
@@ -2287,21 +2293,24 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         var multiplySumExpressions = Seq.empty[NamedExpression]
 
         def createMultiplication(a: Expression, b: Expression): Expression = {
-          val multiplication = if (a.dataType.acceptsType(b.dataType)) {
-            Multiply(a, b)
-          }
-          else {
-            a.dataType match {
-              case _: DecimalType => Multiply(a, Cast(b, DecimalType(20, 0)))
-              case _ => Multiply(a, Cast(b, a.dataType))
-            }
-          }
-
-          if (multiplication.dataType == a.dataType) {
-            multiplication
-          }
-          else {
-            Cast(multiplication, a.dataType)
+          // `a` (a value, partial sum, or product) is multiplied by a Long count `b` to account
+          // for join fan-out; the result feeds a SUM. It must be computed in the type SUM(a)
+          // would use - otherwise a narrow type (e.g. Int) overflows where vanilla Spark's
+          // promoted Sum accumulator would not (a wrong, wrapped result with ANSI off; a thrown
+          // overflow with ANSI on). This mirrors vanilla SUM semantics: summing `a` exactly
+          // `count` times. DecimalType keeps its existing handling.
+          a.dataType match {
+            case _: DecimalType =>
+              val multiplication = if (a.dataType.acceptsType(b.dataType)) {
+                Multiply(a, b)
+              } else {
+                Multiply(a, Cast(b, DecimalType(20, 0)))
+              }
+              if (multiplication.dataType == a.dataType) multiplication
+              else Cast(multiplication, a.dataType)
+            case _ =>
+              val wideType = Sum(a).dataType
+              Multiply(Cast(a, wideType), Cast(b, wideType))
           }
         }
 
