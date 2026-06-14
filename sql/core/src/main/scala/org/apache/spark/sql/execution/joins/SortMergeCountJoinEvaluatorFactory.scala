@@ -51,6 +51,12 @@ class SortMergeCountJoinEvaluatorFactory(
     opId: String)
     extends PartitionEvaluatorFactory[InternalRow, InternalRow] with Logging {
 
+  // The rewrite only ever emits inner count joins; the non-inner branches below delegate to stock
+  // SortMergeJoin iterators that drop the carried count and emit a wrong-width row against the
+  // count-join output schema. Fail loudly if a future change ever asks for a non-inner count join.
+  require(joinType.isInstanceOf[InnerLike],
+    s"CountJoin only supports inner joins, got $joinType")
+
   // Toggle to enable detailed debug logging for CountJoin operations
   private val DEBUG_COUNTJOIN = false
 

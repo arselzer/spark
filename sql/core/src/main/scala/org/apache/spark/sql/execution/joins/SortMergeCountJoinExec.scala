@@ -48,6 +48,11 @@ case class SortMergeCountJoinExec(
     groupRight: Seq[NamedExpression],
     isSkewJoin: Boolean = false) extends ShuffledJoin {
 
+  // The rewrite only ever emits inner count joins; the non-inner branches of the SMJ evaluator
+  // delegate to stock iterators that drop the carried count. Fail loudly on any non-inner type.
+  require(joinType.isInstanceOf[InnerLike],
+    s"CountJoin only supports inner joins, got $joinType")
+
   override lazy val metrics = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"))

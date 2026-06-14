@@ -53,6 +53,12 @@ case class BroadcastHashCountJoinExec(
     isNullAwareAntiJoin: Boolean = false)
   extends HashCountJoin {
 
+  // The rewrite only ever emits inner count joins. The outer/semi/anti branches inherited from
+  // HashJoin drop the carried count and emit a wrong-width row against the count-join schema, so
+  // fail loudly here if a future change ever constructs a non-inner count join.
+  require(joinType.isInstanceOf[InnerLike],
+    s"CountJoin only supports inner joins, got $joinType")
+
   if (isNullAwareAntiJoin) {
     require(leftKeys.length == 1, "leftKeys length should be 1")
     require(rightKeys.length == 1, "rightKeys length should be 1")

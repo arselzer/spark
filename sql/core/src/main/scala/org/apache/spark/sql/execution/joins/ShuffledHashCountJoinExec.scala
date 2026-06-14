@@ -50,6 +50,11 @@ case class ShuffledHashCountJoinExec(
     isSkewJoin: Boolean = false)
   extends HashCountJoin with ShuffledJoin {
 
+  // The rewrite only ever emits inner count joins; the non-inner branches drop the carried count
+  // and emit a wrong-width row against the count-join schema. Fail loudly on any non-inner type.
+  require(joinType.isInstanceOf[InnerLike],
+    s"CountJoin only supports inner joins, got $joinType")
+
   override lazy val metrics = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
     "buildDataSize" -> SQLMetrics.createSizeMetric(sparkContext, "data size of build side"),
