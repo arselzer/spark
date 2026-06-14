@@ -588,56 +588,6 @@ trait HashCountJoin extends JoinCodegenSupport {
         }
       }
     }
-//
-//    if (hashedRelation == EmptyHashedRelation) {
-//      Iterator.empty
-//    } else if (hashedRelation.keyIsUnique) {
-//      streamIter.flatMap { srow =>
-//        joinedRow.withLeft(srow)
-//        val matches = hashedRelation.get(joinKeys(srow))
-//        if (matches != null) {
-//          //          logWarning("left row: " + srow)
-//          val rightCountSum = matches.map(joinedRow.withRight).filter(boundCondition)
-//            .map(row => {
-//              //              logWarning("right row: " + row + ", value: " +
-//              //                row.getRight.getLong(rightCountOrdinal))
-//              row.getRight.getLong(rightCountOrdinal)
-//            }).sum
-//          //          logWarning("right count sum: " + rightCountSum)
-//          val schema = StructType(StructField("c", LongType) :: Nil)
-//          val sumRow = new SpecificInternalRow(schema)
-//          //          logWarning("sumRow: " + sumRow)
-//          val leftCount = srow.getLong(leftCountOrdinal)
-//          //          logWarning("leftCount: " + leftCount)
-//          sumRow.setLong(0, rightCountSum * leftCount)
-//          //          logWarning("sumRow: " + sumRow)
-//          joinedRow.withRight(sumRow)
-//          //          logWarning("produced row: " + joinedRow)
-//          Seq(joinedRow)
-//        } else {
-//          Seq.empty
-//        }
-//      }
-//    } else {
-//      streamIter.flatMap { srow =>
-//        joinedRow.withLeft(srow)
-//        val matches = hashedRelation.get(joinKeys(srow))
-//        if (matches != null) {
-//          val rightCountSum = matches.map(joinedRow.withRight).filter(boundCondition)
-//            .map(row => {
-//              row.getRight.getLong(rightCountOrdinal)
-//            }).sum
-//          val schema = StructType(StructField("c", LongType) :: Nil)
-//          val sumRow = new SpecificInternalRow(schema)
-//          val leftCount = srow.getLong(leftCountOrdinal)
-//          sumRow.setLong(0, rightCountSum * leftCount)
-//          joinedRow.withRight(sumRow)
-//          Seq(joinedRow)
-//        } else {
-//          Seq.empty
-//        }
-//      }
-//    }
   }
 
   protected def join(

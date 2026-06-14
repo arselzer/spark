@@ -59,181 +59,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     }
   }
 
-  /**
-   * ===================================================================================
-   * MULTI-COUNT OPTIMIZATION FRAMEWORK FOR YANNAKAKIS PRODUCT AGGREGATES
-   * ===================================================================================
-   *
-   * OVERVIEW
-   * --------
-   * When computing multiple product aggregates (e.g., SUM(A*B), SUM(B*C), SUM(A*C)),
-   * each product may require different count semantics because the grouping granularity
-   * affects how many rows contribute to each product value.
-   *
-   * CORE PROBLEM
-   * ------------
-   * Consider a join tree T1 -> T2 -> T3 with products:
-   *   P1 = SUM(a * b) where a in T1, b in T2
-   *   P2 = SUM(b * c) where b in T2, c in T3
-   *
-   * When P1 is computed at join T1-T2, we need counts based on grouping by {a, b}.
-   * When P2 is computed at join T2-T3, we need counts based on grouping by {b, c}.
-   *
-   * If P1's grouping (adding b to carry through) affects P2's counts, we have a
-   * CONFLICT - the count semantics are incompatible.
-   *
-   * CONFLICT DETECTION
-   * ------------------
-   * Two products P1 and P2 CONFLICT if they share some but not all attributes:
-   *   conflict(P1, P2) iff attrs(P1) intersect attrs(P2) != empty AND
-   *                        attrs(P1) not-subset-of attrs(P2) AND
-   *                        attrs(P2) not-subset-of attrs(P1)
-   *
-   * CONTAINMENT STRUCTURE
-   * ---------------------
-   * Products have CONTAINMENT when one's attrs are a subset of another's:
-   *   P1 containedIn P2 iff attrs(P1) strict-subset-of attrs(P2)
-   *
-   * Containment enables optimization:
-   * - The larger product P2 can be computed with fine-grained grouping
-   * - The smaller product P1 can reuse P2's count track (derived count)
-   *
-   * Example: {a} < {a,b} < {a,b,c}
-   *   - Compute at {a,b,c} granularity
-   *   - P({a,b,c}) uses direct count
-   *   - P({a,b}) uses SUM(count) grouped by {a,b}
-   *   - P({a}) uses SUM(count) grouped by {a}
-   *
-   * STRATEGIES
-   * ----------
-   * 1. INDEPENDENT PRODUCTS: No conflicts, each computed with its own count track
-   *
-   * 2. HIERARCHICAL CONTAINMENT: When containment exists:
-   *    - Compute finest-grained count (for largest product)
-   *    - Derive coarser counts via aggregation
-   *
-   * 3. CONFLICT FALLBACK: When products conflict without containment:
-   *    - Carry all product attributes through grouping
-   *    - Defer products to final aggregate with count multiplication
-   *
-   * 4. CONNECTED COMPONENTS: Partition products into independent groups:
-   *    - Products in different components don't affect each other
-   *    - Each component can use its own count track
-   *
-   * CONFLICT FALLBACK (DEFERRED) EXPLAINED
-   * ---------------------------------------
-   * When products conflict without containment structure, we must defer to final:
-   *
-   * Example: IMDB query with products {role_id,info_type_id}, {production_year,role_id}
-   *   - They share role_id but neither is a subset of the other
-   *   - If we compute one early, its grouping affects the other's count semantics
-   *   - Solution: carry all product attributes through grouping, compute at final
-   *
-   * This is actually the CORRECT behavior for such queries:
-   *   - All products use the same final count (computed once at the end)
-   *   - The count multiplier correctly accounts for the full join cardinality
-   *   - Products are computed in the final aggregate with count multiplication
-   *
-   * IMPLEMENTATION STATUS
-   * ----------------------
-   * WORKING (tested and verified):
-   *   [x] CASE 1 - Independent Products: disjoint attrs computed early (if join tree allows)
-   *   [x] CASE 2 - Containment Hierarchy: subset products use derived counts
-   *   [x] CASE 3 - Universal Superset: all products derive from common superset
-   *   [x] CASE 4 - Connected Components: independent groups optimized separately
-   *   [x] CASE 5 - Star Pattern (deferred): correctly defers to final aggregate
-   *
-   * JOIN-TREE-AWARE CONFLICT DETECTION
-   * -----------------------------------
-   * For multiple products, we analyze the concrete join tree to determine which
-   * products can compute early vs. must defer to the final aggregate.
-   *
-   * A product P can compute early if:
-   *   1. All its attributes become available at some join J
-   *   2. At all subsequent joins (ancestors of J), the grouping doesn't contain
-   *      attributes FOREIGN to P (not in P's attribute set)
-   *
-   * Foreign grouping causes the product's pending value to be replicated across
-   * groups, leading to overcounting when summed at the final aggregate.
-   *
-   * Strategy 3 fallback: If ALL products would defer, pick ONE "winner" to compute
-   * early (the one computed highest in the tree, to minimize propagation issues).
-   *
-   * IMPLEMENTATION
-   * --------------
-   * DeferredComputation: Unified abstraction for products and cross-relation filters
-   * ConflictGraph: Tracks which products conflict with each other
-   * ContainmentDAG: Directed acyclic graph showing containment relationships
-   * CountTrackAssignment: Maps each product to its count track strategy
-   *
-   * DECISION FLOWCHART
-   * ------------------
-   * For a set of product aggregates:
-   *
-   *   1. Extract product attributes: P1={a,b}, P2={b,c}, P3={d,e}, ...
-   *
-   *   2. Build conflict graph:
-   *      - Edge between Pi and Pj if they share attrs but neither is subset
-   *
-   *   3. Find connected components:
-   *      - Group products that transitively conflict
-   *      - Independent components can use separate count tracks
-   *
-   *   4. For each component, check containment:
-   *      - If pure containment (no conflicts): use hierarchical derivation
-   *      - If universal superset exists: derive all from it
-   *      - Otherwise: defer all to final aggregate
-   *
-   *   5. Assign strategies:
-   *      - DirectCount: product computes its own count at join
-   *      - DerivedCount(source): derive from source via GROUP BY
-   *      - DeferredToFinal: compute at final aggregate with count multiplication
-   *
-   * EXAMPLES BY CASE
-   * ----------------
-   * CASE 1 - Independent Products (optimization applies):
-   *   Products: {a,b}, {c,d}  -- no overlap
-   *   Result: Each uses its own count track, computed early
-   *
-   * CASE 2 - Containment Chain (optimization applies):
-   *   Products: {a}, {a,b}, {a,b,c}  -- strict containment
-   *   Result: Compute at {a,b,c}, derive {a,b} and {a} via GROUP BY
-   *
-   * CASE 3 - Universal Superset (optimization applies):
-   *   Products: {a,b}, {a,c}, {b,c}, {a,b,c}  -- conflicts but superset exists
-   *   Result: Use {a,b,c} as source, derive all others
-   *
-   * CASE 4 - Multiple Components (partial optimization):
-   *   Products: {a,b}, {b,c} (conflict), {d,e} (independent)
-   *   Result: {d,e} uses own track; {a,b},{b,c} deferred together
-   *
-   * CASE 5 - Star Pattern (NO optimization - worst case):
-   *   Products: {a,b}, {a,c}, {a,d}  -- all share 'a' but none contains another
-   *   Result: All deferred to final aggregate with count multiplication
-   *   This is the IMDB query pattern.
-   *
-   * CASE 7 - Isolated Products (optimization applies):
-   *   Products: {a,b}, {c,d}  -- completely disjoint, no overlap at all
-   *   Result: Each product uses its own count, not multiplied by other product's tables
-   *   Key difference from CASE 1: CASE 7 specifically tests that products don't
-   *   interfere with each other during LEFT propagation across join tree levels.
-   *
-   * TEST COVERAGE
-   * -------------
-   * See IMDB12TableBugSuite.scala for comprehensive tests of each case (70 tests total):
-   * - "CASE 1: Independent products - no shared attributes"
-   * - "CASE 2: Containment hierarchy - subset relationships"
-   * - "CASE 3: Universal superset with conflicts"
-   * - "CASE 4: Multiple independent components"
-   * - "CASE 5: Star pattern - worst case (like IMDB)"
-   * - "CASE 6: Partial containment - some derived, some deferred"
-   * - "Isolated products: 2/3/4 disjoint multi-attr products" (CASE 7 tests)
-   * - "IMDB-style: isolated products from different table groups"
-   * - "IMDB-style: three isolated products across 8 tables"
-   *
-   * ===================================================================================
-   */
-
+  // A "product aggregate" is a SUM over 2+ non-count attributes from different relations (e.g.
+  // SUM(a*b)); a "cross-relation filter" is a non-equi predicate spanning relations. Both are
+  // extracted as DeferredComputations so the rewrite can detect product conflicts: when 2+
+  // products are present they all defer to the final aggregate (conflictingProductAttrs), because
+  // computing one early regroups the count and would corrupt the others.
   sealed trait DeferredComputationType
   case object ProductAggregate extends DeferredComputationType
   case object CrossRelationFilter extends DeferredComputationType
@@ -314,638 +144,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
      */
     def independentFrom(other: DeferredComputation): Boolean =
       attrs.intersect(other.attrs).isEmpty
-  }
-
-  /**
-   * Analyzes the containment structure among deferred computations.
-   * Returns true if hierarchical count tracks could help (i.e., containment exists).
-   *
-   * When containment exists, we can:
-   * 1. Compute counts at the finest granularity (for the superset product)
-   * 2. Derive coarser counts via aggregation for contained products
-   *
-   * Example where containment helps:
-   *   P1 = SUM(a), P2 = SUM(a*b), P3 = SUM(a*b*c)
-   *   Containment: {a} < {a,b} < {a,b,c}
-   *   Strategy: Compute at {a,b,c} level, derive {a,b} and {a} counts
-   *
-   * Example where containment doesn't help (IMDB query):
-   *   P1 = SUM(a*b), P2 = SUM(b*c), P3 = SUM(a*c)
-   *   No containment: all pairs conflict without hierarchy
-   *   Strategy: Carry all attrs, defer to final aggregate
-   */
-  def hasContainmentStructure(computations: Seq[DeferredComputation]): Boolean = {
-    computations.exists { c1 =>
-      computations.exists { c2 =>
-        c1 != c2 && c1.containedIn(c2)
-      }
-    }
-  }
-
-  /**
-   * Build the containment DAG for a set of computations.
-   *
-   * Returns a map from each computation to its immediate parents (supersets).
-   * The DAG edges point from smaller to larger attribute sets.
-   *
-   * Example: For products {a}, {a,b}, {a,b,c}, {b,c}:
-   *   {a} -> {a,b}
-   *   {a,b} -> {a,b,c}
-   *   {b,c} -> (no parents in this set)
-   *
-   * This DAG structure enables:
-   * - Finding the "roots" (maximal products) that need direct count computation
-   * - Computing derived counts by traversing the DAG downward
-   */
-  def buildContainmentDAG(computations: Seq[DeferredComputation]):
-      Map[DeferredComputation, Set[DeferredComputation]] = {
-    computations.map { c =>
-      // Find immediate parents: supersets that have no intermediate supersets
-      val allSupersets = computations.filter(other => c.containedIn(other))
-      val immediateParents = allSupersets.filterNot { parent =>
-        allSupersets.exists(other => other != parent && other.containedIn(parent))
-      }
-      c -> immediateParents.toSet
-    }.toMap
-  }
-
-  /**
-   * Find connected components in the conflict graph.
-   *
-   * Each component contains products that directly or transitively conflict with each other.
-   * Products in different components are completely independent and can use separate
-   * count tracks without interference.
-   *
-   * Example:
-   *   P1 conflicts P2, P2 conflicts P3 -> Component 1: {P1, P2, P3}
-   *   P4 conflicts P5                  -> Component 2: {P4, P5}
-   *   P6 independent                   -> Component 3: {P6}
-   *
-   * @return Sequence of components, each being a set of computations
-   */
-  def findConflictComponents(computations: Seq[DeferredComputation]):
-      Seq[Set[DeferredComputation]] = {
-    if (computations.isEmpty) return Seq.empty
-
-    val visited = mutable.Set[DeferredComputation]()
-    val components = mutable.Buffer[Set[DeferredComputation]]()
-
-    def dfs(start: DeferredComputation): Set[DeferredComputation] = {
-      val component = mutable.Set[DeferredComputation]()
-      val stack = mutable.Stack[DeferredComputation](start)
-
-      while (stack.nonEmpty) {
-        val current = stack.pop()
-        if (!visited.contains(current)) {
-          visited.add(current)
-          component.add(current)
-          // Add all conflicting or containing/contained computations
-          computations.foreach { other =>
-            if (!visited.contains(other) &&
-                (current.conflictsWith(other) ||
-                 current.containedIn(other) ||
-                 other.containedIn(current))) {
-              stack.push(other)
-            }
-          }
-        }
-      }
-      component.toSet
-    }
-
-    computations.foreach { c =>
-      if (!visited.contains(c)) {
-        components += dfs(c)
-      }
-    }
-
-    components.toSeq
-  }
-
-  // =====================================================================
-  // JOIN-TREE-AWARE PRODUCT CONFLICT DETECTION
-  // =====================================================================
-  //
-  // For each product, determine if it can compute early given the concrete join tree.
-  //
-  // A product P can compute early if:
-  // 1. All its attributes become available at some join J
-  // 2. At all subsequent joins (ancestors of J), the grouping doesn't contain
-  //    attributes FOREIGN to P (not in P's attribute set)
-  //
-  // Foreign grouping causes the product's pending value to be replicated across
-  // groups, leading to overcounting when summed at the final aggregate.
-  //
-  // Strategy 3 fallback: If all products would defer, pick ONE "winner" to compute
-  // early (the one computed highest in the tree, to minimize propagation issues).
-
-  /**
-   * Analyze which products can compute early given the concrete join tree.
-   *
-   * @param root The root of the join tree (HTNode)
-   * @param productComputations The products to analyze
-   * @return Map from product resultAttr to whether it can compute early
-   */
-  def analyzeProductsForJoinTree(
-      root: HTNode,
-      productComputations: Seq[DeferredComputation]
-  ): Map[Attribute, Boolean] = {
-
-    if (productComputations.size < 2) {
-      // Single product or none - no conflicts possible
-      return productComputations.flatMap(_.resultAttr.map(_ -> true)).toMap
-    }
-
-    // Step 1: Build a map of each node's subtree output attributes
-    val subtreeOutputs = mutable.Map[HTNode, AttributeSet]()
-    def computeSubtreeOutput(node: HTNode): AttributeSet = {
-      if (subtreeOutputs.contains(node)) return subtreeOutputs(node)
-      val ownOutput = node.edges.flatMap(_.outputSet)
-      val childOutput = node.children.flatMap(c => computeSubtreeOutput(c))
-      val result = AttributeSet(ownOutput ++ childOutput)
-      subtreeOutputs(node) = result
-      result
-    }
-    computeSubtreeOutput(root)
-
-    // Step 2: Find computation point for each product
-    // (the deepest node where all its attributes first become available)
-    def findComputationNode(node: HTNode, attrs: Set[Attribute]): HTNode = {
-      // Check if any single child contains all attrs
-      for (child <- node.children) {
-        val childOutput = subtreeOutputs(child)
-        if (attrs.forall(childOutput.contains)) {
-          return findComputationNode(child, attrs)
-        }
-      }
-      // No single child has all attrs - this node is the computation point
-      node
-    }
-
-    val productInfos = productComputations.flatMap { prod =>
-      prod.resultAttr.map { resultAttr =>
-        val computeNode = findComputationNode(root, prod.attrs)
-        (prod, prod.attrs, resultAttr, computeNode)
-      }
-    }
-
-    // Step 3: Compute what grouping attributes will be active at each node
-    // Grouping at node N = union of attrs from products computed BELOW N
-    // that need to be carried through N (from N's children)
-    val nodeGroupings = mutable.Map[HTNode, Set[Attribute]]()
-
-    def computeNodeGrouping(node: HTNode): Set[Attribute] = {
-      if (nodeGroupings.contains(node)) return nodeGroupings(node)
-
-      var grouping = Set.empty[Attribute]
-
-      // For each product computed strictly below this node:
-      // If its attrs come partly from this node's children, those attrs need grouping
-      for ((prod, attrs, _, computeNode) <- productInfos) {
-        if (computeNode != node && isDescendantOf(computeNode, node)) {
-          // Product computed below this node
-          // Check which of its attrs come from this node's children (right side)
-          for (child <- node.children) {
-            val childOutput = subtreeOutputs(child)
-            val attrsFromChild = attrs.filter(childOutput.contains)
-            grouping ++= attrsFromChild
-          }
-        }
-      }
-
-      nodeGroupings(node) = grouping
-      grouping
-    }
-
-    // Compute groupings for all nodes
-    def visitAll(node: HTNode): Unit = {
-      computeNodeGrouping(node)
-      node.children.foreach(visitAll)
-    }
-    visitAll(root)
-
-    // Step 4: For each product, check if any ancestor has foreign grouping
-    def getAncestors(node: HTNode): Seq[HTNode] = {
-      val ancestors = mutable.ArrayBuffer[HTNode]()
-      var current = node.parent
-      while (current != null) {
-        ancestors += current
-        current = current.parent
-      }
-      ancestors.toSeq
-    }
-
-    val results = mutable.Map[Attribute, Boolean]()
-
-    for ((prod, attrs, resultAttr, computeNode) <- productInfos) {
-      val ancestors = getAncestors(computeNode)
-      var canComputeEarly = true
-
-      for (ancestor <- ancestors if canComputeEarly) {
-        val groupingAtAncestor = nodeGroupings.getOrElse(ancestor, Set.empty[Attribute])
-        val foreignGrouping = groupingAtAncestor -- attrs
-
-        if (foreignGrouping.nonEmpty) {
-          // This ancestor has grouping attributes foreign to this product
-          canComputeEarly = false
-          debugLog(s"Product {${attrs.map(_.name).mkString(",")}} cannot compute early: " +
-            s"foreign grouping {${foreignGrouping.map(_.name).mkString(",")}} at ancestor")
-        }
-      }
-
-      results(resultAttr) = canComputeEarly
-    }
-
-    // Step 5: Strategy 3 fallback - if ALL products would defer, pick one winner
-    if (results.nonEmpty && results.values.forall(_ == false)) {
-      // All products would defer - pick the one with computation point highest in tree
-      // (smallest depth = fewer ancestors = less chance of grouping conflicts)
-      def getDepth(node: HTNode): Int = {
-        var depth = 0
-        var current = node.parent
-        while (current != null) {
-          depth += 1
-          current = current.parent
-        }
-        depth
-      }
-
-      val byDepth = productInfos.map { case (prod, attrs, resultAttr, computeNode) =>
-        (prod, attrs, resultAttr, computeNode, getDepth(computeNode))
-      }.sortBy(_._5)  // Sort by depth ascending (smallest depth = highest in tree)
-
-      if (byDepth.nonEmpty) {
-        val (winnerProd, winnerAttrs, winnerResultAttr, _, _) = byDepth.head
-        debugLog(s"Strategy 3 fallback: selecting winner product " +
-          s"{${winnerAttrs.map(_.name).mkString(",")}}")
-        results(winnerResultAttr) = true
-      }
-    }
-
-    results.toMap
-  }
-
-  /**
-   * Check if 'descendant' is a strict descendant of 'ancestor'.
-   */
-  private def isDescendantOf(descendant: HTNode, ancestor: HTNode): Boolean = {
-    var current = descendant.parent
-    while (current != null) {
-      if (current == ancestor) return true
-      current = current.parent
-    }
-    false
-  }
-
-  /**
-   * Determine the count track strategy for each product in a component.
-   *
-   * Strategy assignment:
-   * 1. DIRECT: Product uses directly computed count at its granularity
-   * 2. DERIVED: Product's count is derived from a superset product's count
-   * 3. DEFERRED: Product defers to final aggregate (conflict fallback)
-   *
-   * @return Map from computation to (strategy, sourceComputation)
-   *         where sourceComputation is the computation to derive count from (if DERIVED)
-   */
-  sealed trait CountTrackStrategy
-  case object DirectCount extends CountTrackStrategy
-  case class DerivedCount(source: DeferredComputation) extends CountTrackStrategy
-  case object DeferredToFinal extends CountTrackStrategy
-
-  /**
-   * Select one "winner" product to compute early when there are multiple products.
-   *
-   * The winner is selected based on:
-   * 1. Position in join tree - products computed highest (smallest depth) preferred
-   * 2. This minimizes the chance of foreign grouping conflicts
-   *
-   * @param root The root of the join tree (HTNode)
-   * @param productComputations The products to choose from
-   * @return Some(winner) if a winner can be selected, None otherwise
-   */
-  def selectWinnerProduct(
-      root: HTNode,
-      productComputations: Seq[DeferredComputation]
-  ): Option[DeferredComputation] = {
-    if (productComputations.isEmpty) return None
-
-    // Build a map of each node's subtree output attributes
-    val subtreeOutputs = mutable.Map[HTNode, AttributeSet]()
-    def computeSubtreeOutput(node: HTNode): AttributeSet = {
-      if (subtreeOutputs.contains(node)) return subtreeOutputs(node)
-      val ownOutput = node.edges.flatMap(_.outputSet)
-      val childOutput = node.children.flatMap(c => computeSubtreeOutput(c))
-      val result = AttributeSet(ownOutput ++ childOutput)
-      subtreeOutputs(node) = result
-      result
-    }
-    computeSubtreeOutput(root)
-
-    // Find computation point for each product
-    def findComputationNode(node: HTNode, attrs: Set[Attribute]): HTNode = {
-      for (child <- node.children) {
-        val childOutput = subtreeOutputs(child)
-        if (attrs.forall(childOutput.contains)) {
-          return findComputationNode(child, attrs)
-        }
-      }
-      node
-    }
-
-    // Get depth of a node (root = 0)
-    def getDepth(node: HTNode): Int = {
-      var depth = 0
-      var current = node.parent
-      while (current != null) {
-        depth += 1
-        current = current.parent
-      }
-      depth
-    }
-
-    // Compute depth for each product
-    val productDepths = productComputations.map { prod =>
-      val computeNode = findComputationNode(root, prod.attrs)
-      (prod, getDepth(computeNode))
-    }
-
-    // Select the product with smallest depth (computed highest in tree)
-    // Use stable ordering: sort by (depth, attr names) to ensure deterministic selection
-    val sorted = productDepths.sortBy { case (prod, depth) =>
-      (depth, prod.attrs.map(_.name).toSeq.sorted.mkString(","))
-    }
-    val (winner, _) = sorted.head
-    Some(winner)
-  }
-
-  def assignCountTrackStrategies(component: Set[DeferredComputation]):
-      Map[DeferredComputation, CountTrackStrategy] = {
-    val computations = component.toSeq
-
-    // Check if the component has pure containment (no true conflicts)
-    val hasConflicts = computations.exists { c1 =>
-      computations.exists { c2 => c1.conflictsWith(c2) }
-    }
-
-    if (!hasConflicts) {
-      // Pure containment or independent - use hierarchical strategy
-      val dag = buildContainmentDAG(computations)
-
-      // Find roots (maximal elements with no parents)
-      val roots = computations.filter(c => dag(c).isEmpty)
-
-      computations.map { c =>
-        if (roots.contains(c)) {
-          // Root products compute their own counts directly
-          c -> DirectCount
-        } else {
-          // Find the immediate parent to derive count from
-          val parent = dag(c).head // There's at least one parent
-          c -> DerivedCount(parent)
-        }
-      }.toMap
-    } else {
-      // Has conflicts - check if there's a universal superset
-      val maximalProduct = computations.find { c =>
-        computations.forall(other => other == c || other.containedIn(c))
-      }
-
-      maximalProduct match {
-        case Some(max) =>
-          // All products contained in one maximal product - use it as source
-          computations.map { c =>
-            if (c == max) c -> DirectCount
-            else c -> DerivedCount(max)
-          }.toMap
-
-        case None =>
-          // True conflicts without universal superset - defer all to final
-          computations.map(c => c -> DeferredToFinal).toMap
-      }
-    }
-  }
-
-  /**
-   * Compute hierarchical count derivation plan for products with containment.
-   *
-   * When products have containment relationships (P1.attrs subset P2.attrs), we can:
-   * 1. Compute a single fine-grained count at the maximal level
-   * 2. Derive coarser counts via SUM(count) GROUP BY coarser_attrs
-   *
-   * This avoids computing separate count tracks for each product.
-   *
-   * Example: Products with attrs {a}, {a,b}, {a,b,c}
-   *   - Compute count at {a,b,c} granularity (finest)
-   *   - For {a,b}: SUM(count) GROUP BY a, b
-   *   - For {a}: SUM(count) GROUP BY a
-   *
-   * @param products Products to analyze
-   * @return CountDerivationPlan with grouping specifications for each product
-   */
-  case class CountDerivation(
-    groupByAttrs: Set[Attribute],
-    sourceCountAttr: Attribute,
-    derivedCountAlias: String
-  )
-
-  case class CountDerivationPlan(
-    rootProduct: DeferredComputation,
-    rootGroupByAttrs: Set[Attribute],
-    derivations: Map[DeferredComputation, CountDerivation]
-  )
-
-  def computeCountDerivationPlan(
-      products: Seq[DeferredComputation]
-  ): Option[CountDerivationPlan] = {
-    if (products.size < 2) return None
-
-    // Assign strategies to determine which use direct vs derived counts
-    val components = findConflictComponents(products)
-    val strategies = components.flatMap(c => assignCountTrackStrategies(c)).toMap
-
-    // Check if hierarchical optimization is applicable
-    val directProducts = strategies.filter {
-      case (_, DirectCount) => true
-      case _ => false
-    }.keys.toSeq
-    val derivedProducts = strategies.collect {
-      case (p, DerivedCount(_)) => p
-    }.toSeq
-
-    if (directProducts.isEmpty) return None
-
-    // Find the root (maximal) product - should be unique for hierarchical case
-    val root = directProducts.maxBy(_.attrs.size)
-    val rootAttrs = root.attrs
-
-    // Build derivation plan for each non-root product
-    val derivations = derivedProducts.map { prod =>
-      // Group by this product's attrs to derive its count from root's count
-      prod -> CountDerivation(
-        groupByAttrs = prod.attrs,
-        sourceCountAttr = null, // Will be filled in during execution
-        derivedCountAlias = s"c_${prod.attrs.map(_.name).mkString("_")}"
-      )
-    }.toMap
-
-    Some(CountDerivationPlan(
-      rootProduct = root,
-      rootGroupByAttrs = rootAttrs,
-      derivations = derivations
-    ))
-  }
-
-  /**
-   * Determine the grouping attributes needed for a set of products.
-   *
-   * For products with containment, we need to group by the union of all attrs
-   * in the hierarchy to enable hierarchical count derivation.
-   *
-   * For conflicting products without containment, we group by the union
-   * of all product attrs (to defer to final aggregate with count multiplication).
-   *
-   * @param products Products to analyze
-   * @return Set of attrs that should be included in grouping
-   */
-  def computeRequiredGroupingAttrs(
-      products: Seq[DeferredComputation]
-  ): Set[Attribute] = {
-    if (products.isEmpty) return Set.empty
-
-    val components = findConflictComponents(products)
-
-    components.flatMap { component =>
-      val strategies = assignCountTrackStrategies(component)
-
-      // For hierarchical case: use maximal product's attrs
-      val directProducts = strategies.filter(_._2 == DirectCount).keys
-      if (directProducts.nonEmpty) {
-        directProducts.maxBy(_.attrs.size).attrs
-      } else {
-        // For conflict case (deferred): union of all attrs
-        component.flatMap(_.attrs)
-      }
-    }.toSet
-  }
-
-  /**
-   * CONNECTED COMPONENTS OPTIMIZATION (STATUS: WORKING)
-   * ====================================================
-   *
-   * When there are multiple independent product groups (connected components),
-   * each group can use its own count track without interference.
-   *
-   * Example with two independent components:
-   *   Component 1: P1 = SUM(a*b), P2 = SUM(b*c)  -- share attr b, they conflict
-   *   Component 2: P3 = SUM(x*y)                  -- completely independent
-   *
-   * Benefits:
-   * 1. P3 doesn't need to defer just because P1 and P2 conflict
-   * 2. P3 can be computed early at its join point
-   * 3. Component 1 products follow their own strategy (hierarchical or defer)
-   *
-   * Implementation:
-   * 1. findConflictComponents() partitions products into independent groups
-   * 2. assignCountTrackStrategies() processes each component separately
-   * 3. Products not in conflictingProductAttrs can use early computation
-   *
-   * Test: CASE 4 in IMDB12TableBugSuite.scala
-   */
-
-  /**
-   * Compute per-component strategy summary for logging.
-   *
-   * @param products All product computations to analyze
-   * @return Sequence of (component, strategy map, summary string) tuples
-   */
-  def analyzeComponentStrategies(
-      products: Seq[DeferredComputation]
-  ): Seq[(Set[DeferredComputation], Map[DeferredComputation, CountTrackStrategy], String)] = {
-    val components = findConflictComponents(products)
-
-    components.map { component =>
-      val strategies = assignCountTrackStrategies(component)
-
-      val directCount = strategies.count(_._2 == DirectCount)
-      val derivedCount = strategies.count(_._2.isInstanceOf[DerivedCount])
-      val deferredCount = strategies.count(_._2 == DeferredToFinal)
-
-      val hasHierarchy = hasContainmentStructure(component.toSeq)
-
-      val summary = if (hasHierarchy && derivedCount > 0) {
-        s"Hierarchical: $directCount direct, $derivedCount derived"
-      } else if (deferredCount > 0) {
-        s"Deferred: $deferredCount products deferred to final"
-      } else {
-        s"Independent: $directCount products can compute early"
-      }
-
-      (component, strategies, summary)
-    }
-  }
-
-  /**
-   * Check if a product belongs to an independent component (no conflicts).
-   *
-   * Independent products can use early computation at their join point
-   * without worrying about count track interference from other products.
-   */
-  def isIndependentProduct(
-      product: DeferredComputation,
-      allProducts: Seq[DeferredComputation]
-  ): Boolean = {
-    val components = findConflictComponents(allProducts)
-    components.find(_.contains(product)) match {
-      case Some(component) =>
-        // Check if component has no internal conflicts
-        val strategies = assignCountTrackStrategies(component)
-        strategies.get(product) match {
-          case Some(DirectCount) => true
-          case Some(DerivedCount(_)) => true  // Derived is also non-conflicting
-          case _ => false
-        }
-      case None => true  // Product not found means it's independent
-    }
-  }
-
-  /**
-   * Analyze products and return optimization recommendations.
-   *
-   * This is the main entry point for multi-count optimization analysis.
-   *
-   * @return A summary of the optimization strategy for logging and debugging
-   */
-  def analyzeMultiCountStrategy(products: Seq[DeferredComputation]): String = {
-    if (products.size < 2) {
-      return "Single product: standard count track"
-    }
-
-    val components = findConflictComponents(products)
-    val sb = new StringBuilder
-
-    val numProds = products.size
-    val numComps = components.size
-    sb.append(s"Multi-count analysis: $numProds products in $numComps component(s)\n")
-
-    components.zipWithIndex.foreach { case (component, idx) =>
-      val strategies = assignCountTrackStrategies(component)
-
-      val directCount = strategies.count(_._2 == DirectCount)
-      val derivedCount = strategies.count(_._2.isInstanceOf[DerivedCount])
-      val deferredCount = strategies.count(_._2 == DeferredToFinal)
-
-      sb.append(s"  Component ${idx + 1}: ${component.size} products\n")
-      sb.append(s"    Direct: $directCount, Derived: $derivedCount, Deferred: $deferredCount\n")
-
-      if (hasContainmentStructure(component.toSeq)) {
-        sb.append(s"    Has containment structure - hierarchical optimization applicable\n")
-      } else if (deferredCount > 0) {
-        sb.append(s"    No containment - falling back to deferred computation\n")
-      }
-    }
-
-    sb.toString()
   }
 
   /**
@@ -1222,7 +420,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                   .getOrElse(jointree)
               val reducedJoin = distinctRoot.buildBottomUpDistinctJoin(needed, isTop = true)
               val newAgg = Aggregate(groupingExpressions, resultExpressions, reducedJoin)
-              logWarning("new aggregate (distinct-reduced)")
+              logInfo("new aggregate (distinct-reduced)")
               debugLog("time difference: " + (System.nanoTime() - startTime))
               return newAgg
             }
@@ -1337,44 +535,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
           val filterComputations = deferredComputations.filter(
             _.computationType == CrossRelationFilter)
 
-          // Run comprehensive multi-count analysis. Its results feed only debugLog, so skip
-          // the whole (non-trivial) computation when debug logging is off.
-          if (DEBUG_LOGGING && productComputations.size >= 2) {
-            val analysisReport = analyzeMultiCountStrategy(productComputations)
-            debugLog("Multi-count optimization analysis:\n" + analysisReport)
-
-            // Log detailed containment structure
-            val hasContainment = hasContainmentStructure(productComputations)
-            if (hasContainment) {
-              val dag = buildContainmentDAG(productComputations)
-              debugLog("Containment DAG:")
-              dag.foreach { case (child, parents) =>
-                val childStr = s"{${child.attrs.map(_.name).mkString(",")}}"
-                val parentsStr = parents.map(p =>
-                  s"{${p.attrs.map(_.name).mkString(",")}}").mkString(", ")
-                if (parents.nonEmpty) {
-                  debugLog(s"  $childStr -> $parentsStr")
-                }
-              }
-            }
-
-            // Log connected components with per-component strategy analysis
-            val componentAnalysis = analyzeComponentStrategies(productComputations)
-            if (componentAnalysis.size > 1) {
-              debugLog(s"Independent product groups: ${componentAnalysis.size}")
-              componentAnalysis.zipWithIndex.foreach { case ((comp, _, summary), idx) =>
-                val prodStr = comp.map(p => s"{${p.attrs.map(_.name).mkString(",")}}")
-                  .mkString(", ")
-                debugLog(s"  Group ${idx + 1}: $prodStr")
-                debugLog(s"    Strategy: $summary")
-              }
-            } else if (componentAnalysis.nonEmpty) {
-              // Single component - log its strategy
-              val (_, _, summary) = componentAnalysis.head
-              debugLog(s"Single product group strategy: $summary")
-            }
-          }
-
           // =====================================================================
           // CONSERVATIVE CONFLICT DETECTION WITH ONE-WINNER FALLBACK
           // =====================================================================
@@ -1421,9 +581,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
               filterComputations.map(f => s"${f.expr}[${f.attrs.map(_.name).mkString(",")}]"))
           }
 
-          // For backward compatibility
-          val hasConflictingProducts = conflictingProductAttrs.nonEmpty
-
           debugLog("applicable query (joins=" + (items.size - 1) + ")")
 
           val (yannakakisJoins, countingAttribute, _, _) =
@@ -1442,12 +599,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
           debugLog("lastSumMap: " + lastSumMap)
           debugLog("resultExpressionsWithAliasesReplaced: " +
             resultExpressionsWithAliasesReplaced)
-
-          // Phase 4 (disabled for now - window-based approach needs more work)
-          // For conflicting products, we defer to the final aggregate with count multiplication
-          // The per-product conflict detection in Phase 1-2 handles this correctly
-          val productCountTrackMap = mutable.Map[Attribute, Attribute]()
-          val joinsWithWindowCounts: LogicalPlan = yannakakisJoins
 
           // Adapt the result expressions to make use of the frequency attribute
           val rewrittenResultExpressions = resultExpressionsWithAliasesReplaced.map {
@@ -1487,16 +638,14 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                                 a.withNewChildren(Seq(lastSumAtt))
                               }
                               else {
-                                // Phase 4: Use window count for conflicting products
-                                val countToUse = productCountTrackMap.getOrElse(
-                                  resultAtt, countingAttribute)
                                 // Multiply in the type SUM(c) would use so the count multiplication
                                 // does not overflow c's narrow type (e.g. Int) where vanilla's
                                 // promoted Sum accumulator would not (cf. the guarded Sum case).
                                 val c = a.children.head
                                 val wideType = Sum(c).dataType
                                 a.withNewChildren(
-                                  Seq(Multiply(Cast(c, wideType), Cast(countToUse, wideType))))
+                                  Seq(Multiply(Cast(c, wideType),
+                                    Cast(countingAttribute, wideType))))
                               }
                             case _ =>
                               // MIN, MAX
@@ -1536,7 +685,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             rewrittenResultExpressions.flatMap(_.references) ++
             groupingExpressions.flatMap(_.references)
           )
-          val allOutputs = joinsWithWindowCounts.output ++ groupAliasProjections
+          val allOutputs = yannakakisJoins.output ++ groupAliasProjections
           val prunedOutput = allOutputs.filter(attr => neededAttrs.contains(attr))
 
           // When piecewise-guardedness was established via join equivalences, the final
@@ -1547,7 +696,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
           val equivalenceAliases = neededAttrs.toSeq
             .filterNot(att => presentIds.contains(att.exprId))
             .flatMap(att => hg.getAttributeToVertex.get(att.exprId).flatMap(v =>
-              joinsWithWindowCounts.output.find(out =>
+              yannakakisJoins.output.find(out =>
                 hg.getAttributeToVertex.get(out.exprId).contains(v))
                 .map(out => Alias(out, att.name)(exprId = att.exprId))))
 
@@ -1558,9 +707,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
           }
           val newAgg = Aggregate(groupingExpressions,
             rewrittenResultExpressions,
-            Project(prunedOutput ++ equivalenceAliases, joinsWithWindowCounts))
+            Project(prunedOutput ++ equivalenceAliases, yannakakisJoins))
           val queryClass = if (piecewiseGuarded) "piecewise-guarded" else "unguarded"
-          logWarning(f"new aggregate ($queryClass)")
+          logInfo(f"new aggregate ($queryClass)")
           debugLog("time difference: " + (System.nanoTime() - startTime))
           newAgg
         }
@@ -1597,7 +746,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
               val yannakakisJoins = root.buildBottomUpJoins
               Aggregate(groupingExpressions, resultExpressions, yannakakisJoins)
             }
-            logWarning("new aggregate (0MA)")
+            logInfo("new aggregate (0MA)")
             debugLog("time difference: " + (System.nanoTime() - startTime))
             newAgg
           }
@@ -1736,7 +885,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             val newAgg = Aggregate(groupingExpressions,
               rewrittenResultExpressions, yannakakisJoins)
 
-            logWarning("new aggregate (guarded)")
+            logInfo("new aggregate (guarded)")
             debugLog("time difference: " + (System.nanoTime() - startTime))
             newAgg
           }
