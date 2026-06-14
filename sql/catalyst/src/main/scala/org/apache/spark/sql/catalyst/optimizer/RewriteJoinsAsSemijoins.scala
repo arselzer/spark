@@ -2188,15 +2188,15 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
       val newRightCount = Alias(Literal(1L, LongType), "c")()
 
-      var applicableGroupAttributes = groupingExpressions.filter(
+      // The genuine GROUP BY keys present on the current right plan.
+      val realGroupKeys = groupingExpressions.filter(
         groupExpr => {groupExpr.references.subsetOf(rightPlan.outputSet)}
       )
 
-      // Capture the grouping state BEFORE adding attributes for new products.
-      // This is used for pending product propagation - pending products should use
-      // count aggregations based on grouping that existed BEFORE this join adds
-      // new grouping for products being created here.
-      val groupingBeforeNewProducts = applicableGroupAttributes.toSeq
+      // Right-side attributes carried through this join only to keep product-aggregate and
+      // cross-relation-filter references available higher up the tree - NOT real grouping keys.
+      // The grouping passed to the CountJoin below is realGroupKeys ++ carriedAttributes.
+      var carriedAttributes = Seq.empty[NamedExpression]
 
       // For product aggregates (SUM(A*B) where A and B are from different relations),
       // we need to carry attributes through the tree until both are available.
@@ -2229,11 +2229,11 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
             if (needsCarryThrough) {
               // Add right-side refs to grouping to carry them through
               refsOnRight.foreach(att => {
-                val alreadyGrouped = applicableGroupAttributes.exists(
+                val alreadyGrouped = (realGroupKeys ++ carriedAttributes).exists(
                   g => g.references.contains(att))
                 if (!alreadyGrouped) {
                   val namedAtt = att.asInstanceOf[NamedExpression]
-                  applicableGroupAttributes = applicableGroupAttributes :+ namedAtt
+                  carriedAttributes = carriedAttributes :+ namedAtt
                   dbg(s"Added $att to grouping for product agg (carry through)")
                 }
               })
@@ -2245,11 +2245,11 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // We also need to ensure left-side refs are in grouping to prevent
               // collapsing of rows that have different left-side values.
               refsOnRight.foreach(att => {
-                val alreadyGrouped = applicableGroupAttributes.exists(
+                val alreadyGrouped = (realGroupKeys ++ carriedAttributes).exists(
                   g => g.references.contains(att))
                 if (!alreadyGrouped) {
                   val namedAtt = att.asInstanceOf[NamedExpression]
-                  applicableGroupAttributes = applicableGroupAttributes :+ namedAtt
+                  carriedAttributes = carriedAttributes :+ namedAtt
                   dbg(s"Added $att to grouping for product agg (for aggregate)")
                 }
               })
@@ -2269,16 +2269,20 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         // If not all refs are available yet, carry the right-side refs through
         if (refsNotYetAvailable.nonEmpty) {
           refsOnRight.foreach(att => {
-            val alreadyGrouped = applicableGroupAttributes.exists(
+            val alreadyGrouped = (realGroupKeys ++ carriedAttributes).exists(
               g => g.references.contains(att))
             if (!alreadyGrouped) {
               val namedAtt = att.asInstanceOf[NamedExpression]
-              applicableGroupAttributes = applicableGroupAttributes :+ namedAtt
+              carriedAttributes = carriedAttributes :+ namedAtt
               dbg(s"Added $att to grouping for cross-relation filter (carry through)")
             }
           })
         }
       })
+
+      // The grouping the CountJoin uses: the real GROUP BY keys plus the attributes carried for
+      // products/filters. Byte-identical to the value the single mutable var accumulated before.
+      val applicableGroupAttributes = realGroupKeys ++ carriedAttributes
 
       val join = if (usePhysicalCountJoin) {
         var applicableAggExpressions = Seq.empty[AggregateExpression]
