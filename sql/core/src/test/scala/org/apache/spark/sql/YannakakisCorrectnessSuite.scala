@@ -19,6 +19,7 @@ package org.apache.spark.sql
 
 import java.sql.Date
 
+import org.apache.spark.sql.execution.joins.{HashCountJoin, SortMergeCountJoinExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -1100,5 +1101,57 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertSameResults(
       "select sum(v) as s from nj_a a join nj_b b on a.k = b.k",
       "sum directly over a join")
+  }
+
+  test("MEASURE: how many count-join operators in grouped counting queries are codegen-able") {
+    // Data point for whether building grouped-path codegen is worth it: the shipped codegen only
+    // covers non-grouping count-joins (groupRight empty). This tallies, across a spread of grouped
+    // counting queries, how many count-join operators are codegen-able vs. fall to the interpreted
+    // grouping path - i.e. does GROUP BY push grouping INTO the count-joins, or stay at the top?
+    Seq((1, "g1", 10), (2, "g1", 20), (3, "g2", 30))
+      .toDF("k", "g", "v").createOrReplaceTempView("m_fact")
+    Seq(1, 1, 2, 3, 3).toDF("k").createOrReplaceTempView("m_d1")
+    Seq((10, 100), (20, 200), (30, 300)).toDF("v", "w").createOrReplaceTempView("m_d2")
+    Seq((1, 5), (2, 6), (3, 7)).toDF("k", "j").createOrReplaceTempView("m_b")
+    Seq(5, 5, 6, 7).toDF("j").createOrReplaceTempView("m_c")
+    val queries = Seq(
+      "star count(*) grouped by fact col" ->
+        "select g, count(*) as c from m_fact f, m_d1 d1 where f.k = d1.k group by g",
+      "star sum grouped by fact col" ->
+        "select g, sum(v) as s from m_fact f, m_d1 d1 where f.k = d1.k group by g",
+      "chain count(*) grouped by leaf col" ->
+        ("select g, count(*) as c from m_fact f, m_b b, m_c c " +
+          "where f.k = b.k and b.j = c.j group by g"),
+      "grouped by a dimension column" ->
+        ("select d2.w as w, count(*) as c from m_fact f, m_d1 d1, m_d2 d2 " +
+          "where f.k = d1.k and f.v = d2.v group by d2.w"),
+      "Q9 green-supplier revenue (grouped sum over 6 relations)" ->
+        ("select n_name as nation, extract(year from o_orderdate) as o_year, " +
+          "sum(l_extendedprice * (1 - l_discount)) as rev " +
+          "from part_t9, supplier_t9, lineitem_t9, partsupp_t9, orders_t9, nation_t9 " +
+          "where s_suppkey = l_suppkey and ps_suppkey = l_suppkey " +
+          "and ps_partkey = l_partkey and p_partkey = l_partkey " +
+          "and o_orderkey = l_orderkey and s_nationkey = n_nationkey and p_name like '%green%' " +
+          "group by n_name, extract(year from o_orderdate)"))
+    createQ9Tables()
+    withSQLConf((yannakakisOn :+ (SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      var total = 0
+      var codegenable = 0
+      // scalastyle:off println
+      for ((label, q) <- queries) {
+        val plan = sql(q).queryExecution.executedPlan
+        val cjs = plan.collect {
+          case cj: HashCountJoin => (cj.groupRight.isEmpty, cj.supportCodegen)
+          case cj: SortMergeCountJoinExec => (cj.groupRight.isEmpty, false)
+        }
+        total += cjs.size
+        codegenable += cjs.count(_._2)
+        println(s"MEASURE: [$label] ${cjs.size} count-joins, " +
+          s"${cjs.count(_._1)} non-grouping, ${cjs.count(_._2)} codegen-able")
+      }
+      println(s"MEASURE TOTAL: $codegenable / $total count-join operators codegen-able")
+      // scalastyle:on println
+      assert(total > 0, "expected the grouped counting queries to produce count-joins")
+    }
   }
 }
