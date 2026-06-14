@@ -1268,6 +1268,18 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             }
           }
 
+          // The unguarded/piecewise counting rewrite below handles Count and Sum and treats every
+          // other aggregate as MIN/MAX. Only Min/Max are actually correct under that default;
+          // Average, Percentile, stddev, etc. would be emitted WITHOUT count multiplication and
+          // silently return wrong results. Restrict to the functions this path rewrites correctly.
+          if (!aggregateExpressions.forall(ae => ae.aggregateFunction match {
+            case _: Count | _: Sum | _: Min | _: Max => true
+            case _ => false
+          })) {
+            debugLog("unguarded: unsupported aggregate function present - keeping original plan")
+            return agg
+          }
+
           // Cross-relation filters are folded into the CountJoin condition; rows whose matches
           // all fail the filter are now correctly dropped by the operator (the non-grouping
           // path emits nothing when rightCountSum == 0, and the grouping path produces no group),
@@ -1478,9 +1490,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                                 // Phase 4: Use window count for conflicting products
                                 val countToUse = productCountTrackMap.getOrElse(
                                   resultAtt, countingAttribute)
+                                // Multiply in the type SUM(c) would use so the count multiplication
+                                // does not overflow c's narrow type (e.g. Int) where vanilla's
+                                // promoted Sum accumulator would not (cf. the guarded Sum case).
+                                val c = a.children.head
+                                val wideType = Sum(c).dataType
                                 a.withNewChildren(
-                                  Seq(Multiply(a.children.head,
-                                    Cast(countToUse, a.children.head.dataType))))
+                                  Seq(Multiply(Cast(c, wideType), Cast(countToUse, wideType))))
                               }
                             case _ =>
                               // MIN, MAX
@@ -1593,6 +1609,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
               debugLog("mixed DISTINCT and plain aggregates - not applicable")
               return agg
             }
+            // The guarded counting rewrite below only knows Count/Percentile/Average/Sum. A Min/Max
+            // reaching here (it is mixed with a counting aggregate; pure min/max takes the 0MA
+            // branch above) or any other function (stddev, variance, collect_*, first/last, ...)
+            // has no case and would MatchError mid-optimization. Fall back instead of crashing.
+            if (!aggregateExpressions.forall(ae => ae.aggregateFunction match {
+              case _: Count | _: Percentile | _: Average | _: Sum => true
+              case _ => false
+            })) {
+              debugLog("guarded: unsupported aggregate function present - keeping original plan")
+              return agg
+            }
             // Cross-relation filters are folded into the CountJoin condition and rows whose
             // matches all fail them are dropped by the operator (see the unguarded path); the
             // guarded counting path no longer bails on them.
@@ -1623,72 +1650,83 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                 crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
                 conflictingProductAttrs = guardedConflictingAttrs)
 
-            val rewrittenResultExpressions = resultExpressions.map {
-              expr =>
-                expr.transformDown {
-                  case aggExpr @ AggregateExpression(aggFn, mode, isDistinct, filter, resultId) =>
-                    aggFn match {
-                      case a: Count =>
-                        // count must skip rows whose input is NULL: count(x) with
-                        // nullable x, and the CASE-desugared count(...) FILTER form
-                        val nullableInputs = a.children.filter(_.nullable)
-                        val countInput: Expression = if (nullableInputs.isEmpty) {
-                          countingAttribute
-                        } else {
-                          If(nullableInputs.map(IsNull(_): Expression).reduce(Or),
-                            Literal(0L, LongType), countingAttribute)
-                        }
-                        AggregateExpression(
-                        Sum(countInput), mode, isDistinct, filter, resultId)
-
-                      case Percentile(c, percExp, freqExp, mutableAggBufferOffset,
-                      inputAggBufferOffset, reverse) =>
-                        val freqExpr = countingAttribute
-                        AggregateExpression(
-                          Percentile(c, percExp, freqExpr, mutableAggBufferOffset,
-                            inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
-
-                      case Average(avgInput, _) =>
-                        // Multiply the whole input by the count exactly once. A
-                        // per-attribute multiplication would corrupt CASE predicates
-                        // and square the count for products of two attributes.
-                        val sumAggregateExpr = aggFn.transformUp {
-                          case a@Average(c, evalMode) =>
-                            // Multiply the numerator in SUM(c)'s type to avoid overflow.
-                            val wideType = Sum(c).dataType
-                            Sum(Multiply(Cast(c, wideType), Cast(countingAttribute, wideType),
-                              NumericEvalContext(evalMode)), NumericEvalContext(evalMode))
-                        }.asInstanceOf[AggregateFunction].toAggregateExpression()
-
-                        val countAggregateExpr = Sum(
-                          If(avgInput.isNull,
-                            Literal(0L, LongType), countingAttribute))
-                          .toAggregateExpression()
-                        Cast(
-                          if (DoubleType.acceptsType(sumAggregateExpr.dataType) &&
-                            DoubleType.acceptsType(countAggregateExpr.dataType)) {
-                            Divide(sumAggregateExpr, countAggregateExpr)
-                          } else {
-                            // TODO check if there is a better way than casting to DoubleDecimal?
-                            Divide(Cast(sumAggregateExpr, DoubleDecimal),
-                              Cast(countAggregateExpr, DoubleDecimal))
-                          }, aggExpr.dataType)
-
-                      case Sum(_, _) =>
-                        // Multiply the whole input by the count exactly once (see the
-                        // Average case above).
-                        AggregateExpression(aggFn.transformUp {
-                          case s @ Sum(c, evalMode) =>
-                            // Multiply in the type SUM(c) would use so the count multiplication
-                            // does not overflow c's narrow type (e.g. Int) where vanilla's
-                            // promoted Sum accumulator would not.
-                            val wideType = Sum(c).dataType
-                            Sum(Multiply(Cast(c, wideType), Cast(countingAttribute, wideType),
-                              evalMode), evalMode)
-                        }.asInstanceOf[AggregateFunction], mode, isDistinct, filter, resultId)
+            // Rewrite each aggregate in the result expressions. IMPORTANT: this recurses manually
+            // and stops at every rewritten aggregate instead of using transformDown, which
+            // re-descends into the *replacement* subtree (TreeNode.transformDownWithPruning line
+            // 506). A rewrite that introduces nested aggregates - Average -> SUM(x*c)/SUM(c) -
+            // would otherwise have the count multiplied a second time, producing SUM(x*c*c)/
+            // SUM(c*c): silently wrong whenever the per-row counts are not all equal (the square
+            // cancels only when every row's count is identical). Original SQL aggregates never
+            // nest, so each is rewritten exactly once.
+            def rewriteGuardedAggregate(e: Expression): Expression = e match {
+              case aggExpr @ AggregateExpression(aggFn, mode, isDistinct, filter, resultId) =>
+                aggFn match {
+                  case a: Count =>
+                    // count must skip rows whose input is NULL: count(x) with
+                    // nullable x, and the CASE-desugared count(...) FILTER form
+                    val nullableInputs = a.children.filter(_.nullable)
+                    val countInput: Expression = if (nullableInputs.isEmpty) {
+                      countingAttribute
+                    } else {
+                      If(nullableInputs.map(IsNull(_): Expression).reduce(Or),
+                        Literal(0L, LongType), countingAttribute)
                     }
-                }.asInstanceOf[NamedExpression]
+                    AggregateExpression(
+                    Sum(countInput), mode, isDistinct, filter, resultId)
+
+                  case Percentile(c, percExp, freqExp, mutableAggBufferOffset,
+                  inputAggBufferOffset, reverse) =>
+                    val freqExpr = countingAttribute
+                    AggregateExpression(
+                      Percentile(c, percExp, freqExpr, mutableAggBufferOffset,
+                        inputAggBufferOffset, reverse), mode, isDistinct, filter, resultId)
+
+                  case Average(avgInput, _) =>
+                    // Multiply the whole input by the count exactly once. A
+                    // per-attribute multiplication would corrupt CASE predicates
+                    // and square the count for products of two attributes.
+                    val sumAggregateExpr = aggFn.transformUp {
+                      case a@Average(c, evalMode) =>
+                        // Multiply the numerator in SUM(c)'s type to avoid overflow.
+                        val wideType = Sum(c).dataType
+                        Sum(Multiply(Cast(c, wideType), Cast(countingAttribute, wideType),
+                          NumericEvalContext(evalMode)), NumericEvalContext(evalMode))
+                    }.asInstanceOf[AggregateFunction].toAggregateExpression()
+
+                    val countAggregateExpr = Sum(
+                      If(avgInput.isNull,
+                        Literal(0L, LongType), countingAttribute))
+                      .toAggregateExpression()
+                    Cast(
+                      if (DoubleType.acceptsType(sumAggregateExpr.dataType) &&
+                        DoubleType.acceptsType(countAggregateExpr.dataType)) {
+                        Divide(sumAggregateExpr, countAggregateExpr)
+                      } else {
+                        // TODO check if there is a better way than casting to DoubleDecimal?
+                        Divide(Cast(sumAggregateExpr, DoubleDecimal),
+                          Cast(countAggregateExpr, DoubleDecimal))
+                      }, aggExpr.dataType)
+
+                  case Sum(_, _) =>
+                    // Multiply the whole input by the count exactly once (see the
+                    // Average case above).
+                    val widenedSum = AggregateExpression(aggFn.transformUp {
+                      case s @ Sum(c, evalMode) =>
+                        // Multiply in the type SUM(c) would use so the count multiplication
+                        // does not overflow c's narrow type (e.g. Int) where vanilla's
+                        // promoted Sum accumulator would not.
+                        val wideType = Sum(c).dataType
+                        Sum(Multiply(Cast(c, wideType), Cast(countingAttribute, wideType),
+                          evalMode), evalMode)
+                    }.asInstanceOf[AggregateFunction], mode, isDistinct, filter, resultId)
+                    // The wide multiply can change the static type (a high-scale decimal clamps to
+                    // DECIMAL(38,6)); cast back so the rewritten output schema matches vanilla.
+                    Cast(widenedSum, aggExpr.dataType)
+                }
+              case other => other.mapChildren(rewriteGuardedAggregate)
             }
+            val rewrittenResultExpressions = resultExpressions.map(e =>
+              rewriteGuardedAggregate(e).asInstanceOf[NamedExpression])
 
             if (baselineBroadcastsAllButLargest(items)) {
               debugLog("cost gate: baseline broadcasts all but the largest relation - " +
@@ -1720,9 +1758,19 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
         join@Join(_, _, Inner, _, _)), _) =>
-          validateOrFallback(agg,
-            rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-              join, keyRefs = Seq(), uniqueConstraints = Seq()))
+          // Defense-in-depth: the rewrite explicitly falls back on shapes it cannot handle, but
+          // any unforeseen unhandled case (e.g. an aggregate function with no rewrite branch)
+          // must degrade to the original plan rather than fail the whole query.
+          try {
+            validateOrFallback(agg,
+              rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+                join, keyRefs = Seq(), uniqueConstraints = Seq()))
+          } catch {
+            case scala.util.control.NonFatal(e) =>
+              logWarning("yannakakis rewrite failed; falling back to the original plan: " +
+                e.getMessage)
+              agg
+          }
         case agg@Aggregate(_, _, _, _) =>
           debugLog("not applicable to aggregate: " + agg)
           agg

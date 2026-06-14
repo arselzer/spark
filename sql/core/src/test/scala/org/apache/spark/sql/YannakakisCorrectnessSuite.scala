@@ -943,4 +943,103 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     val query = "select count(*) as c from uq_fact f join uq_dim d on f.k = d.k"
     assertCountJoinCodegenMatches(query, "unique-build-key count(*)")
   }
+
+  // ---- Aggregate-dispatch correctness (rewrite rule) -------------------------------------
+
+  test("unguarded AVG over a fan-out join matches vanilla (must not drop count multiplication)") {
+    // a.g (group) is in dim_a, avg input x is in dim_c, bridged by fact_b: no single relation
+    // contains both g and x, so this takes the unguarded/piecewise count-join path. With fan-out
+    // on j=20 (two c rows), the unweighted average over the count-reduced rows != the true mean.
+    // Vanilla per g=X: x in {100,200,300} -> avg = 200.0.
+    Seq((1, "X"), (2, "X")).toDF("k", "g").createOrReplaceTempView("avu_a")
+    Seq((1, 10), (2, 20)).toDF("k", "j").createOrReplaceTempView("avu_b")
+    Seq((10, 100.0), (20, 200.0), (20, 300.0)).toDF("j", "x").createOrReplaceTempView("avu_c")
+    assertSameResults(
+      "select g, avg(x) as a from avu_a a, avu_b b, avu_c c " +
+        "where a.k = b.k and b.j = c.j group by g",
+      "unguarded avg over fan-out")
+  }
+
+  test("guarded AVG over a fan-out join matches vanilla (count-multiplied numerator/denominator)") {
+    // {g, x} both in fact -> guarded; dim duplicates the key (x2 fan-out). The guarded path
+    // computes SUM(x*count)/SUM(count). Vanilla per g=X over [100,100,200,200] -> avg = 150.0.
+    Seq(("X", 100.0, 1), ("X", 200.0, 1)).toDF("g", "x", "k").createOrReplaceTempView("avg_fact")
+    Seq(1, 1).toDF("k").createOrReplaceTempView("avg_dim")
+    assertSameResults(
+      "select g, avg(x) as a from avg_fact f join avg_dim d on f.k = d.k group by g",
+      "guarded avg over fan-out")
+  }
+
+  test("guarded AVG with NON-UNIFORM per-row counts matches vanilla (no count-squaring)") {
+    // x=100 has count 1 (k=1 once), x=200 has count 2 (k=2 twice). The correct weighted mean is
+    // SUM(x*c)/SUM(c) = 500/3 = 166.67. A buggy SUM(x*c*c)/SUM(c*c) = 900/5 = 180. Uniform-count
+    // data hides this because the squared count cancels; non-uniform counts expose it.
+    Seq(("X", 100.0, 1), ("X", 200.0, 2)).toDF("g", "x", "k").createOrReplaceTempView("avgn_fact")
+    Seq(1, 2, 2).toDF("k").createOrReplaceTempView("avgn_dim")
+    assertSameResults(
+      "select g, avg(x) as a from avgn_fact f join avgn_dim d on f.k = d.k group by g",
+      "guarded avg with non-uniform counts")
+  }
+
+  test("guarded query mixing SUM and MIN must not crash (unrecognized aggregate falls back)") {
+    // {x, y, g} all in fact -> guarded; sum(x) makes it a counting query, but the guarded
+    // counting branch has no MIN case -> currently a MatchError mid-optimization. Must fall back
+    // and match vanilla. Vanilla per g=X (x2 fan-out): sum(x)=24, min(y)=100.
+    Seq(("X", 5, 100, 1), ("X", 7, 200, 1))
+      .toDF("g", "x", "y", "k").createOrReplaceTempView("mix_fact")
+    Seq(1, 1).toDF("k").createOrReplaceTempView("mix_dim")
+    assertSameResults(
+      "select g, sum(x) as s, min(y) as m from mix_fact f join mix_dim d on f.k = d.k group by g",
+      "guarded sum + min")
+  }
+
+  test("query mixing SUM and STDDEV must not crash (unrecognized aggregate falls back)") {
+    Seq(("X", 5.0, 1), ("X", 7.0, 1), ("Y", 9.0, 2))
+      .toDF("g", "x", "k").createOrReplaceTempView("sd_fact")
+    Seq(1, 1, 2).toDF("k").createOrReplaceTempView("sd_dim")
+    assertSameResults(
+      "select g, sum(x) as s, stddev(x) as sd from sd_fact f join sd_dim d on f.k = d.k group by g",
+      "sum + stddev")
+  }
+
+  test("NULL join keys never match (count/sum over a nullable join key) matches vanilla") {
+    // equi-join treats NULL = NULL as false, so the null-keyed rows drop. A miscounted semijoin
+    // or count would diverge here.
+    Seq((Some(1), "X"), (None, "Y"), (Some(2), "Z"))
+      .toDF("k", "g").createOrReplaceTempView("nk_a")
+    Seq(Some(1), Some(1), None, Some(2)).toDF("k").createOrReplaceTempView("nk_b")
+    assertSameResults(
+      "select g, count(*) as c from nk_a a join nk_b b on a.k = b.k group by g",
+      "null join keys count")
+  }
+
+  test("decimal carried aggregate over a fan-out join matches vanilla (precision preserved)") {
+    Seq((1, BigDecimal("12345.67")), (2, BigDecimal("0.01")))
+      .toDF("k", "x").createOrReplaceTempView("dec_fact")
+    Seq(1, 1, 1, 2).toDF("k").createOrReplaceTempView("dec_dim")
+    assertSameResults(
+      "select sum(x) as s from dec_fact f join dec_dim d on f.k = d.k",
+      "decimal sum over fan-out")
+  }
+
+  test("empty join result: ungrouped count(*)=0 and sum=NULL match vanilla") {
+    Seq((1, 100), (2, 200)).toDF("k", "x").createOrReplaceTempView("ej_a")
+    Seq(7, 8, 9).toDF("k").createOrReplaceTempView("ej_b")
+    assertSameResults(
+      "select count(*) as c, sum(x) as s from ej_a a join ej_b b on a.k = b.k",
+      "empty join count/sum")
+  }
+
+  test("count-multiplied SUM over narrow Int does not overflow under ANSI (widened accumulator)") {
+    // x is Int near Int.MaxValue; with x3 fan-out, sum(x) = 6e9 > Int.MaxValue but fits in the
+    // promoted (bigint) accumulator. A count multiplication done in the narrow Int type would
+    // overflow (throw under ANSI / wrap otherwise); vanilla sum(int) promotes and does not.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      Seq((1, 2000000000)).toDF("k", "x").createOrReplaceTempView("ovf_fact")
+      Seq(1, 1, 1).toDF("k").createOrReplaceTempView("ovf_dim")
+      assertSameResults(
+        "select sum(x) as s from ovf_fact f join ovf_dim d on f.k = d.k",
+        "narrow-int sum overflow under ANSI")
+    }
+  }
 }
