@@ -76,6 +76,34 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
   }
 
   /**
+   * With the rewrite on, asserts the count-join is whole-stage-codegen'd and that running the
+   * query with whole-stage codegen ON produces identical rows to running it with codegen OFF
+   * (the interpreted oracle). `extraConf` lets a caller force the shuffled path etc.
+   */
+  private def assertCountJoinCodegenMatches(
+      query: String, hint: String, extraConf: (String, String)*): Unit = {
+    withSQLConf((yannakakisOn ++ extraConf): _*) {
+      // AQE off so the WholeStageCodegen `*(n)` markers are present in the static executedPlan
+      // (under AQE they only appear after the plan is finalized at run time).
+      val onPlan = withSQLConf(
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        sql(query).queryExecution.executedPlan.toString
+      }
+      assert(onPlan.linesIterator.exists(_.matches(".*\\*\\(\\d+\\).*HashCountJoin.*")),
+        s"$hint: the count-join should be whole-stage-codegen'd:\n$onPlan")
+      val on = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      val off = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      assert(on == off, s"$hint: codegen result $on != interpreted $off")
+    }
+    assertSameResults(query, hint)
+  }
+
+  /**
    * Runs `query` with the rewrite on, asserts the results equal the baseline (rewrite off)
    * AND that the non-guarded distinct path actually fired (logs "distinct-reduced").
    */
@@ -884,5 +912,35 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       SQLConf.SORT_MERGE_JOIN_EXEC_BUFFER_IN_MEMORY_THRESHOLD.key -> "1") {
       assertSameResults(query, "grouped count-join under sort-merge spill")
     }
+  }
+
+  test("codegen: pure-count count-join matches interpreted (whole-stage on vs off)") {
+    // 3-relation chain with DIFFERENT multiplicities (a:2 per k, c:3 per j) so a count side-swap
+    // would change the total. count(*) carries only the count (aggregatesRight empty) - the
+    // pure-count codegen path. Expected count = 2 * 1 * 3 = 6.
+    Seq(1, 1).toDF("k").createOrReplaceTempView("cg_a")
+    Seq((1, 10)).toDF("k", "j").createOrReplaceTempView("cg_b")
+    Seq(10, 10, 10).toDF("j").createOrReplaceTempView("cg_c")
+    val query = "select count(*) as c from cg_a a, cg_b b, cg_c c where a.k = b.k and b.j = c.j"
+    assertCountJoinCodegenMatches(query, "pure-count 3-relation chain count(*)")
+  }
+
+  test("codegen: count-join on the shuffled-hash path matches interpreted") {
+    // Broadcast disabled -> ShuffledHashCountJoin (keyIsUnique always false -> iterator branch).
+    Seq(1, 1, 2, 2, 2).toDF("k").createOrReplaceTempView("sh_a")
+    Seq((1, 10), (2, 20)).toDF("k", "j").createOrReplaceTempView("sh_b")
+    Seq(10, 10, 20).toDF("j").createOrReplaceTempView("sh_c")
+    val query = "select count(*) as c from sh_a a, sh_b b, sh_c c where a.k = b.k and b.j = c.j"
+    assertCountJoinCodegenMatches(query, "shuffled-hash count(*)",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
+  }
+
+  test("codegen: count-join with a unique build key (getValue branch) matches interpreted") {
+    // Build (right) side keys are unique -> the broadcast relation reports keyIsUnique=true, so
+    // codegen takes the getValue branch rather than the iterator branch.
+    Seq(1, 1, 2, 2, 2, 3).toDF("k").createOrReplaceTempView("uq_fact")
+    Seq(1, 2, 3, 4).toDF("k").createOrReplaceTempView("uq_dim")
+    val query = "select count(*) as c from uq_fact f join uq_dim d on f.k = d.k"
+    assertCountJoinCodegenMatches(query, "unique-build-key count(*)")
   }
 }

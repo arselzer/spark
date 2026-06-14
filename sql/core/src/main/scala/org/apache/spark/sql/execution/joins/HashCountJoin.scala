@@ -56,6 +56,13 @@ trait HashCountJoin extends JoinCodegenSupport {
 
   def buildSide: BuildSide
 
+  // Constructor params of the concrete execs (Broadcast/ShuffledHashCountJoinExec), exposed as
+  // trait members so the codegen path below can reach them.
+  def countLeft: Option[Expression]
+  def countRight: Option[NamedExpression]
+  def aggregatesRight: Seq[AggregateExpression]
+  def groupRight: Seq[NamedExpression]
+
   override def simpleStringWithNodeId(): String = {
     val opId = ExplainUtils.getOpId(this)
     s"$nodeName $joinType ${buildSide} ($opId)".trim
@@ -79,7 +86,13 @@ trait HashCountJoin extends JoinCodegenSupport {
     }
   }
 
-  override def supportCodegen: Boolean = false
+  // Whole-stage codegen is implemented for the non-grouping inner path: count(*)/count-only as
+  // well as carried DeclarativeAggregates (single fixed-position aggregate buffer, no grouping).
+  // Grouping paths stay interpreted (no HashMap codegen analog yet).
+  override def supportCodegen: Boolean =
+    groupRight.isEmpty && joinType.isInstanceOf[InnerLike] &&
+      buildSide == BuildRight &&
+      aggregatesRight.forall(_.aggregateFunction.isInstanceOf[DeclarativeAggregate])
 
   override def outputPartitioning: Partitioning = buildSide match {
     case BuildLeft =>
@@ -657,7 +670,7 @@ trait HashCountJoin extends JoinCodegenSupport {
 
   override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
     joinType match {
-      case _: InnerLike => codegenInner(ctx, input)
+      case _: InnerLike => codegenCountInner(ctx, input)
       case LeftOuter | RightOuter => codegenOuter(ctx, input)
       case LeftSemi => codegenSemi(ctx, input)
       case LeftAnti => codegenAnti(ctx, input)
@@ -739,6 +752,139 @@ trait HashCountJoin extends JoinCodegenSupport {
          |}
        """.stripMargin
     }
+  }
+
+  /**
+   * Inner-join codegen for the non-grouping, pure-count path: per stream row, accumulate the
+   * (count-multiplied) number of build matches that pass the residual condition and emit ONE row
+   * (left cols ++ count), or nothing when no match passes (the phantom-count-0 case).
+   */
+  protected def codegenCountInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+    assert(buildSide == BuildRight, "count join must build the right side")
+    val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
+    if (isEmptyHashedRelation) {
+      return "// empty HashedRelation: count inner join returns nothing"
+    }
+    val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
+    val (matched, checkCondition, buildVars) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
+    val numOutput = metricTerm(ctx, "numOutputRows")
+
+    // Ordinals index streamedOutput (= left, the stream side) and buildOutput (= right).
+    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
+      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
+      .map(c => buildOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+
+    val rightCountSum = ctx.freshName("rightCountSum")
+    val leftCount = ctx.freshName("leftCount")
+    val countOut = ctx.freshName("countOut")
+
+    // leftCount: the stream-side carried count (or 1 at a leaf). Force-evaluate the stream var and
+    // blank its ExprCode so the later consume(input) does not re-declare it.
+    val leftCountSetup = if (leftCountOrdinal != -1) {
+      val eval = evaluateRequiredVariables(
+        streamedPlan.output, input, AttributeSet(countLeft.get.references))
+      s"$eval\nlong $leftCount = ${input(leftCountOrdinal).value};"
+    } else {
+      s"long $leftCount = 1L;"
+    }
+
+    // Aggregate buffer (single buffer, no grouping): reset per stream row, updated per match.
+    val aggFns = aggregatesRight.map(_.aggregateFunction.asInstanceOf[DeclarativeAggregate])
+    val bufferSchema = aggFns.flatMap(_.aggBufferAttributes)
+    val bufVarsAndInit = aggFns.map(_.initialValues).map { exprs =>
+      exprs.map { e =>
+        val isNull = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "cjBufIsNull")
+        val value = ctx.addMutableState(CodeGenerator.javaType(e.dataType), "cjBufValue")
+        val ev = e.genCode(ctx)
+        val initStr = s"${ev.code}\n$isNull = ${ev.isNull};\n$value = ${ev.value};"
+        (ExprCode(EmptyBlock, JavaCode.isNullGlobal(isNull), JavaCode.global(value, e.dataType)),
+          initStr)
+      }
+    }
+    val bufVars = bufVarsAndInit.map(_.map(_._1))
+    val flatBufVars = bufVars.flatten
+    // Per-stream-row reset = re-run the buffer-init statements (captured as strings so we never
+    // re-emit consumed ExprCodes, which would bleed the previous row's buffer).
+    val bufferReset = bufVarsAndInit.flatten.map(_._2).mkString("\n")
+
+    val updateExprs = aggregatesRight.map { e =>
+      e.mode match {
+        case Partial | Complete =>
+          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].updateExpressions
+        case _ =>
+          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].mergeExpressions
+      }
+    }
+    // Force-evaluate (once per match) the build vars referenced by the count column and by the
+    // aggregate update; buildVars are otherwise lazy and would be uninitialised when read.
+    val neededBuildRefs = AttributeSet(
+      countRight.toSeq.flatMap(_.references) ++ updateExprs.flatten.flatMap(_.references))
+    val buildEval = evaluateRequiredVariables(buildPlan.output, buildVars, neededBuildRefs)
+    val rightCountAccum = if (rightCountOrdinal != -1) {
+      s"$rightCountSum += ${buildVars(rightCountOrdinal).value};"
+    } else {
+      s"$rightCountSum += 1L;"
+    }
+    // Per-match update: read-before-write into the buffer.
+    ctx.currentVars = flatBufVars ++ buildVars
+    val bufferEvals = updateExprs.map(u =>
+      bindReferences(u, bufferSchema ++ buildPlan.output).map(_.genCode(ctx)))
+    val updateCode = bufferEvals.zipWithIndex.map { case (evalsForFn, i) =>
+      val writes = evalsForFn.zip(bufVars(i)).map { case (ev, bv) =>
+        s"${bv.isNull} = ${ev.isNull};\n${bv.value} = ${ev.value};"
+      }
+      s"${evaluateVariables(evalsForFn)}\n${writes.mkString("\n")}"
+    }.mkString("\n")
+
+    val matchBody = s"$buildEval\n$rightCountAccum\n$updateCode"
+    val matchLoop = if (keyIsUnique) {
+      s"""
+         |UnsafeRow $matched = $anyNull ? null : (UnsafeRow)$relationTerm.getValue(${keyEv.value});
+         |if ($matched != null) {
+         |  $checkCondition {
+         |    $matchBody
+         |  }
+         |}
+       """.stripMargin
+    } else {
+      val matches = ctx.freshName("matches")
+      val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+      s"""
+         |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
+         |if ($matches != null) {
+         |  while ($matches.hasNext()) {
+         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |    $checkCondition {
+         |      $matchBody
+         |    }
+         |  }
+         |}
+       """.stripMargin
+    }
+
+    // Post-loop: evaluate the aggregate results from the buffer.
+    ctx.currentVars = flatBufVars
+    val aggResultVars =
+      bindReferences(aggFns.map(_.evaluateExpression), bufferSchema).map(_.genCode(ctx))
+    val aggResultEval = evaluateVariables(aggResultVars)
+
+    val countEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(countOut, LongType))
+    val resultVars = input ++ Seq(countEv) ++ aggResultVars
+
+    s"""
+       |${keyEv.code}
+       |long $rightCountSum = 0L;
+       |$leftCountSetup
+       |$bufferReset
+       |$matchLoop
+       |if ($rightCountSum != 0L) {
+       |  long $countOut = $rightCountSum * $leftCount;
+       |  $aggResultEval
+       |  $numOutput.add(1);
+       |  ${consume(ctx, resultVars)}
+       |}
+     """.stripMargin
   }
 
   /**

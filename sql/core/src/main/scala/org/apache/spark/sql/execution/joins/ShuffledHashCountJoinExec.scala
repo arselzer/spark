@@ -339,8 +339,6 @@ case class ShuffledHashCountJoinExec(
     streamResultIter ++ buildResultIter
   }
 
-  override def supportCodegen: Boolean = false
-
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
     streamedPlan.execute() :: buildPlan.execute() :: Nil
   }
