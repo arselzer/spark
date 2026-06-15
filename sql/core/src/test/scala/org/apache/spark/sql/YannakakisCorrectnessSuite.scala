@@ -1077,6 +1077,49 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
   }
 
+  // Forces the sort-merge count-join operator and asserts it is whole-stage-codegen'd (the
+  // `*(n) ... SortMergeCountJoin` marker), then that codegen results equal interpreted (codegen
+  // off) and vanilla. Before SMJ codegen support the operator runs interpreted (no marker) -> fail.
+  private def assertSMJCountJoinCodegenMatches(query: String, hint: String): Unit = {
+    val smjConf = Seq(
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> "sortMerge",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+    withSQLConf((yannakakisOn ++ smjConf): _*) {
+      val onPlan = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        sql(query).queryExecution.executedPlan.toString
+      }
+      assert(onPlan.linesIterator.exists(_.matches(".*\\*\\(\\d+\\).*SortMergeCountJoin.*")),
+        s"$hint: the SMJ count-join should be whole-stage-codegen'd:\n$onPlan")
+      val on = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      val off = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      assert(on == off, s"$hint: SMJ codegen result $on != interpreted $off")
+    }
+    assertSameResults(query, hint)
+  }
+
+  test("codegen: sort-merge count-join (non-grouping) matches interpreted") {
+    // fan-out on k (a has dup keys) with a carried SUM over the build (dim) column v.
+    Seq(1, 1, 2, 2, 2).toDF("k").createOrReplaceTempView("smjng_a")
+    Seq((1, 100), (2, 200)).toDF("k", "v").createOrReplaceTempView("smjng_b")
+    val query = "select count(*) as c, sum(v) as s from smjng_a a join smjng_b b on a.k = b.k"
+    assertSMJCountJoinCodegenMatches(query, "SMJ non-grouping count+sum")
+  }
+
+  test("codegen: sort-merge GROUPED count-join matches interpreted") {
+    // group by a build (dim) column g, carried SUM over build column v, fan-out on k.
+    Seq(1, 1, 2, 2, 2, 3).toDF("k").createOrReplaceTempView("smjg_a")
+    Seq((1, 100, "x"), (2, 200, "y"), (3, 300, "x"))
+      .toDF("k", "v", "g").createOrReplaceTempView("smjg_b")
+    val query =
+      "select g, count(*) as c, sum(v) as s from smjg_a a join smjg_b b on a.k = b.k group by g"
+    assertSMJCountJoinCodegenMatches(query, "SMJ grouped count+sum")
+  }
+
   test("codegen: two count-joins on the same key fuse into one stage without colliding") {
     // f joins d1 and d2 BOTH on k, so the two count-joins are co-partitioned on k - no exchange
     // between them, so whole-stage codegen fuses them into one stage. Each count-join builds its

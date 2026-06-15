@@ -22,15 +22,13 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
-import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Complete, DeclarativeAggregate, Partial}
 import org.apache.spark.sql.catalyst.expressions.codegen._
-import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.sql.types.BooleanType
-import org.apache.spark.util.collection.BitSet
+import org.apache.spark.sql.types.LongType
 
 /**
  * Performs a sort merge join of two child relations.
@@ -182,12 +180,17 @@ case class SortMergeCountJoinExec(
   private lazy val streamedOutput = streamedPlan.output
   private lazy val bufferedOutput = bufferedPlan.output
 
-//  override def supportCodegen: Boolean = joinType match {
-//    case FullOuter => conf.getConf(SQLConf.ENABLE_FULL_OUTER_SORT_MERGE_JOIN_CODEGEN)
-//    case _: ExistenceJoin => conf.getConf(SQLConf.ENABLE_EXISTENCE_SORT_MERGE_JOIN_CODEGEN)
-//    case _ => true
-//  }
-  override def supportCodegen: Boolean = false
+  // Only the inner count-join path is codegen'd (the rewrite only ever emits inner). Both the
+  // grouping and non-grouping inner paths are supported; non-declarative aggregates fall back to
+  // the interpreted evaluator (supportCodegen = false routes doExecute through the factory).
+  override def supportCodegen: Boolean =
+    joinType.isInstanceOf[InnerLike] &&
+      aggregatesRight.forall(_.aggregateFunction.isInstanceOf[DeclarativeAggregate])
+
+  // Per-task grouped aggregator (group-key projection + buffer init/eval), built from generated
+  // code via the plan reference. Build side is always the right child for an inner count join.
+  def createGroupedAggregator(): GroupedCountAggregator =
+    new GroupedCountAggregator(aggregatesRight, groupRight, right.output)
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
     streamedPlan.execute() :: bufferedPlan.execute() :: Nil
@@ -247,11 +250,13 @@ case class SortMergeCountJoinExec(
     val clsName = classOf[ExternalAppendOnlyUnsafeRowArray].getName
 
     val spillThreshold = getSpillThreshold
+    val sizeInBytesSpillThreshold = getSizeInBytesSpillThreshold
     val inMemoryThreshold = getInMemoryThreshold
 
     // Inline mutable state since not many join operations in a task
     val matches = ctx.addMutableState(clsName, "matches",
-      v => s"$v = new $clsName($inMemoryThreshold, $spillThreshold);", forceInline = true)
+      v => s"$v = new $clsName($inMemoryThreshold, ${sizeInBytesSpillThreshold}L, " +
+        s"$spillThreshold, ${sizeInBytesSpillThreshold}L);", forceInline = true)
     // Copy the streamed keys as class members so they could be used in next function call.
     val matchedKeyVars = copyKeys(ctx, streamedKeyVars)
 
@@ -391,67 +396,6 @@ case class SortMergeCountJoinExec(
     (findNextJoinRowsFuncName, streamedRow, matches)
   }
 
-  /**
-   * Creates variables and declarations for streamed part of result row.
-   *
-   * In order to defer the access after condition and also only access once in the loop,
-   * the variables should be declared separately from accessing the columns, we can't use the
-   * codegen of BoundReference here.
-   */
-  private def createStreamedVars(
-      ctx: CodegenContext,
-      streamedRow: String): (Seq[ExprCode], Seq[String]) = {
-    ctx.INPUT_ROW = streamedRow
-    streamedPlan.output.zipWithIndex.map { case (a, i) =>
-      val value = ctx.freshName("value")
-      val valueCode = CodeGenerator.getValue(streamedRow, a.dataType, i.toString)
-      val javaType = CodeGenerator.javaType(a.dataType)
-      val defaultValue = CodeGenerator.defaultValue(a.dataType)
-      if (a.nullable) {
-        val isNull = ctx.freshName("isNull")
-        val code =
-          code"""
-             |$isNull = $streamedRow.isNullAt($i);
-             |$value = $isNull ? $defaultValue : ($valueCode);
-           """.stripMargin
-        val streamedVarsDecl =
-          s"""
-             |boolean $isNull = false;
-             |$javaType $value = $defaultValue;
-           """.stripMargin
-        (ExprCode(code, JavaCode.isNullVariable(isNull), JavaCode.variable(value, a.dataType)),
-          streamedVarsDecl)
-      } else {
-        val code = code"$value = $valueCode;"
-        val streamedVarsDecl = s"""$javaType $value = $defaultValue;"""
-        (ExprCode(code, FalseLiteral, JavaCode.variable(value, a.dataType)), streamedVarsDecl)
-      }
-    }.unzip
-  }
-
-  /**
-   * Splits variables based on whether it's used by condition or not, returns the code to create
-   * these variables before the condition and after the condition.
-   *
-   * Only a few columns are used by condition, then we can skip the accessing of those columns
-   * that are not used by condition also filtered out by condition.
-   */
-  private def splitVarsByCondition(
-      attributes: Seq[Attribute],
-      variables: Seq[ExprCode]): (String, String) = {
-    if (condition.isDefined) {
-      val condRefs = condition.get.references
-      val (used, notUsed) = attributes.zip(variables).partition{ case (a, ev) =>
-        condRefs.contains(a)
-      }
-      val beforeCond = evaluateVariables(used.map(_._2))
-      val afterCond = evaluateVariables(notUsed.map(_._2))
-      (beforeCond, afterCond)
-    } else {
-      (evaluateVariables(variables), "")
-    }
-  }
-
   override def needCopyResult: Boolean = true
 
   /**
@@ -462,143 +406,107 @@ case class SortMergeCountJoinExec(
   }
 
   override def doProduce(ctx: CodegenContext): String = {
-    // Specialize `doProduce` code for full outer join, because full outer join needs to
-    // buffer both sides of join.
-    if (joinType == FullOuter) {
-      return codegenFullOuter(ctx)
-    }
+    if (groupRight.isEmpty) produceCountInner(ctx) else produceCountGroupedInner(ctx)
+  }
 
-    // Inline mutable state since not many join operations in a task
+  // Non-grouping inner count join. Mirrors HashCountJoin.codegenCountInner: per streamed (left)
+  // row, fold the count-multiplied matches into a single aggregate buffer and emit one row (left
+  // cols ++ count ++ aggregate results), or nothing when no match passes the residual condition
+  // (the phantom-count-0 case). The only structural difference from the hash path is the match
+  // source - the sort-merge scanner's buffered `matches` array rather than a HashedRelation probe.
+  private def produceCountInner(ctx: CodegenContext): String = {
     val streamedInput = ctx.addMutableState("scala.collection.Iterator", "streamedInput",
       v => s"$v = inputs[0];", forceInline = true)
     val bufferedInput = ctx.addMutableState("scala.collection.Iterator", "bufferedInput",
       v => s"$v = inputs[1];", forceInline = true)
 
     val (findNextJoinRowsFuncName, streamedRow, matches) = genScanner(ctx)
-
-    // Create variables for row from both sides.
-    val (streamedVars, streamedVarDecl) = createStreamedVars(ctx, streamedRow)
-    val bufferedRow = ctx.freshName("bufferedRow")
-    val setDefaultValue = joinType == LeftOuter || joinType == RightOuter
-    val bufferedVars = genOneSideJoinVars(ctx, bufferedRow, bufferedPlan, setDefaultValue)
-
-    // Create variable name for Existence join.
-    val existsVar = joinType match {
-      case ExistenceJoin(_) => Some(ctx.freshName("exists"))
-      case _ => None
-    }
-
-    val iterator = ctx.freshName("iterator")
-    val numOutput = metricTerm(ctx, "numOutputRows")
-    val resultVars = joinType match {
-      case _: InnerLike | LeftOuter =>
-        streamedVars ++ bufferedVars
-      case RightOuter =>
-        bufferedVars ++ streamedVars
-      case LeftSemi | LeftAnti =>
-        streamedVars
-      case ExistenceJoin(_) =>
-        streamedVars ++ Seq(ExprCode.forNonNullValue(
-          JavaCode.variable(existsVar.get, BooleanType)))
-      case x =>
-        throw new IllegalArgumentException(
-          s"SortMergeJoin.doProduce should not take $x as the JoinType")
-    }
-
-    val (streamedBeforeLoop, condCheck, loadStreamed) = if (condition.isDefined) {
-      // Split the code of creating variables based on whether it's used by condition or not.
-      val loaded = ctx.freshName("loaded")
-      val (streamedBefore, streamedAfter) = splitVarsByCondition(streamedOutput, streamedVars)
-      val (bufferedBefore, bufferedAfter) = splitVarsByCondition(bufferedOutput, bufferedVars)
-      // Generate code for condition
-      ctx.currentVars = streamedVars ++ bufferedVars
-      val cond = BindReferences.bindReference(
-        condition.get, streamedPlan.output ++ bufferedPlan.output).genCode(ctx)
-      // Evaluate the columns those used by condition before loop
-      val before = joinType match {
-        case LeftAnti =>
-          // No need to initialize `loaded` variable for Left Anti join.
-          streamedBefore.trim
-        case _ =>
-          s"""
-             |boolean $loaded = false;
-             |$streamedBefore
-         """.stripMargin
-      }
-
-      val loadStreamedAfterCondition = joinType match {
-        case LeftAnti =>
-          // No need to evaluate columns not used by condition from streamed side, as for Left Anti
-          // join, streamed row with match is not outputted.
-          ""
-        case _ =>
-          s"""
-             |if (!$loaded) {
-             |  $loaded = true;
-             |  $streamedAfter
-             |}
-         """.stripMargin
-      }
-
-      val loadBufferedAfterCondition = joinType match {
-        case LeftExistence(_) =>
-          // No need to evaluate columns not used by condition from buffered side
-          ""
-        case _ => bufferedAfter
-      }
-
-      val checking =
-        s"""
-           |$bufferedBefore
-           |if ($bufferedRow != null) {
-           |  ${cond.code}
-           |  if (${cond.isNull} || !${cond.value}) {
-           |    continue;
-           |  }
-           |}
-           |$loadStreamedAfterCondition
-           |$loadBufferedAfterCondition
-         """.stripMargin
-      (before, checking.trim, streamedAfter.trim)
-    } else {
-      (evaluateVariables(streamedVars), "", "")
-    }
-
-    val beforeLoop =
-      s"""
-         |${streamedVarDecl.mkString("\n")}
-         |${streamedBeforeLoop.trim}
-         |scala.collection.Iterator<UnsafeRow> $iterator = $matches.generateIterator();
-       """.stripMargin
-    val outputRow =
-      s"""
-         |$numOutput.add(1);
-         |${consume(ctx, resultVars)}
-       """.stripMargin
     val findNextJoinRows = s"$findNextJoinRowsFuncName($streamedInput, $bufferedInput)"
     val thisPlan = ctx.addReferenceObj("plan", this)
     val eagerCleanup = s"$thisPlan.cleanupResources();"
+    val numOutput = metricTerm(ctx, "numOutputRows")
 
-    val doJoin = joinType match {
-      case _: InnerLike =>
-        codegenInner(findNextJoinRows, beforeLoop, iterator, bufferedRow, condCheck, outputRow,
-          eagerCleanup)
-      case LeftOuter | RightOuter =>
-        codegenOuter(streamedInput, findNextJoinRows, beforeLoop, iterator, bufferedRow, condCheck,
-          ctx.freshName("hasOutputRow"), outputRow, eagerCleanup)
-      case LeftSemi =>
-        codegenSemi(findNextJoinRows, beforeLoop, iterator, bufferedRow, condCheck,
-          ctx.freshName("hasOutputRow"), outputRow, eagerCleanup)
-      case LeftAnti =>
-        codegenAnti(streamedInput, findNextJoinRows, beforeLoop, iterator, bufferedRow, condCheck,
-          loadStreamed, ctx.freshName("hasMatchedRow"), outputRow, eagerCleanup)
-      case ExistenceJoin(_) =>
-        codegenExistence(streamedInput, findNextJoinRows, beforeLoop, iterator, bufferedRow,
-          condCheck, loadStreamed, existsVar.get, outputRow, eagerCleanup)
-      case x =>
-        throw new IllegalArgumentException(
-          s"SortMergeJoin.doProduce should not take $x as the JoinType")
+    // Streamed (left) columns, evaluated once per streamed row. The buffered (right) columns and
+    // the residual-condition check come from getJoinCondition, bound to the current match row.
+    // getJoinCondition copies streamedVars internally, so evaluating the originals here is safe.
+    val streamedVars = genOneSideJoinVars(ctx, streamedRow, streamedPlan, setDefaultValue = false)
+    // Evaluate the streamed (left) columns once per streamed row BEFORE getJoinCondition copies
+    // them for the residual condition. Otherwise the condition re-declares the same variables in
+    // the inner match scope (Java forbids local-variable shadowing) and the generated code fails
+    // to compile. After this, getJoinCondition copies already-blanked vars and references values.
+    val streamedEval = evaluateVariables(streamedVars)
+    val bufferedRow = ctx.freshName("bufferedRow")
+    val (_, checkCondition, bufferedVars) =
+      getJoinCondition(ctx, streamedVars, streamedPlan, bufferedPlan, Some(bufferedRow))
+
+    // Count ordinals index streamedOutput (= left) and bufferedOutput (= right).
+    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
+      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
+      .map(c => bufferedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+
+    val rightCountSum = ctx.freshName("rightCountSum")
+    val leftCount = ctx.freshName("leftCount")
+    val countOut = ctx.freshName("countOut")
+
+    // Single aggregate buffer (no grouping): mutable-state slot vars, reset per streamed row.
+    val aggFns = aggregatesRight.map(_.aggregateFunction.asInstanceOf[DeclarativeAggregate])
+    val bufferSchema = aggFns.flatMap(_.aggBufferAttributes)
+    val bufVarsAndInit = aggFns.map(_.initialValues).map { exprs =>
+      exprs.map { e =>
+        val isNull = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "cjBufIsNull")
+        val value = ctx.addMutableState(CodeGenerator.javaType(e.dataType), "cjBufValue")
+        val ev = e.genCode(ctx)
+        val initStr = s"${ev.code}\n$isNull = ${ev.isNull};\n$value = ${ev.value};"
+        (ExprCode(EmptyBlock, JavaCode.isNullGlobal(isNull), JavaCode.global(value, e.dataType)),
+          initStr)
+      }
     }
+    val bufVars = bufVarsAndInit.map(_.map(_._1))
+    val flatBufVars = bufVars.flatten
+    val bufferReset = bufVarsAndInit.flatten.map(_._2).mkString("\n")
+
+    val updateExprs = aggregatesRight.map { e =>
+      e.mode match {
+        case Partial | Complete =>
+          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].updateExpressions
+        case _ =>
+          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].mergeExpressions
+      }
+    }
+    val neededBuildRefs = AttributeSet(
+      countRight.toSeq.flatMap(_.references) ++ updateExprs.flatten.flatMap(_.references))
+    val buildEval = evaluateRequiredVariables(bufferedPlan.output, bufferedVars, neededBuildRefs)
+    val rightCountAccum = if (rightCountOrdinal != -1) {
+      s"$rightCountSum += ${bufferedVars(rightCountOrdinal).value};"
+    } else {
+      s"$rightCountSum += 1L;"
+    }
+    ctx.currentVars = flatBufVars ++ bufferedVars
+    val bufferEvals = updateExprs.map(u =>
+      bindReferences(u, bufferSchema ++ bufferedPlan.output).map(_.genCode(ctx)))
+    val updateCode = bufferEvals.zipWithIndex.map { case (evalsForFn, i) =>
+      val writes = evalsForFn.zip(bufVars(i)).map { case (ev, bv) =>
+        s"${bv.isNull} = ${ev.isNull};\n${bv.value} = ${ev.value};"
+      }
+      s"${evaluateVariables(evalsForFn)}\n${writes.mkString("\n")}"
+    }.mkString("\n")
+    val matchBody = s"$buildEval\n$rightCountAccum\n$updateCode"
+
+    // Post-loop: evaluate aggregate results from the buffer and emit.
+    ctx.currentVars = flatBufVars
+    val aggResultVars =
+      bindReferences(aggFns.map(_.evaluateExpression), bufferSchema).map(_.genCode(ctx))
+    val aggResultEval = evaluateVariables(aggResultVars)
+    val countEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(countOut, LongType))
+    val resultVars = streamedVars ++ Seq(countEv) ++ aggResultVars
+
+    val leftCountSetup = if (leftCountOrdinal != -1) {
+      s"long $leftCount = ${streamedVars(leftCountOrdinal).value};"
+    } else {
+      s"long $leftCount = 1L;"
+    }
+    val iterator = ctx.freshName("iterator")
 
     val initJoin = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "initJoin")
     val addHookToRecordMetrics =
@@ -617,28 +525,23 @@ case class SortMergeCountJoinExec(
        |  $initJoin = true;
        |  $addHookToRecordMetrics
        |}
-       |$doJoin
-     """.stripMargin
-  }
-
-  /**
-   * Generates the code for Inner join.
-   */
-  private def codegenInner(
-      findNextJoinRows: String,
-      beforeLoop: String,
-      matchIterator: String,
-      bufferedRow: String,
-      conditionCheck: String,
-      outputRow: String,
-      eagerCleanup: String): String = {
-    s"""
        |while ($findNextJoinRows) {
-       |  $beforeLoop
-       |  while ($matchIterator.hasNext()) {
-       |    InternalRow $bufferedRow = (InternalRow) $matchIterator.next();
-       |    $conditionCheck
-       |    $outputRow
+       |  $streamedEval
+       |  $leftCountSetup
+       |  $bufferReset
+       |  long $rightCountSum = 0L;
+       |  scala.collection.Iterator<UnsafeRow> $iterator = $matches.generateIterator();
+       |  while ($iterator.hasNext()) {
+       |    InternalRow $bufferedRow = (InternalRow) $iterator.next();
+       |    $checkCondition {
+       |      $matchBody
+       |    }
+       |  }
+       |  if ($rightCountSum != 0L) {
+       |    long $countOut = $rightCountSum * $leftCount;
+       |    $aggResultEval
+       |    $numOutput.add(1);
+       |    ${consume(ctx, resultVars)}
        |  }
        |  if (shouldStop()) return;
        |}
@@ -646,384 +549,177 @@ case class SortMergeCountJoinExec(
      """.stripMargin
   }
 
-  /**
-   * Generates the code for Left or Right Outer join.
-   */
-  private def codegenOuter(
-      streamedInput: String,
-      findNextJoinRows: String,
-      beforeLoop: String,
-      matchIterator: String,
-      bufferedRow: String,
-      conditionCheck: String,
-      hasOutputRow: String,
-      outputRow: String,
-      eagerCleanup: String): String = {
-    s"""
-       |while ($streamedInput.hasNext()) {
-       |  $findNextJoinRows;
-       |  $beforeLoop
-       |  boolean $hasOutputRow = false;
-       |
-       |  // the last iteration of this loop is to emit an empty row if there is no matched rows.
-       |  while ($matchIterator.hasNext() || !$hasOutputRow) {
-       |    InternalRow $bufferedRow = $matchIterator.hasNext() ?
-       |      (InternalRow) $matchIterator.next() : null;
-       |    $conditionCheck
-       |    $hasOutputRow = true;
-       |    $outputRow
-       |  }
-       |  if (shouldStop()) return;
-       |}
-       |$eagerCleanup
-     """.stripMargin
-  }
-
-  /**
-   * Generates the code for Left Semi join.
-   */
-  private def codegenSemi(
-      findNextJoinRows: String,
-      beforeLoop: String,
-      matchIterator: String,
-      bufferedRow: String,
-      conditionCheck: String,
-      hasOutputRow: String,
-      outputRow: String,
-      eagerCleanup: String): String = {
-    s"""
-       |while ($findNextJoinRows) {
-       |  $beforeLoop
-       |  boolean $hasOutputRow = false;
-       |
-       |  while (!$hasOutputRow && $matchIterator.hasNext()) {
-       |    InternalRow $bufferedRow = (InternalRow) $matchIterator.next();
-       |    $conditionCheck
-       |    $hasOutputRow = true;
-       |    $outputRow
-       |  }
-       |  if (shouldStop()) return;
-       |}
-       |$eagerCleanup
-     """.stripMargin
-  }
-
-  /**
-   * Generates the code for Left Anti join.
-   */
-  private def codegenAnti(
-      streamedInput: String,
-      findNextJoinRows: String,
-      beforeLoop: String,
-      matchIterator: String,
-      bufferedRow: String,
-      conditionCheck: String,
-      loadStreamed: String,
-      hasMatchedRow: String,
-      outputRow: String,
-      eagerCleanup: String): String = {
-    s"""
-       |while ($streamedInput.hasNext()) {
-       |  $findNextJoinRows;
-       |  $beforeLoop
-       |  boolean $hasMatchedRow = false;
-       |
-       |  while (!$hasMatchedRow && $matchIterator.hasNext()) {
-       |    InternalRow $bufferedRow = (InternalRow) $matchIterator.next();
-       |    $conditionCheck
-       |    $hasMatchedRow = true;
-       |  }
-       |
-       |  if (!$hasMatchedRow) {
-       |    // load all values of streamed row, because the values not in join condition are not
-       |    // loaded yet.
-       |    $loadStreamed
-       |    $outputRow
-       |  }
-       |  if (shouldStop()) return;
-       |}
-       |$eagerCleanup
-     """.stripMargin
-  }
-
-  /**
-   * Generates the code for Existence join.
-   */
-  private def codegenExistence(
-      streamedInput: String,
-      findNextJoinRows: String,
-      beforeLoop: String,
-      matchIterator: String,
-      bufferedRow: String,
-      conditionCheck: String,
-      loadStreamed: String,
-      exists: String,
-      outputRow: String,
-      eagerCleanup: String): String = {
-    s"""
-       |while ($streamedInput.hasNext()) {
-       |  $findNextJoinRows;
-       |  $beforeLoop
-       |  boolean $exists = false;
-       |
-       |  while (!$exists && $matchIterator.hasNext()) {
-       |    InternalRow $bufferedRow = (InternalRow) $matchIterator.next();
-       |    $conditionCheck
-       |    $exists = true;
-       |  }
-       |
-       |  if (!$exists) {
-       |    // load all values of streamed row, because the values not in join condition are not
-       |    // loaded yet.
-       |    $loadStreamed
-       |  }
-       |  $outputRow
-       |
-       |  if (shouldStop()) return;
-       |}
-       |$eagerCleanup
-     """.stripMargin
-  }
-
-  /**
-   * Generates the code for Full Outer join.
-   */
-  private def codegenFullOuter(ctx: CodegenContext): String = {
-    // Inline mutable state since not many join operations in a task.
-    // Create class member for input iterator from both sides.
-    val leftInput = ctx.addMutableState("scala.collection.Iterator", "leftInput",
+  // Grouping inner count join. Mirrors HashCountJoin.codegenCountGroupedInner: per streamed (left)
+  // row, group the passing matches by groupRight into a reused per-row map (group key -> aggregate
+  // buffer, with the fan-out count folded into the buffer's trailing slot), then emit one row per
+  // group (left cols ++ count-multiplied ++ aggregate results ++ group key). The per-match buffer
+  // update is inlined (no GroupedCountAggregator.update virtual call). Match source is the merge
+  // scanner's buffered `matches` array rather than a HashedRelation probe.
+  private def produceCountGroupedInner(ctx: CodegenContext): String = {
+    val streamedInput = ctx.addMutableState("scala.collection.Iterator", "streamedInput",
       v => s"$v = inputs[0];", forceInline = true)
-    val rightInput = ctx.addMutableState("scala.collection.Iterator", "rightInput",
+    val bufferedInput = ctx.addMutableState("scala.collection.Iterator", "bufferedInput",
       v => s"$v = inputs[1];", forceInline = true)
 
-    // Create class member for next input row from both sides.
-    val leftInputRow = ctx.addMutableState("InternalRow", "leftInputRow", forceInline = true)
-    val rightInputRow = ctx.addMutableState("InternalRow", "rightInputRow", forceInline = true)
+    val (findNextJoinRowsFuncName, streamedRow, matches) = genScanner(ctx)
+    val findNextJoinRows = s"$findNextJoinRowsFuncName($streamedInput, $bufferedInput)"
+    val thisPlan = ctx.addReferenceObj("plan", this)
+    val eagerCleanup = s"$thisPlan.cleanupResources();"
+    val numOutput = metricTerm(ctx, "numOutputRows")
 
-    // Create variables for join keys from both sides.
-    val leftKeyVars = createJoinKey(ctx, leftInputRow, leftKeys, left.output)
-    val leftAnyNull = leftKeyVars.map(_.isNull).mkString(" || ")
-    val rightKeyVars = createJoinKey(ctx, rightInputRow, rightKeys, right.output)
-    val rightAnyNull = rightKeyVars.map(_.isNull).mkString(" || ")
-    val matchedKeyVars = copyKeys(ctx, leftKeyVars)
-    val leftMatchedKeyVars = createJoinKey(ctx, leftInputRow, leftKeys, left.output)
-    val rightMatchedKeyVars = createJoinKey(ctx, rightInputRow, rightKeys, right.output)
+    val streamedVars = genOneSideJoinVars(ctx, streamedRow, streamedPlan, setDefaultValue = false)
+    // Evaluate the streamed (left) columns once per streamed row BEFORE getJoinCondition copies
+    // them for the residual condition. Otherwise the condition re-declares the same variables in
+    // the inner match scope (Java forbids local-variable shadowing) and the generated code fails
+    // to compile. After this, getJoinCondition copies already-blanked vars and references values.
+    val streamedEval = evaluateVariables(streamedVars)
+    val bufferedRow = ctx.freshName("bufferedRow")
+    val (_, checkCondition, bufferedVars) =
+      getJoinCondition(ctx, streamedVars, streamedPlan, bufferedPlan, Some(bufferedRow))
 
-    // Create class member for next output row from both sides.
-    val leftOutputRow = ctx.addMutableState("InternalRow", "leftOutputRow", forceInline = true)
-    val rightOutputRow = ctx.addMutableState("InternalRow", "rightOutputRow", forceInline = true)
+    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
+      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
+      .map(c => bufferedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val leftCount = ctx.freshName("leftCount")
+    val leftCountSetup = if (leftCountOrdinal != -1) {
+      s"long $leftCount = ${streamedVars(leftCountOrdinal).value};"
+    } else {
+      s"long $leftCount = 1L;"
+    }
 
-    // Create class member for buffers of rows with same join keys from both sides.
-    val bufferClsName = "java.util.ArrayList<InternalRow>"
-    val leftBuffer = ctx.addMutableState(bufferClsName, "leftBuffer",
-      v => s"$v = new $bufferClsName();", forceInline = true)
-    val rightBuffer = ctx.addMutableState(bufferClsName, "rightBuffer",
-      v => s"$v = new $bufferClsName();", forceInline = true)
-    val matchedClsName = classOf[BitSet].getName
-    val leftMatched = ctx.addMutableState(matchedClsName, "leftMatched",
-      v => s"$v = new $matchedClsName(1);", forceInline = true)
-    val rightMatched = ctx.addMutableState(matchedClsName, "rightMatched",
-      v => s"$v = new $matchedClsName(1);", forceInline = true)
-    val leftIndex = ctx.freshName("leftIndex")
-    val rightIndex = ctx.freshName("rightIndex")
+    // Per-task grouped aggregator + one reused per-stream-row group map (cleared per streamed row,
+    // fully drained by the emit loop). The fan-out count lives in the buffer's trailing slot.
+    val aggClass = classOf[GroupedCountAggregator].getName
+    val aggTerm = ctx.addMutableState(aggClass, "groupedAgg",
+      v => s"$v = $thisPlan.createGroupedAggregator();", forceInline = true)
+    val rowCls = classOf[InternalRow].getName
+    val mapCls = "java.util.LinkedHashMap"
+    val bufMap = ctx.addMutableState(s"$mapCls<UnsafeRow, $rowCls>", "cjBufMap",
+      v => s"$v = new $mapCls<UnsafeRow, $rowCls>();", forceInline = true)
+    val rightCount = ctx.freshName("rightCount")
+    val gkey = ctx.freshName("gkey")
+    val buf = ctx.freshName("buf")
+    val countOrd = aggregatesRight.map(_.aggregateFunction).flatMap(_.aggBufferAttributes).length
+    val rightCountExpr =
+      if (rightCountOrdinal != -1) s"$bufferedRow.getLong($rightCountOrdinal)" else "1L"
 
-    // Generate code for join condition
-    val leftResultVars = genOneSideJoinVars(
-      ctx, leftOutputRow, left, setDefaultValue = true)
-    val rightResultVars = genOneSideJoinVars(
-      ctx, rightOutputRow, right, setDefaultValue = true)
-    val resultVars = leftResultVars ++ rightResultVars
-    val (_, conditionCheck, _) =
-      getJoinCondition(ctx, leftResultVars, left, right, Some(rightOutputRow))
+    // Inline the per-match buffer update: write into the per-group buffer ROW via updateColumn,
+    // buffer slots read from `buf` (INPUT_ROW), build columns from the lazy bufferedVars.
+    val aggFns = aggregatesRight.map(_.aggregateFunction.asInstanceOf[DeclarativeAggregate])
+    val bufferSchema = aggFns.flatMap(_.aggBufferAttributes)
+    val updateExprs = aggregatesRight.map { e =>
+      e.mode match {
+        case Partial | Complete =>
+          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].updateExpressions
+        case _ =>
+          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].mergeExpressions
+      }
+    }
+    val bufferStartOffsets = aggFns.map(_.aggBufferAttributes.length).scanLeft(0)(_ + _)
+    val buildUpdateEval = evaluateRequiredVariables(
+      bufferedPlan.output, bufferedVars, AttributeSet(updateExprs.flatten.flatMap(_.references)))
+    ctx.INPUT_ROW = buf
+    ctx.currentVars = (Array.fill[ExprCode](bufferSchema.length)(null) ++ bufferedVars).toSeq
+    val bufferEvals = updateExprs.map(u =>
+      bindReferences(u, bufferSchema ++ bufferedPlan.output).map(_.genCode(ctx)))
+    ctx.INPUT_ROW = null
+    val updateCode = bufferEvals.zipWithIndex.map { case (evals, i) =>
+      val base = bufferStartOffsets(i)
+      val writes = evals.zipWithIndex.map { case (ev, j) =>
+        val attr = aggFns(i).aggBufferAttributes(j)
+        CodeGenerator.updateColumn(buf, attr.dataType, base + j, ev, attr.nullable)
+      }
+      s"${evaluateVariables(evals)}\n${writes.mkString("\n")}"
+    }.mkString("\n")
 
-    // Generate code for result output in separate function, as we need to output result from
-    // multiple places in join code.
-    val consumeFullOuterJoinRow = ctx.freshName("consumeFullOuterJoinRow")
-    ctx.addNewFunction(consumeFullOuterJoinRow,
+    val matchBody =
       s"""
-         |private void $consumeFullOuterJoinRow() throws java.io.IOException {
-         |  ${metricTerm(ctx, "numOutputRows")}.add(1);
-         |  ${consume(ctx, resultVars)}
+         |long $rightCount = $rightCountExpr;
+         |UnsafeRow $gkey = $aggTerm.groupKey($bufferedRow);
+         |$rowCls $buf = ($rowCls) $bufMap.get($gkey);
+         |if ($buf == null) {
+         |  $buf = $aggTerm.newBuffer();
+         |  $bufMap.put($gkey.copy(), $buf);
          |}
-       """.stripMargin)
-
-    // Handle the case when input row has no match.
-    val outputLeftNoMatch =
-      s"""
-         |$leftOutputRow = $leftInputRow;
-         |$rightOutputRow = null;
-         |$leftInputRow = null;
-         |$consumeFullOuterJoinRow();
+         |$buf.setLong($countOrd, $buf.getLong($countOrd) + $rightCount);
+         |$buildUpdateEval
+         |$updateCode
        """.stripMargin
-    val outputRightNoMatch =
-      s"""
-         |$rightOutputRow = $rightInputRow;
-         |$leftOutputRow = null;
-         |$rightInputRow = null;
-         |$consumeFullOuterJoinRow();
-       """.stripMargin
 
-    // Generate a function to scan both sides to find rows with matched join keys.
-    // The matched rows from both sides are copied in buffers separately. This function assumes
-    // either non-empty `leftIter` and `rightIter`, or non-null `leftInputRow` and `rightInputRow`.
-    //
-    // The function has the following steps:
-    //  - Step 1: Find the next `leftInputRow` and `rightInputRow` with non-null join keys.
-    //            Output row with null join keys (`outputLeftNoMatch` and `outputRightNoMatch`).
-    //
-    //  - Step 2: Compare and find next same join keys from between `leftInputRow` and
-    //            `rightInputRow`.
-    //            Output row with smaller join keys (`outputLeftNoMatch` and `outputRightNoMatch`).
-    //
-    //  - Step 3: Buffer rows with same join keys from both sides into `leftBuffer` and
-    //            `rightBuffer`. Reset bit sets for both buffers accordingly (`leftMatched` and
-    //            `rightMatched`).
-    val findNextJoinRowsFuncName = ctx.freshName("findNextJoinRows")
-    ctx.addNewFunction(findNextJoinRowsFuncName,
-      s"""
-         |private void $findNextJoinRowsFuncName(
-         |    scala.collection.Iterator leftIter,
-         |    scala.collection.Iterator rightIter) throws java.io.IOException {
-         |  int comp = 0;
-         |  $leftBuffer.clear();
-         |  $rightBuffer.clear();
-         |
-         |  if ($leftInputRow == null) {
-         |    $leftInputRow = (InternalRow) leftIter.next();
-         |  }
-         |  if ($rightInputRow == null) {
-         |    $rightInputRow = (InternalRow) rightIter.next();
-         |  }
-         |
-         |  ${leftKeyVars.map(_.code).mkString("\n")}
-         |  if ($leftAnyNull) {
-         |    // The left row join key is null, join it with null row
-         |    $outputLeftNoMatch
-         |    return;
-         |  }
-         |
-         |  ${rightKeyVars.map(_.code).mkString("\n")}
-         |  if ($rightAnyNull) {
-         |    // The right row join key is null, join it with null row
-         |    $outputRightNoMatch
-         |    return;
-         |  }
-         |
-         |  ${genComparison(ctx, leftKeyVars, rightKeyVars)}
-         |  if (comp < 0) {
-         |    // The left row join key is smaller, join it with null row
-         |    $outputLeftNoMatch
-         |    return;
-         |  } else if (comp > 0) {
-         |    // The right row join key is smaller, join it with null row
-         |    $outputRightNoMatch
-         |    return;
-         |  }
-         |
-         |  ${matchedKeyVars.map(_.code).mkString("\n")}
-         |  $leftBuffer.add($leftInputRow.copy());
-         |  $rightBuffer.add($rightInputRow.copy());
-         |  $leftInputRow = null;
-         |  $rightInputRow = null;
-         |
-         |  // Buffer rows from both sides with same join key
-         |  while (leftIter.hasNext()) {
-         |    $leftInputRow = (InternalRow) leftIter.next();
-         |    ${leftMatchedKeyVars.map(_.code).mkString("\n")}
-         |    ${genComparison(ctx, leftMatchedKeyVars, matchedKeyVars)}
-         |    if (comp == 0) {
-         |
-         |      $leftBuffer.add($leftInputRow.copy());
-         |      $leftInputRow = null;
-         |    } else {
-         |      break;
-         |    }
-         |  }
-         |  while (rightIter.hasNext()) {
-         |    $rightInputRow = (InternalRow) rightIter.next();
-         |    ${rightMatchedKeyVars.map(_.code).mkString("\n")}
-         |    ${genComparison(ctx, rightMatchedKeyVars, matchedKeyVars)}
-         |    if (comp == 0) {
-         |      $rightBuffer.add($rightInputRow.copy());
-         |      $rightInputRow = null;
-         |    } else {
-         |      break;
-         |    }
-         |  }
-         |
-         |  // Reset bit sets of buffers accordingly
-         |  if ($leftBuffer.size() <= $leftMatched.capacity()) {
-         |    $leftMatched.clearUntil($leftBuffer.size());
-         |  } else {
-         |    $leftMatched = new $matchedClsName($leftBuffer.size());
-         |  }
-         |  if ($rightBuffer.size() <= $rightMatched.capacity()) {
-         |    $rightMatched.clearUntil($rightBuffer.size());
-         |  } else {
-         |    $rightMatched = new $matchedClsName($rightBuffer.size());
-         |  }
-         |}
-       """.stripMargin)
+    // Per-group emit: read the aggregate-result and group-key fields into locals, then consume.
+    val aggResultAttributes = aggregatesRight.map(_.resultAttribute)
+    val groupAttributes = groupRight.map(_.toAttribute)
+    val aggResRow = ctx.freshName("aggRes")
+    val cnt = ctx.freshName("cnt")
+    val gkeyOut = ctx.freshName("gkeyOut")
+    val bufOut = ctx.freshName("bufOut")
 
-    // Scan the left and right buffers to find all matched rows.
-    val matchRowsInBuffer =
+    def readField(row: String, attr: Attribute, i: Int): (String, ExprCode) = {
+      val v = ctx.freshName("fval")
+      val isNull = ctx.freshName("fIsNull")
+      val jt = CodeGenerator.javaType(attr.dataType)
+      val getter = CodeGenerator.getValue(row, attr.dataType, i.toString)
+      val stmt =
+        s"""boolean $isNull = $row.isNullAt($i);
+           |$jt $v = $isNull ? ${CodeGenerator.defaultValue(attr.dataType)} : $getter;"""
+          .stripMargin
+      (stmt, ExprCode(EmptyBlock, JavaCode.isNullVariable(isNull),
+        JavaCode.variable(v, attr.dataType)))
+    }
+
+    val aggReads =
+      aggResultAttributes.zipWithIndex.map { case (a, i) => readField(aggResRow, a, i) }
+    val groupReads = groupAttributes.zipWithIndex.map { case (a, i) => readField(gkeyOut, a, i) }
+    val cntEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(cnt, LongType))
+    val resultVars = streamedVars ++ Seq(cntEv) ++ aggReads.map(_._2) ++ groupReads.map(_._2)
+    val iter = ctx.freshName("groupIter")
+    val entry = ctx.freshName("groupEntry")
+    val matchIterator = ctx.freshName("iterator")
+
+    val initJoin = ctx.addMutableState(CodeGenerator.JAVA_BOOLEAN, "initJoin")
+    val addHookToRecordMetrics =
       s"""
-         |int $leftIndex;
-         |int $rightIndex;
-         |
-         |for ($leftIndex = 0; $leftIndex < $leftBuffer.size(); $leftIndex++) {
-         |  $leftOutputRow = (InternalRow) $leftBuffer.get($leftIndex);
-         |  for ($rightIndex = 0; $rightIndex < $rightBuffer.size(); $rightIndex++) {
-         |    $rightOutputRow = (InternalRow) $rightBuffer.get($rightIndex);
-         |    $conditionCheck {
-         |      $consumeFullOuterJoinRow();
-         |      $leftMatched.set($leftIndex);
-         |      $rightMatched.set($rightIndex);
+         |$thisPlan.getTaskContext().addTaskCompletionListener(
+         |  new org.apache.spark.util.TaskCompletionListener() {
+         |    @Override
+         |    public void onTaskCompletion(org.apache.spark.TaskContext context) {
+         |      ${metricTerm(ctx, "spillSize")}.add($matches.spillSize());
          |    }
-         |  }
-         |
-         |  if (!$leftMatched.get($leftIndex)) {
-         |
-         |    $rightOutputRow = null;
-         |    $consumeFullOuterJoinRow();
-         |  }
-         |}
-         |
-         |$leftOutputRow = null;
-         |for ($rightIndex = 0; $rightIndex < $rightBuffer.size(); $rightIndex++) {
-         |  if (!$rightMatched.get($rightIndex)) {
-         |    // The right row has never matched any left row, join it with null row
-         |    $rightOutputRow = (InternalRow) $rightBuffer.get($rightIndex);
-         |    $consumeFullOuterJoinRow();
-         |  }
-         |}
+         |});
        """.stripMargin
 
     s"""
-       |while (($leftInputRow != null || $leftInput.hasNext()) &&
-       |  ($rightInputRow != null || $rightInput.hasNext())) {
-       |  $findNextJoinRowsFuncName($leftInput, $rightInput);
-       |  $matchRowsInBuffer
-       |  if (shouldStop()) return;
+       |if (!$initJoin) {
+       |  $initJoin = true;
+       |  $addHookToRecordMetrics
        |}
-       |
-       |// The right iterator has no more rows, join left row with null
-       |while ($leftInputRow != null || $leftInput.hasNext()) {
-       |  if ($leftInputRow == null) {
-       |    $leftInputRow = (InternalRow) $leftInput.next();
+       |while ($findNextJoinRows) {
+       |  $streamedEval
+       |  $leftCountSetup
+       |  $bufMap.clear();
+       |  scala.collection.Iterator<UnsafeRow> $matchIterator = $matches.generateIterator();
+       |  while ($matchIterator.hasNext()) {
+       |    InternalRow $bufferedRow = (InternalRow) $matchIterator.next();
+       |    $checkCondition {
+       |      $matchBody
+       |    }
        |  }
-       |  $outputLeftNoMatch
-       |  if (shouldStop()) return;
-       |}
-       |
-       |// The left iterator has no more rows, join right row with null
-       |while ($rightInputRow != null || $rightInput.hasNext()) {
-       |  if ($rightInputRow == null) {
-       |    $rightInputRow = (InternalRow) $rightInput.next();
+       |  java.util.Iterator $iter = $bufMap.entrySet().iterator();
+       |  while ($iter.hasNext()) {
+       |    java.util.Map.Entry $entry = (java.util.Map.Entry) $iter.next();
+       |    UnsafeRow $gkeyOut = (UnsafeRow) $entry.getKey();
+       |    $rowCls $bufOut = ($rowCls) $entry.getValue();
+       |    long $cnt = $bufOut.getLong($countOrd) * $leftCount;
+       |    $rowCls $aggResRow = $aggTerm.eval($bufOut);
+       |    ${aggReads.map(_._1).mkString("\n")}
+       |    ${groupReads.map(_._1).mkString("\n")}
+       |    $numOutput.add(1);
+       |    ${consume(ctx, resultVars)}
        |  }
-       |  $outputRightNoMatch
        |  if (shouldStop()) return;
        |}
+       |$eagerCleanup
      """.stripMargin
   }
 
