@@ -46,6 +46,9 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
     SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true")
 
+  private val cyclicBagsOn =
+    yannakakisOn :+ (SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED.key -> "true")
+
   private def cellsMatch(a: Any, b: Any): Boolean = (a, b) match {
     case (null, null) => true
     case (x: Double, y: Double) =>
@@ -1553,4 +1556,151 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  /** Runs `query` with cyclic-bag decomposition ON and asserts the rows match vanilla. */
+  private def assertCyclicSameResults(query: String, hint: String): Unit = {
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq.sortBy(_.toString)
+    }
+    withSQLConf(cyclicBagsOn: _*) {
+      val df = sql(query)
+      val actual = df.collect().toSeq.sortBy(_.toString)
+      val ok = expected.size == actual.size &&
+        expected.zip(actual).forall { case (e, a) =>
+          e.size == a.size && (0 until e.size).forall(i => cellsMatch(e.get(i), a.get(i)))
+        }
+      assert(ok,
+        s"""$hint
+           |expected: ${expected.mkString(" | ")}
+           |actual  : ${actual.mkString(" | ")}
+           |optimized plan:
+           |${df.queryExecution.optimizedPlan}""".stripMargin)
+    }
+  }
+
+  /** Asserts the cyclic-bag rewrite FIRES (plan contains a CountJoin) for `query`. */
+  private def assertCyclicRewriteFires(query: String, hint: String): Unit = {
+    withSQLConf((cyclicBagsOn :+
+      (SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      val plan = sql(query).queryExecution.executedPlan.toString
+      assert(plan.contains("CountJoin"),
+        s"$hint: cyclic-bag rewrite should fire (plan should contain a CountJoin):\n$plan")
+    }
+  }
+
+  /** Asserts the cyclic-bag rewrite FIRES by checking the rewrite emitted the given log. */
+  private def assertCyclicRewriteLogged(query: String, logFragment: String, hint: String): Unit = {
+    val appender = new LogAppender("cyclic-bag rewrite")
+    withLogAppender(appender) {
+      withSQLConf(cyclicBagsOn: _*) {
+        sql(query).collect()
+      }
+    }
+    val fired = appender.loggingEvents.exists(
+      _.getMessage.getFormattedMessage.contains(logFragment))
+    assert(fired, s"$hint: expected the cyclic-bag rewrite to fire (log '$logFragment')")
+  }
+
+  // Triangle base relations with fan-out: keys are duplicated so the join multiplicities (and
+  // thus the counts/sums) are > 1 and a dropped fan-out would be detected.
+  private def createTriangleTables(): Unit = {
+    // R(a, b): a=1 appears twice (fan-out on a), and pairs (1,10),(1,20),(2,10),(3,30)
+    Seq((1, 10), (1, 20), (2, 10), (3, 30), (4, 40))
+      .toDF("a", "b").createOrReplaceTempView("tri_r")
+    // S(b, c): b=10 appears twice (fan-out on b)
+    Seq((10, 100), (10, 200), (20, 100), (30, 300), (50, 500))
+      .toDF("b", "c").createOrReplaceTempView("tri_s")
+    // T(a, c): closes the cycle a<->c; (1,100) participates in multiple triangles
+    Seq((1, 100), (1, 200), (2, 100), (3, 300), (4, 999))
+      .toDF("a", "c").createOrReplaceTempView("tri_t")
+  }
+
+  test("cyclic triangle: count(*) matches vanilla and the rewrite fires") {
+    createTriangleTables()
+    // A bare triangle materializes into a single bag that IS the whole query, so the count-join
+    // machinery degenerates to the original aggregate over the bag join (no CountJoin needed).
+    // We assert the cyclic rewrite definitively activated via its log line and that the count -
+    // which must reflect the full join fan-out - matches vanilla.
+    val query =
+      "select count(*) as c from tri_r r join tri_s s on r.b = s.b " +
+        "join tri_t t on r.a = t.a and s.c = t.c"
+    assertCyclicRewriteLogged(query, "guarded single-node bag", "triangle count(*)")
+    assertCyclicSameResults(query, "triangle count(*)")
+  }
+
+  test("cyclic triangle: sum over a column matches vanilla (fan-out counted)") {
+    createTriangleTables()
+    // sum(c) over the triangle: must count the join fan-out, not the distinct c values.
+    val query =
+      "select sum(t.c) as s from tri_r r join tri_s s on r.b = s.b " +
+        "join tri_t t on r.a = t.a and s.c = t.c"
+    assertCyclicRewriteLogged(query, "guarded single-node bag", "triangle sum(c)")
+    assertCyclicSameResults(query, "triangle sum(c)")
+  }
+
+  test("cyclic triangle: grouped count(*) matches vanilla") {
+    createTriangleTables()
+    val query =
+      "select r.a as a, count(*) as c from tri_r r join tri_s s on r.b = s.b " +
+        "join tri_t t on r.a = t.a and s.c = t.c group by r.a"
+    assertCyclicSameResults(query, "triangle grouped count(*)")
+  }
+
+  test("cyclic triangle with an internal cross-relation filter matches vanilla") {
+    // A non-equi predicate spanning two of the bag's relations (r.a < t.c) must be applied
+    // INSIDE the materialized bag, so the bag's rows equal the filtered cyclic sub-query.
+    createTriangleTables()
+    val query =
+      "select count(*) as c from tri_r r join tri_s s on r.b = s.b " +
+        "join tri_t t on r.a = t.a and s.c = t.c where r.a < t.c"
+    assertCyclicRewriteLogged(query, "guarded single-node bag", "triangle + internal filter")
+    assertCyclicSameResults(query, "triangle + internal filter count(*)")
+  }
+
+  test("cyclic triangle with a dangling fringe relation matches vanilla") {
+    // Triangle R-S-T plus an acyclic fringe relation U(c, d) hanging off vertex c. GYO strips U
+    // as an ear first, then the triangle stalls and becomes a bag; U must be re-attached as a
+    // child of the bag (not orphaned). count(*) over the whole thing must still count fan-out.
+    createTriangleTables()
+    Seq((100, 7), (100, 8), (200, 9), (300, 9), (999, 1))
+      .toDF("c", "d").createOrReplaceTempView("tri_u")
+    val query =
+      "select count(*) as c from tri_r r join tri_s s on r.b = s.b " +
+        "join tri_t t on r.a = t.a and s.c = t.c join tri_u u on t.c = u.c"
+    assertCyclicRewriteFires(query, "triangle + fringe count(*)")
+    assertCyclicSameResults(query, "triangle + fringe count(*)")
+  }
+
+  test("cyclic 4-cycle: count(*) matches vanilla") {
+    // A 4-cycle R(a,b)-S(b,c)-T(c,d)-U(d,a). GYO stalls on all four edges (no ear); they form a
+    // single bag. With fan-out on b and d so the counts are non-trivial.
+    Seq((1, 10), (1, 20), (2, 10), (3, 30)).toDF("a", "b").createOrReplaceTempView("c4_r")
+    Seq((10, 100), (20, 100), (30, 300), (10, 200)).toDF("b", "c").createOrReplaceTempView("c4_s")
+    Seq((100, 1000), (200, 1000), (300, 3000), (100, 2000))
+      .toDF("c", "d").createOrReplaceTempView("c4_t")
+    Seq((1000, 1), (2000, 1), (3000, 3), (1000, 2)).toDF("d", "a").createOrReplaceTempView("c4_u")
+    val query =
+      "select count(*) as c from c4_r r join c4_s s on r.b = s.b " +
+        "join c4_t t on s.c = t.c join c4_u u on t.d = u.d and u.a = r.a"
+    assertCyclicSameResults(query, "4-cycle count(*)")
+  }
+
+  test("cyclic triangle: acyclic regression - with the flag OFF the plan is NOT rewritten") {
+    // Belt-and-suspenders: the default (flag off) must leave a cyclic query as the original plan
+    // (no CountJoin), proving the new path is strictly opt-in and acyclic behaviour is untouched.
+    createTriangleTables()
+    val query =
+      "select count(*) as c from tri_r r join tri_s s on r.b = s.b " +
+        "join tri_t t on r.a = t.a and s.c = t.c"
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+    withSQLConf(yannakakisOn: _*) { // cyclic-bags NOT enabled
+      val df = sql(query)
+      checkAnswer(df, expected)
+      assert(!df.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        "cyclic query must NOT be rewritten when cyclicBagsEnabled is off")
+    }
+  }
 }

@@ -3652,6 +3652,19 @@ object SQLConf {
       .booleanConf
       .createWithDefault(true)
 
+  val YANNAKAKIS_CYCLIC_BAGS_ENABLED =
+    buildConf("spark.sql.yannakakis.cyclicBagsEnabled")
+      .doc("Handle CYCLIC join queries (which otherwise fall back to the original plan) via a " +
+        "generalized hypertree decomposition: the mutually-irreducible cyclic component left " +
+        "by GYO ear-removal is materialized as an ordinary inner join (a \"bag\") and reinserted " +
+        "as a single derived relation, after which the acyclic count-join machinery runs " +
+        "unchanged. Acyclic queries are unaffected (the bag logic only triggers on the residual " +
+        "that makes GYO stall). Off by default: materializing a bag can be expensive and a " +
+        "future cost gate would guard it.")
+      .version("3.5.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR =
     buildConf("spark.sql.yannakakis.forcePhysicalCountJoinOperator")
       .doc("Test-only: force the physical count-join operator (\"broadcast\", \"shuffle\" or " +
@@ -7453,6 +7466,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def yannakakisCostGateEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_COST_GATE_ENABLED)
+
+  def yannakakisCyclicBagsEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED)
 
   def yannakakisForcePhysicalCountJoinOperator: String =
     getConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR)

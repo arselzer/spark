@@ -379,7 +379,22 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     }
     else {
       val hg = new Hypergraph(items, conditions)
-      val jointree = hg.flatGYO
+      // For acyclic queries flatGYO returns the join tree directly (unchanged behaviour). When
+      // it returns null the query is cyclic: if cyclic-bag decomposition is enabled, try to
+      // materialize the cyclic component as a bag and produce an (acyclic) tree-of-bags; the
+      // rest of the count-join machinery then runs over it unchanged. A null from either path
+      // falls back to the original plan.
+      val jointree = {
+        val acyclicTree = hg.flatGYO
+        if (acyclicTree != null) {
+          acyclicTree
+        } else if (conf.yannakakisCyclicBagsEnabled) {
+          debugLog("join is cyclic - attempting bag decomposition")
+          hg.flatGYOWithBags
+        } else {
+          null
+        }
+      }
 
       if (jointree == null) {
         debugLog("join is cyclic")
@@ -730,6 +745,25 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
           // The query is guarded
           val root = nodeContainingAllAttributes.reroot
           debugLog("applicable query (joins=" + (items.size - 1) + ")")
+
+          // Degenerate single-node tree: the whole query reduced to one (possibly bag) leaf with
+          // no children. This only arises when a cyclic component is materialized as a bag that
+          // IS the entire query (e.g. a bare triangle) - an acyclic >= 2-relation join always
+          // leaves the root with >= 1 child. There is no fan-out beyond the bag's own rows, so
+          // the count-join machinery (which needs a join to seed/carry the count column) has
+          // nothing to do; applying the ORIGINAL aggregate directly to the materialized leaf is
+          // exactly correct (the bag's rows already equal the cyclic sub-query result).
+          if (root.children.isEmpty && root.edges.size == 1) {
+            if (baselineBroadcastsAllButLargest(items)) {
+              debugLog("cost gate: keeping original plan")
+              return agg
+            }
+            val newAgg = Aggregate(groupingExpressions, resultExpressions,
+              root.edges.head.planReference)
+            logWarning("new aggregate (guarded single-node bag)")
+            debugLog("time difference: " + (System.nanoTime() - startTime))
+            return newAgg
+          }
 
           if (countingAggregates.isEmpty
             && percentileAggregates.isEmpty
@@ -2321,6 +2355,213 @@ class Hypergraph (private val items: Seq[LogicalPlan],
 
   def isAcyclic: Boolean = {
     flatGYO == null
+  }
+
+  // Iterate edges in a stable order (E1, E2, ...): HGEdge uses identity hashCodes, so raw Set
+  // iteration order varies between JVM runs and would make the join tree shape nondeterministic.
+  private def orderedEdges(es: mutable.Set[HGEdge]): Seq[HGEdge] =
+    es.toSeq.sortBy(e => (e.name.length, e.name))
+
+  // One round of GYO ear-removal over `gyoEdges`, attaching contained edges as children in
+  // `treeNodes`. Returns (root, progress): `progress` is false when no ear could be removed
+  // (the remaining edges form a mutually-irreducible cyclic component). This is the exact
+  // loop body of flatGYO, factored out so the cyclic path can reuse it verbatim; flatGYO
+  // itself is left untouched so the ACYCLIC behaviour is provably unchanged.
+  private def gyoReduce(gyoEdges: mutable.Set[HGEdge],
+                        treeNodes: mutable.Map[String, HTNode]): (HTNode, Boolean) = {
+    var root: HTNode = null
+    var progress = true
+    while (gyoEdges.size > 1 && progress) {
+      for (e <- orderedEdges(gyoEdges)) {
+        val allOtherVertices = gyoEdges.diff(Set(e)).map(o => o.vertices)
+          .reduce((o1, o2) => o1 union o2)
+        val singleNodeVertices = e.vertices -- allOtherVertices
+        val eNew = e.copy(newVertices = e.vertices -- singleNodeVertices)
+        gyoEdges -= e
+        gyoEdges += eNew
+      }
+
+      var nodeAdded = false
+      for (e <- orderedEdges(gyoEdges) if gyoEdges.contains(e)) {
+        val supersets = gyoEdges.filter(o => o containsNotEqual e)
+        if (supersets.isEmpty) {
+          val containedEdges = gyoEdges.filter(o => (e contains o) && (e.name != o.name))
+          val parentNode = treeNodes.getOrElse(e.name, new HTNode(Set(e), Set(), null))
+          val childNodes = containedEdges
+            .map(c => treeNodes.getOrElse(c.name, new HTNode(Set(c), Set(), null)))
+            .toSet
+          parentNode.children ++= childNodes
+          if (childNodes.nonEmpty) {
+            nodeAdded = true
+          }
+          treeNodes.put(e.name, parentNode)
+          childNodes.foreach(c => treeNodes.put(c.edges.head.name, c))
+          root = parentNode
+          root.setParentReferences
+          gyoEdges --= containedEdges
+        }
+      }
+      if (!nodeAdded) progress = false
+    }
+    (root, progress)
+  }
+
+  /**
+   * Cyclic-query decomposition (generalized hypertree decomposition, simplest correct first
+   * cut). Runs GYO ear-removal; when GYO STALLS with a mutually-irreducible cyclic component
+   * of >= 2 edges remaining (the residual that makes `flatGYO` return null), it materializes
+   * that residual as a single BAG and continues:
+   *
+   *  1. The residual `gyoEdges` IS the cyclic component (all ears already stripped).
+   *  2. Materialize the bag as an ordinary inner-join of the residual relations' planReferences,
+   *     applying every bag-internal equi-join predicate (derived from shared hypergraph vertices)
+   *     AND every cross-relation filter whose attributes lie entirely within the bag.
+   *  3. Replace the residual edges with ONE new HGEdge whose planReference is the materialized
+   *     join and whose vertices are the union of the residual edges' vertices (minus vertices
+   *     internal to the bag, which no longer connect to the outside) - so the bag connects to
+   *     the rest of the query exactly as the cyclic component did.
+   *  4. Continue GYO with the bag edge folded in. The result is an HTNode tree where one leaf is
+   *     the materialized bag; `buildBottomUpJoinsCounting` then runs over it UNCHANGED - the bag
+   *     is just a derived relation whose rows already equal the cyclic sub-query.
+   *
+   * Returns null (-> caller keeps the original plan) on shapes this first cut cannot decompose:
+   * an empty residual, a residual whose edges do not all share at least one vertex with the rest
+   * (disconnected), or when a second stall occurs after one bag was formed.
+   */
+  def flatGYOWithBags: HTNode = {
+    val gyoEdges: mutable.Set[HGEdge] = mutable.Set.empty
+    for (edge <- edges) {
+      gyoEdges.add(edge.copy())
+    }
+    val treeNodes: mutable.Map[String, HTNode] = mutable.Map.empty
+
+    var bagsFormed = 0
+    var (root, progress) = gyoReduce(gyoEdges, treeNodes)
+
+    // GYO stalled on a cyclic residual: collapse it into a single materialized bag, then
+    // continue. Only one bag is formed in this first cut; a second stall falls back to null.
+    while (gyoEdges.size > 1 && !progress) {
+      if (bagsFormed >= 1) {
+        if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) {
+          logWarning("cyclic decomposition: more than one cyclic component, falling back")
+        }
+        return null
+      }
+      val residual = orderedEdges(gyoEdges)
+      val bagEdge = materializeBag(residual)
+      if (bagEdge == null) {
+        if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) {
+          logWarning("cyclic decomposition: could not materialize bag, falling back")
+        }
+        return null
+      }
+      // Ears removed in earlier GYO rounds may already be attached as children of a residual
+      // edge's tree node. Collapsing the residual into one bag must NOT orphan them: collect
+      // every such child whose own edge is outside the residual and re-attach it to the bag
+      // node. (Children that ARE residual edges are subsumed by the materialized join.)
+      val residualNames = residual.map(_.name).toSet
+      val orphanChildren: Set[HTNode] = residual.flatMap { e =>
+        treeNodes.get(e.name).toSeq.flatMap(_.children)
+      }.filterNot(c => residualNames.contains(c.edges.head.name)).toSet
+      // Replace the residual edges with the single bag edge. The bag edge participates in GYO
+      // exactly like a base relation; its tree node carries the materialized join as its
+      // planReference, with the rescued ear subtrees as children.
+      gyoEdges --= residual
+      gyoEdges += bagEdge
+      residual.foreach(e => treeNodes.remove(e.name))
+      val bagNode = new HTNode(Set(bagEdge), orphanChildren, null)
+      bagNode.setParentReferences
+      treeNodes.put(bagEdge.name, bagNode)
+      bagsFormed += 1
+      val (newRoot, newProgress) = gyoReduce(gyoEdges, treeNodes)
+      root = newRoot
+      progress = newProgress
+    }
+
+    if (gyoEdges.size > 1) {
+      return null
+    }
+    // Exactly one edge remains: it is the root of the join tree. Resolve it from treeNodes
+    // (the loop builds the tree there, keyed by edge name). If the single remaining edge is
+    // the bag itself with no surrounding relations (the whole query was one cyclic component),
+    // treeNodes already holds its node from materialization; otherwise build a leaf node.
+    val onlyEdge = gyoEdges.head
+    root = treeNodes.getOrElse(onlyEdge.name, new HTNode(Set(onlyEdge), Set(), null))
+    root.parent = null
+    root.setParentReferences
+    root
+  }
+
+  /**
+   * Materialize the bag of the given residual edges as an ordinary inner-join LogicalPlan and
+   * wrap it in a new HGEdge. Returns null if the bag cannot be built (single edge, or a
+   * disconnected residual that this first cut declines to handle).
+   *
+   * Join conditions: for each pair of relations already in the running join and the relation
+   * being added, an equi-join is emitted on every shared hypergraph vertex (the attributes in
+   * that vertex's equivalence class that each side actually outputs). Cross-relation filters
+   * whose referenced attributes lie entirely inside the bag's output are applied as a Filter on
+   * top of the join, so the bag's rows equal the corresponding cyclic sub-query.
+   */
+  private def materializeBag(residual: Seq[HGEdge]): HGEdge = {
+    if (residual.size < 2) {
+      return null
+    }
+
+    // Equi-join condition between two relations on every hypergraph vertex they share. For a
+    // vertex v, both sides may output several attributes of v's equivalence class; pick one
+    // attribute per side (any pair is equal under the equivalence) and AND the equalities.
+    def joinCondition(leftOut: AttributeSet, rightVertices: Set[String],
+                      rightOut: AttributeSet): Option[Expression] = {
+      val conds: Seq[Expression] = rightVertices.toSeq.sorted.flatMap { v =>
+        val classAttrs = vertexToAttributes.getOrElse(v, Set.empty)
+        val lOpt = classAttrs.find(a => leftOut.contains(a))
+        val rOpt = classAttrs.find(a => rightOut.contains(a))
+        for (l <- lOpt; r <- rOpt) yield
+          if (l.dataType == r.dataType) EqualTo(l, r)
+          else EqualTo(l, Cast(r, l.dataType))
+      }
+      conds.reduceOption((c1, c2) => And(c1, c2))
+    }
+
+    // Chain the residual relations into an inner join. Each newly added relation is joined on
+    // the vertices it shares with the already-accumulated relations.
+    var plan: LogicalPlan = residual.head.planReference
+    var accumulatedVertices: Set[String] = residual.head.vertices
+    for (e <- residual.tail) {
+      val shared = accumulatedVertices intersect e.vertices
+      val cond = joinCondition(plan.outputSet, shared, e.planReference.outputSet)
+      if (cond.isEmpty) {
+        // The relation does not connect (via a shared vertex) to what we have so far. A
+        // genuine cyclic component is connected; a disconnected residual is a shape this
+        // first cut does not handle, so fall back.
+        return null
+      }
+      plan = Join(plan, e.planReference, Inner, cond, JoinHint(Option.empty, Option.empty))
+      accumulatedVertices = accumulatedVertices union e.vertices
+    }
+
+    // Apply cross-relation filters that lie entirely within the bag (e.g. an inequality between
+    // two of the bag's relations). Filters spanning attributes outside the bag are left for the
+    // surrounding query and must NOT be applied here.
+    val bagOutput = plan.outputSet
+    val bagFilters = crossRelationFilters.filter(f => f.references.subsetOf(bagOutput))
+    bagFilters.reduceOption((f1, f2) => And(f1, f2)).foreach { f =>
+      plan = Filter(f, plan)
+    }
+
+    // The bag's vertices: every vertex of a residual edge that ALSO appears in some edge
+    // outside the residual (i.e. still connects the bag to the rest of the query). Vertices
+    // internal to the bag are dropped - they have been consumed by the materialized join and
+    // no longer participate in the outer decomposition. (If the bag is the whole query there
+    // are no outside edges and this set is empty, which is correct: nothing left to join.)
+    val residualNames = residual.map(_.name).toSet
+    val outsideVertices: Set[String] = edges.filterNot(e => residualNames.contains(e.name))
+      .flatMap(_.vertices).toSet
+    val bagVertices = residual.flatMap(_.vertices).toSet intersect outsideVertices
+
+    new HGEdge(bagVertices, s"BAG_${residualNames.toSeq.sorted.mkString("_")}",
+      plan, attributeToVertex)
   }
 
   def flatGYO: HTNode = {
