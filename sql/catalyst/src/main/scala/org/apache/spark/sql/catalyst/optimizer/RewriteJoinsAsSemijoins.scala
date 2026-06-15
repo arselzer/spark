@@ -2661,6 +2661,16 @@ class Hypergraph (private val items: Seq[LogicalPlan],
       val orphanChildren: Set[HTNode] = residual.flatMap { e =>
         treeNodes.get(e.name).toSeq.flatMap(_.children)
       }.filterNot(c => residualNames.contains(c.edges.head.name)).toSet
+      // Every rescued orphan child must connect to the bag via one of the bag's (external)
+      // vertices. If an orphan shared only a vertex now INTERNAL to the bag, the tree-of-bags is
+      // not join-connected: the reduction could not form a join condition for it (empty
+      // overlapping vertices -> empty.reduceLeft). Decline to decompose this shape (fall back).
+      if (orphanChildren.exists(c => (c.edges.head.vertices intersect bagEdge.vertices).isEmpty)) {
+        if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) {
+          logWarning("cyclic decomposition: orphan child not connected to bag, falling back")
+        }
+        return null
+      }
       // Replace the residual edges with the single bag edge. The bag edge participates in GYO
       // exactly like a base relation; its tree node carries the materialized join as its
       // planReference, with the rescued ear subtrees as children.
