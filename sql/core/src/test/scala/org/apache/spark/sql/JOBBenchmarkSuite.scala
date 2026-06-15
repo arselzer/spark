@@ -182,4 +182,40 @@ class JOBBenchmarkSuite extends QueryTest with SharedSparkSession {
     }
     // scalastyle:on println
   }
+
+  test("JOB grouped count(*) codegen matches vanilla (real-data grouping count-joins)") {
+    assume(new File(imdbDir).isDirectory, s"IMDB parquet dataset not present at $imdbDir")
+    loadImdb()
+    // 1a's join graph, grouped by columns from TWO different relations (title and company_type)
+    // so the group keys can't all reach one relation - grouping is pushed INTO a count-join (the
+    // path the Q9 unit tests cover synthetically) on real-scale data.
+    val file = new File(s"$jobDir/1a.sql")
+    assume(file.exists(), "1a.sql not present")
+    val src = scala.io.Source.fromFile(file)
+    val raw = try src.mkString.trim.stripSuffix(";") finally src.close()
+    val fromIdx = raw.toLowerCase(java.util.Locale.ROOT).indexOf("from")
+    val gq = s"SELECT t.production_year AS py, ct.id AS ctid, count(*) AS c " +
+      s"${raw.substring(fromIdx)} group by t.production_year, ct.id"
+    val aqeOff = Seq(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+    // Confirm a grouping count-join is actually present and codegen-able under the rewrite.
+    withSQLConf((aqeOff ++ yannakakisOn): _*) {
+      val plan = sql(gq).queryExecution.executedPlan
+      val groupingCjs = plan.collect {
+        case cj: org.apache.spark.sql.execution.joins.HashCountJoin if cj.groupRight.nonEmpty => cj
+      }
+      // scalastyle:off println
+      println(s"JOB-GROUPED: grouping count-joins=${groupingCjs.size}, " +
+        s"all codegen-able=${groupingCjs.forall(_.supportCodegen)}")
+      // scalastyle:on println
+    }
+    val on = withSQLConf((aqeOff ++ yannakakisOn :+
+      (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
+      sql(gq).collect().toSeq.map(_.toString).sorted
+    }
+    val off = withSQLConf((aqeOff :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false")): _*) {
+      sql(gq).collect().toSeq.map(_.toString).sorted
+    }
+    assert(on == off,
+      s"grouped count(*) codegen must match vanilla (${on.size} vs ${off.size} rows)")
+  }
 }
