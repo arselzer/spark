@@ -88,51 +88,6 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
     }
   }
 
-  // Grouping-heavy TPC-H queries that route through the count-join rewrite. Q7/Q9 group by keys
-  // spanning multiple relations, so grouping is pushed INTO the count-joins (grouped codegen).
-  private val queries: Seq[(String, String)] = Seq(
-    "Q3" ->
-      """select l_orderkey, sum(l_extendedprice * (1 - l_discount)) as revenue,
-               o_orderdate, o_shippriority
-        from customer, orders, lineitem
-        where c_mktsegment = 'BUILDING' and c_custkey = o_custkey and l_orderkey = o_orderkey
-          and o_orderdate < date '1995-03-15' and l_shipdate > date '1995-03-15'
-        group by l_orderkey, o_orderdate, o_shippriority""",
-    "Q7" ->
-      """select supp_nation, cust_nation, l_year, sum(volume) as revenue
-        from (
-          select n1.n_name as supp_nation, n2.n_name as cust_nation,
-                 extract(year from l_shipdate) as l_year,
-                 l_extendedprice * (1 - l_discount) as volume
-          from supplier, lineitem, orders, customer, nation n1, nation n2
-          where s_suppkey = l_suppkey and o_orderkey = l_orderkey and c_custkey = o_custkey
-            and s_nationkey = n1.n_nationkey and c_nationkey = n2.n_nationkey
-            and ((n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY')
-              or (n1.n_name = 'GERMANY' and n2.n_name = 'FRANCE'))
-            and l_shipdate between date '1995-01-01' and date '1996-12-31'
-        ) as shipping
-        group by supp_nation, cust_nation, l_year""",
-    "Q9" ->
-      """select nation, o_year, sum(amount) as sum_profit
-        from (
-          select n_name as nation, extract(year from o_orderdate) as o_year,
-                 l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
-          from part, supplier, lineitem, partsupp, orders, nation
-          where s_suppkey = l_suppkey and ps_suppkey = l_suppkey and ps_partkey = l_partkey
-            and p_partkey = l_partkey and o_orderkey = l_orderkey and s_nationkey = n_nationkey
-            and p_name like '%green%'
-        ) as profit
-        group by nation, o_year""",
-    "Q10" ->
-      """select c_custkey, c_name, sum(l_extendedprice * (1 - l_discount)) as revenue,
-               c_acctbal, n_name, c_address, c_phone, c_comment
-        from customer, orders, lineitem, nation
-        where c_custkey = o_custkey and l_orderkey = o_orderkey
-          and o_orderdate >= date '1993-10-01'
-          and o_orderdate < date '1993-10-01' + interval '3' month
-          and l_returnflag = 'R' and c_nationkey = n_nationkey
-        group by c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment""")
-
   test("TPC-H benchmark: count-join codegen on vs interpreted vs off (sf1)") {
     assume(new File(tpchDir).isDirectory, s"TPC-H parquet dataset not present at $tpchDir")
     loadTpch()
@@ -148,38 +103,48 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
       (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false")
     val codegenConf = aqeOff ++ yannakakisOn :+
       (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
+    val mismatches = scala.collection.mutable.ListBuffer[String]()
     // scalastyle:off println
     println("TPCH-BENCH: query | count-joins(grouping) | off | on(interp) | on(codegen) | match")
-    for ((name, q) <- queries) {
-      val cjShape = withSQLConf(codegenConf: _*) {
-        val cjs = sql(q).queryExecution.executedPlan.collect {
-          case cj: HashCountJoin => cj.groupRight.nonEmpty
+    for (name <- (1 to 22).map(i => s"q$i")) {
+      val q =
+        try resourceToString(s"tpch/$name.sql",
+          classLoader = Thread.currentThread().getContextClassLoader)
+        catch { case _: Throwable => null }
+      if (q == null) {
+        println(s"TPCH-BENCH: $name | (no sql)")
+      } else {
+        val cjShape = withSQLConf(codegenConf: _*) {
+          val cjs = sql(q).queryExecution.executedPlan.collect {
+            case cj: HashCountJoin => cj.groupRight.nonEmpty
+          }
+          (cjs.size, cjs.count(identity))
         }
-        (cjs.size, cjs.count(identity))
+        Seq(offConf, interpConf, codegenConf).foreach { c =>
+          withSQLConf(c: _*) { try sql(q).collect() catch { case _: Throwable => } }  // warm up
+        }
+        val offTs = scala.collection.mutable.ArrayBuffer[Long]()
+        val intTs = scala.collection.mutable.ArrayBuffer[Long]()
+        val cgTs = scala.collection.mutable.ArrayBuffer[Long]()
+        var offRows: Seq[Row] = null
+        var cgRows: Seq[Row] = null
+        for (_ <- 0 until iters) {
+          val (o, oMs) = withSQLConf(offConf: _*) { timeMs(sql(q).collect().toSeq) }
+          val (i, iMs) = withSQLConf(interpConf: _*) { timeMs(sql(q).collect().toSeq) }
+          val (c, cMs) = withSQLConf(codegenConf: _*) { timeMs(sql(q).collect().toSeq) }
+          o.foreach { r => offTs += oMs; offRows = r }
+          i.foreach { _ => intTs += iMs }
+          c.foreach { r => cgTs += cMs; cgRows = r }
+        }
+        val matched = offRows != null && cgRows != null && rowsMatch(offRows, cgRows)
+        println(s"TPCH-BENCH: $name | ${cjShape._1}(${cjShape._2} grouping) | " +
+          s"off=${median(offTs.toSeq)}ms | interp=${median(intTs.toSeq)}ms | " +
+          s"codegen=${median(cgTs.toSeq)}ms | match=$matched")
+        if (offRows != null && cgRows != null && !matched) mismatches.append(name)
       }
-      Seq(offConf, interpConf, codegenConf).foreach { c =>
-        withSQLConf(c: _*) { try sql(q).collect() catch { case _: Throwable => } }  // warm up
-      }
-      val offTs = scala.collection.mutable.ArrayBuffer[Long]()
-      val intTs = scala.collection.mutable.ArrayBuffer[Long]()
-      val cgTs = scala.collection.mutable.ArrayBuffer[Long]()
-      var offRows: Seq[Row] = null
-      var cgRows: Seq[Row] = null
-      for (_ <- 0 until iters) {
-        val (o, oMs) = withSQLConf(offConf: _*) { timeMs(sql(q).collect().toSeq) }
-        val (i, iMs) = withSQLConf(interpConf: _*) { timeMs(sql(q).collect().toSeq) }
-        val (c, cMs) = withSQLConf(codegenConf: _*) { timeMs(sql(q).collect().toSeq) }
-        o.foreach { r => offTs += oMs; offRows = r }
-        i.foreach { _ => intTs += iMs }
-        c.foreach { r => cgTs += cMs; cgRows = r }
-      }
-      val matched = offRows != null && cgRows != null && rowsMatch(offRows, cgRows)
-      println(s"TPCH-BENCH: $name | ${cjShape._1}(${cjShape._2} grouping) | " +
-        s"off=${median(offTs.toSeq)}ms | interp=${median(intTs.toSeq)}ms | " +
-        s"codegen=${median(cgTs.toSeq)}ms | match=$matched")
-      assert(matched, s"$name codegen result must match vanilla")
     }
     // scalastyle:on println
+    assert(mismatches.isEmpty, s"codegen result diverged from vanilla for: ${mismatches.mkString}")
   }
 
   test("TPC-H full 22-query sweep: rewrite matches vanilla (sf1)") {
