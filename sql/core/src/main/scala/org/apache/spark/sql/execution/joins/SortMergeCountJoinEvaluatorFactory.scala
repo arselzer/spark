@@ -189,11 +189,6 @@ class SortMergeCountJoinEvaluatorFactory(
       val groupingProjection: UnsafeProjection =
         UnsafeProjection.create(groupRight, right.output)
 
-//      logWarning("agregate functions: " + aggregateFunctions.mkString("Array(", ", ", ")"))
-//      logWarning("groupRight: " + groupRight)
-//      logWarning("right output: " + right.output)
-//      logWarning("left output: " + left.output)
-
       joinType match {
         // TODO remove other join types as they get ignored in the countjoin
         case _: InnerLike =>
@@ -340,13 +335,6 @@ class SortMergeCountJoinEvaluatorFactory(
                 ++ groupRight.map(_.toAttribute),
               left.output ++ Seq(countRight.get.toAttribute)
                 ++ aggResultAttributes ++ groupRight.map(_.toAttribute))
-
-//            logWarning("agg buffer atts: " + bufferSchema.mkString("Array(", ", ", ")"))
-//            logWarning("agg results: " + aggResultAttributes)
-//            logWarning("evaluate expressions: " + evalExpressions.mkString("Array(", ", ", ")"))
-//            logWarning("output types: " + (left.output ++
-//              Seq(countRight.get.toAttribute)
-//              ++ aggResultAttributes ++ groupRight.map(_.toAttribute)).map(_.dataType))
 
             override def getRow: InternalRow = {
 

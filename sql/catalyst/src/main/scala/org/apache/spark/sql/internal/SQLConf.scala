@@ -3648,6 +3648,7 @@ object SQLConf {
         "relation except the largest (a broadcast-friendly star schema), where the " +
         "interpreted count-join only adds cost with no reduction benefit")
       .version("3.5.0")
+      .internal()
       .booleanConf
       .createWithDefault(true)
 
@@ -3658,6 +3659,7 @@ object SQLConf {
         "broadcast->shuffle->sortMerge selection. Needed because count joins otherwise plan as " +
         "broadcast (or shuffle) at unit-test scale and the sort-merge path is never exercised.")
       .version("3.5.0")
+      .internal()
       .stringConf
       .createWithDefault("")
 

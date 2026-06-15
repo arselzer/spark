@@ -33,16 +33,6 @@ import org.apache.spark.sql.execution.{CodegenSupport, ExplainUtils, RowIterator
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.types.{BooleanType, IntegralType, LongType, StructField, StructType}
 
-/**
- * @param relationTerm variable name for HashedRelation
- * @param keyIsUnique  indicate whether keys of HashedRelation known to be unique in code-gen time
- * @param isEmpty indicate whether it known to be EmptyHashedRelation in code-gen time
- */
-// private[joins] case class HashedRelationInfo(
-//    relationTerm: String,
-//    keyIsUnique: Boolean,
-//    isEmpty: Boolean)
-
 trait HashCountJoin extends JoinCodegenSupport {
   // Toggle to enable detailed debug logging for CountJoin operations
   private val DEBUG_COUNTJOIN = false
@@ -563,9 +553,10 @@ trait HashCountJoin extends JoinCodegenSupport {
             // Every key-matching build row failed the residual (non-equi) condition, so this
             // stream row has no real match: emit nothing rather than a phantom count-0 row.
             // Carried counts start at 1 and only sum upward, so rightCountSum == 0 can only mean
-            // "all matches filtered out", never a genuine zero-count group. Correct-by-construction
-            // - the rewrite currently bails on cross-relation filters so this is not yet reachable
-            // from SQL, but it makes the operator safe for future residual-filter support.
+            // "all matches filtered out", never a genuine zero-count group. This IS reachable:
+            // the rewrite folds cross-relation filters into the CountJoin condition, so a row
+            // whose every match fails the filter lands here. (HashCountJoin codegen and the SMJ
+            // evaluator guard the same case.)
             Seq.empty
           }
           else {
