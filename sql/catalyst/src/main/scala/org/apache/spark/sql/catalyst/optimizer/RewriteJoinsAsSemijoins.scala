@@ -352,21 +352,22 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     // For all aggregates (0MA or counting-based), check if there are no references to attributes
     // (e.g., COUNT(1)) or the references are not part of the grouping attributes
     // TODO remove duplicated code. Use enum for representing query types?
+    // The "references not a subset of grouping" filter is ONLY sound for duplicate-insensitive
+    // aggregates (min/max/distinct) and percentiles: over a grouping-key argument those are
+    // constant per group and need no fan-out counting. Count/Sum/Average are fan-out-SENSITIVE
+    // even when their only argument is a grouping key (e.g. count(k)/sum(k) grouped by k still
+    // count the join fan-out), so they must NOT be filtered out - otherwise the query is
+    // misclassified as 0MA and a semijoin reduction silently drops the fan-out. (Found by
+    // YannakakisFuzzSuite: count(k) + max(v) grouped by the join key k returned count=1, not 2.)
     val zeroMAAggregates = resultExpressions
       .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
       .filter(agg => isDuplicateInsensitive(agg))
     val percentileAggregates = resultExpressions
       .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
       .filter(agg => isPercentile(agg))
-    val countingAggregates = resultExpressions
-      .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
-      .filter(agg => isCounting(agg))
-    val sumAggregates = resultExpressions
-      .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
-      .filter(agg => isSum(agg))
-    val averageAggregates = resultExpressions
-      .filter(agg => agg.references.isEmpty || !(agg.references subsetOf groupAttributes))
-      .filter(agg => isAverage(agg))
+    val countingAggregates = resultExpressions.filter(agg => isCounting(agg))
+    val sumAggregates = resultExpressions.filter(agg => isSum(agg))
+    val averageAggregates = resultExpressions.filter(agg => isAverage(agg))
 
     if (zeroMAAggregates.isEmpty
       && percentileAggregates.isEmpty

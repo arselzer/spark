@@ -1418,6 +1418,34 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "sum directly over a join")
   }
 
+  test("count/sum of the grouping key over a fan-out join must count the fan-out") {
+    // Regression (found by YannakakisFuzzSuite seed 64): count(k)/sum(k) where k is BOTH the
+    // grouping key and the join key. The build dim has duplicate keys (fan-out), so vanilla counts
+    // the fan-out. The classifier used to EXCLUDE aggregates whose only reference is a grouping
+    // attribute (treating count(k) like count(*) of a constant), so the query was misclassified as
+    // 0MA and took the semijoin (LeftSemi) reduction - which drops the fan-out -> wrong count.
+    Seq((1, 10), (2, 20)).toDF("k", "v").createOrReplaceTempView("gk_fact")
+    Seq(1, 1, 2).toDF("k").createOrReplaceTempView("gk_dim")  // k=1 duplicated -> fan-out x2
+    // count(f.k) of the grouping key is paired with max(v) over a NON-grouping column. max(v) is
+    // duplicate-insensitive so it populates the 0MA class; count(f.k) was wrongly EXCLUDED from the
+    // counting class (refs subset of grouping), so the query took the 0MA semijoin reduction and
+    // dropped the fan-out -> count came back as 1 instead of 2.
+    assertSameResults(
+      "select f.k as g, count(f.k) as c, max(f.v) as m " +
+        "from gk_fact f join gk_dim d on f.k = d.k group by f.k",
+      "count(grouping key) over fan-out")
+    assertSameResults(
+      "select f.k as g, sum(f.k) as s, min(f.v) as m " +
+        "from gk_fact f join gk_dim d on f.k = d.k group by f.k",
+      "sum(grouping key) over fan-out")
+    // Mixed with a DISTINCT aggregate (the exact shape the fuzzer hit): the split's counting half
+    // must also count the fan-out.
+    assertSameResults(
+      "select f.k as g, count(f.k) as c, sum(distinct v) as sd, max(v) as mx " +
+        "from gk_fact f join gk_dim d on f.k = d.k group by f.k",
+      "count(grouping key) + distinct over fan-out")
+  }
+
   test("mixed DISTINCT + additive aggregates: split fires and matches vanilla (grouped)") {
     // a.k=1 appears twice -> the join fans b's k=1 row out twice. count(distinct x) must IGNORE
     // that fan-out (distinct x stays {10,20}=2), while sum(y)/count(*) must COUNT it. These two
