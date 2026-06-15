@@ -1685,6 +1685,24 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertCyclicSameResults(query, "4-cycle count(*)")
   }
 
+  test("cyclic 4-cycle written as a comma-join (non-cycle relation order) matches vanilla") {
+    // The same 4-cycle R(a,b)-S(b,c)-T(c,d)-U(d,a) but expressed as a comma-join whose FROM clause
+    // lists two OPPOSITE edges first (cyc_w(a,b), cyc_x(c,d) share no vertex). Spark's ReorderJoin
+    // still delivers a connected join order to the bag materialization (it avoids cartesians), so
+    // the bag chains successfully regardless of how the cycle is written. Regression coverage for
+    // the bag's connected-order assumption.
+    Seq((1, 10), (1, 20), (2, 10), (3, 30)).toDF("a", "b").createOrReplaceTempView("cyc_w")
+    Seq((100, 1000), (200, 1000), (300, 3000), (100, 2000))
+      .toDF("c", "d").createOrReplaceTempView("cyc_x")
+    Seq((10, 100), (20, 100), (30, 300), (10, 200)).toDF("b", "c").createOrReplaceTempView("cyc_y")
+    Seq((1000, 1), (2000, 1), (3000, 3), (1000, 2)).toDF("d", "a").createOrReplaceTempView("cyc_z")
+    val query =
+      """select count(*) as c from cyc_w w, cyc_x x, cyc_y y, cyc_z z
+         where w.b = y.b and y.c = x.c and x.d = z.d and z.a = w.a"""
+    assertCyclicRewriteLogged(query, "guarded single-node bag", "comma-join 4-cycle bag")
+    assertCyclicSameResults(query, "comma-join 4-cycle count(*)")
+  }
+
   test("cyclic triangle: acyclic regression - with the flag OFF the plan is NOT rewritten") {
     // Belt-and-suspenders: the default (flag off) must leave a cyclic query as the original plan
     // (no CountJoin), proving the new path is strictly opt-in and acyclic behaviour is untouched.
