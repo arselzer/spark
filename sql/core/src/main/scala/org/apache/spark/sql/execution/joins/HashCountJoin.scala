@@ -86,13 +86,16 @@ trait HashCountJoin extends JoinCodegenSupport {
     }
   }
 
-  // Whole-stage codegen is implemented for the non-grouping inner path: count(*)/count-only as
-  // well as carried DeclarativeAggregates (single fixed-position aggregate buffer, no grouping).
-  // Grouping paths stay interpreted (no HashMap codegen analog yet).
+  // Whole-stage codegen for the inner count-join: the non-grouping path uses a single fixed
+  // aggregate buffer; the grouping path uses a per-stream-row group map driving a per-task
+  // GroupedCountAggregator. Both require carried DeclarativeAggregates and a right build side.
   override def supportCodegen: Boolean =
-    groupRight.isEmpty && joinType.isInstanceOf[InnerLike] &&
-      buildSide == BuildRight &&
+    joinType.isInstanceOf[InnerLike] && buildSide == BuildRight &&
       aggregatesRight.forall(_.aggregateFunction.isInstanceOf[DeclarativeAggregate])
+
+  /** Per-task helper used by the grouped count-join codegen path. */
+  def createGroupedAggregator(): GroupedCountAggregator =
+    new GroupedCountAggregator(aggregatesRight, groupRight, right.output)
 
   override def outputPartitioning: Partitioning = buildSide match {
     case BuildLeft =>
@@ -710,6 +713,9 @@ trait HashCountJoin extends JoinCodegenSupport {
    * (left cols ++ count), or nothing when no match passes (the phantom-count-0 case).
    */
   protected def codegenCountInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+    if (groupRight.nonEmpty) {
+      return codegenCountGroupedInner(ctx, input)
+    }
     assert(buildSide == BuildRight, "count join must build the right side")
     val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
     if (isEmptyHashedRelation) {
@@ -831,6 +837,150 @@ trait HashCountJoin extends JoinCodegenSupport {
        |if ($rightCountSum != 0L) {
        |  long $countOut = $rightCountSum * $leftCount;
        |  $aggResultEval
+       |  $numOutput.add(1);
+       |  ${consume(ctx, resultVars)}
+       |}
+     """.stripMargin
+  }
+
+  /**
+   * Inner-join codegen for the GROUPING path: per stream row, group the passing build matches by
+   * groupRight into per-row maps (group key -> aggregate buffer, and -> summed count), then emit
+   * one row per group (left cols ++ count-multiplied sum ++ aggregate results ++ group key). The
+   * aggregate buffer math is delegated to a per-task GroupedCountAggregator; this code owns the
+   * match loop, the residual condition, the maps, the count multiplication and the emission.
+   */
+  protected def codegenCountGroupedInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+    assert(buildSide == BuildRight, "count join must build the right side")
+    val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
+    if (isEmptyHashedRelation) {
+      return "// empty HashedRelation: count inner join returns nothing"
+    }
+    val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
+    val (matched, checkCondition, _) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
+    val numOutput = metricTerm(ctx, "numOutputRows")
+
+    // Ordinals index streamedOutput (= left) and buildOutput (= right), as in the non-grouped path.
+    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
+      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
+      .map(c => buildOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+
+    val leftCount = ctx.freshName("leftCount")
+    val leftCountSetup = if (leftCountOrdinal != -1) {
+      val eval = evaluateRequiredVariables(
+        streamedPlan.output, input, AttributeSet(countLeft.get.references))
+      s"$eval\nlong $leftCount = ${input(leftCountOrdinal).value};"
+    } else {
+      s"long $leftCount = 1L;"
+    }
+
+    // Per-task grouped aggregator (group-key projection + buffer init/update/eval).
+    val thisPlan = ctx.addReferenceObj("plan", this)
+    val aggClass = classOf[GroupedCountAggregator].getName
+    val aggTerm = ctx.addMutableState(aggClass, "groupedAgg",
+      v => s"$v = $thisPlan.createGroupedAggregator();", forceInline = true)
+
+    val rowCls = classOf[InternalRow].getName
+    val mapCls = "java.util.LinkedHashMap"
+    val bufMap = ctx.freshName("bufMap")
+    val sumMap = ctx.freshName("sumMap")
+    val rightCount = ctx.freshName("rightCount")
+    val gkey = ctx.freshName("gkey")
+    val buf = ctx.freshName("buf")
+    val gkeyCopy = ctx.freshName("gkeyCopy")
+
+    val rightCountExpr =
+      if (rightCountOrdinal != -1) s"$matched.getLong($rightCountOrdinal)" else "1L"
+
+    val matchBody =
+      s"""
+         |long $rightCount = $rightCountExpr;
+         |UnsafeRow $gkey = $aggTerm.groupKey($matched);
+         |$rowCls $buf = ($rowCls) $bufMap.get($gkey);
+         |if ($buf == null) {
+         |  UnsafeRow $gkeyCopy = $gkey.copy();
+         |  $buf = $aggTerm.newBuffer();
+         |  $bufMap.put($gkeyCopy, $buf);
+         |  $sumMap.put($gkeyCopy, Long.valueOf($rightCount));
+         |} else {
+         |  $sumMap.put($gkey,
+         |    Long.valueOf(((Long) $sumMap.get($gkey)).longValue() + $rightCount));
+         |}
+         |$aggTerm.update($buf, $matched);
+       """.stripMargin
+
+    val matchLoop = if (keyIsUnique) {
+      s"""
+         |UnsafeRow $matched = $anyNull ? null : (UnsafeRow)$relationTerm.getValue(${keyEv.value});
+         |if ($matched != null) {
+         |  $checkCondition {
+         |    $matchBody
+         |  }
+         |}
+       """.stripMargin
+    } else {
+      val matches = ctx.freshName("matches")
+      val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+      s"""
+         |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
+         |if ($matches != null) {
+         |  while ($matches.hasNext()) {
+         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |    $checkCondition {
+         |      $matchBody
+         |    }
+         |  }
+         |}
+       """.stripMargin
+    }
+
+    // Per-group emit: read the aggregate-result and group-key fields into locals, then consume.
+    val aggResultAttributes = aggregatesRight.map(_.resultAttribute)
+    val groupAttributes = groupRight.map(_.toAttribute)
+    val aggResRow = ctx.freshName("aggRes")
+    val cnt = ctx.freshName("cnt")
+    val gkeyOut = ctx.freshName("gkeyOut")
+    val bufOut = ctx.freshName("bufOut")
+
+    def readField(row: String, attr: Attribute, i: Int): (String, ExprCode) = {
+      val v = ctx.freshName("fval")
+      val isNull = ctx.freshName("fIsNull")
+      val jt = CodeGenerator.javaType(attr.dataType)
+      val getter = CodeGenerator.getValue(row, attr.dataType, i.toString)
+      val stmt =
+        s"""boolean $isNull = $row.isNullAt($i);
+           |$jt $v = $isNull ? ${CodeGenerator.defaultValue(attr.dataType)} : $getter;"""
+          .stripMargin
+      (stmt, ExprCode(EmptyBlock, JavaCode.isNullVariable(isNull),
+        JavaCode.variable(v, attr.dataType)))
+    }
+
+    val aggReads =
+      aggResultAttributes.zipWithIndex.map { case (a, i) => readField(aggResRow, a, i) }
+    val groupReads = groupAttributes.zipWithIndex.map { case (a, i) => readField(gkeyOut, a, i) }
+    val countEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(cnt, LongType))
+    val resultVars = input ++ Seq(countEv) ++ aggReads.map(_._2) ++ groupReads.map(_._2)
+    val inputEval = evaluateVariables(input)
+    val iter = ctx.freshName("groupIter")
+    val entry = ctx.freshName("groupEntry")
+
+    s"""
+       |${keyEv.code}
+       |$leftCountSetup
+       |$mapCls<UnsafeRow, $rowCls> $bufMap = new $mapCls<UnsafeRow, $rowCls>();
+       |$mapCls<UnsafeRow, Long> $sumMap = new $mapCls<UnsafeRow, Long>();
+       |$matchLoop
+       |$inputEval
+       |java.util.Iterator $iter = $bufMap.entrySet().iterator();
+       |while ($iter.hasNext()) {
+       |  java.util.Map.Entry $entry = (java.util.Map.Entry) $iter.next();
+       |  UnsafeRow $gkeyOut = (UnsafeRow) $entry.getKey();
+       |  $rowCls $bufOut = ($rowCls) $entry.getValue();
+       |  long $cnt = ((Long) $sumMap.get($gkeyOut)).longValue() * $leftCount;
+       |  $rowCls $aggResRow = $aggTerm.eval($bufOut);
+       |  ${aggReads.map(_._1).mkString("\n")}
+       |  ${groupReads.map(_._1).mkString("\n")}
        |  $numOutput.add(1);
        |  ${consume(ctx, resultVars)}
        |}
@@ -1164,5 +1314,89 @@ object HashCountJoin extends CastSupport with SQLConfHelper {
         timeZoneId = Option(conf.sessionLocalTimeZone),
         ansiEnabled = false)
     }
+  }
+}
+
+/**
+ * Per-task helper for the GROUPED count-join codegen path. It bundles the same projections the
+ * interpreted grouping path builds (group-key projection, buffer init/update/eval) so the
+ * generated code can own the hot loop - matching, the residual condition, the per-stream-row group
+ * map and the count multiplication - while delegating the aggregate buffer math to these proven,
+ * MutableProjection-based helpers. The projections re-target their output row on each call, so an
+ * instance is stateful and MUST NOT be shared across tasks/threads: the generated iterator creates
+ * one per task in init().
+ */
+class GroupedCountAggregator(
+    aggregatesRight: Seq[AggregateExpression],
+    groupRight: Seq[NamedExpression],
+    rightOutput: Seq[Attribute]) {
+
+  private val aggregateFunctions = aggregatesRight.map(_.aggregateFunction).toIndexedSeq
+  private val bufferSchema = aggregateFunctions.flatMap(_.aggBufferAttributes)
+  private val useUnsafeBuffer = bufferSchema.map(_.dataType).forall(UnsafeRow.isMutable)
+  private val unsafeProjection = UnsafeProjection.create(bufferSchema.map(_.dataType).toArray)
+
+  private val initProjection = {
+    val initExpressions = aggregateFunctions.flatMap {
+      case ae: DeclarativeAggregate => ae.initialValues
+    }
+    MutableProjection.create(initExpressions, Nil)
+  }
+
+  private val mergeExpressions =
+    aggregateFunctions.zip(
+      aggregatesRight.map(ae => (ae.mode, ae.isDistinct, ae.filter))).flatMap {
+      case (ae: DeclarativeAggregate, (mode, _, filter)) =>
+        mode match {
+          case Partial | Complete =>
+            if (filter.isDefined) {
+              ae.updateExpressions.zip(ae.aggBufferAttributes).map {
+                case (updateExpr, attr) => If(filter.get, updateExpr, attr)
+              }
+            } else {
+              ae.updateExpressions
+            }
+          case _ => ae.mergeExpressions
+        }
+      case (agg: AggregateFunction, _) => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
+    }
+  private val updateProjection =
+    MutableProjection.create(mergeExpressions, bufferSchema ++ rightOutput)
+
+  private val evalExpressions = aggregateFunctions.map {
+    case ae: DeclarativeAggregate => ae.evaluateExpression
+    case _: AggregateFunction => NoOp
+  }
+  private val aggregateResult = new SpecificInternalRow(aggregatesRight.map(_.dataType))
+  private val evalProjection = {
+    val p = MutableProjection.create(evalExpressions, bufferSchema)
+    p.target(aggregateResult)
+    p
+  }
+
+  private val groupingProjection = UnsafeProjection.create(groupRight, rightOutput)
+  private val aggRow = new JoinedRow
+
+  /** Group key for a build row. The returned UnsafeRow is REUSED - copy before using as a key. */
+  def groupKey(buildRow: InternalRow): UnsafeRow = groupingProjection(buildRow)
+
+  /** A fresh, initialised aggregate buffer for a new group. */
+  def newBuffer(): InternalRow = {
+    val bufferRow = new SpecificInternalRow(bufferSchema.map(_.dataType))
+    val buffer = if (useUnsafeBuffer) unsafeProjection.apply(bufferRow).copy() else bufferRow
+    initProjection.target(buffer)(EmptyRow)
+    buffer
+  }
+
+  /** Folds one build row into a group's buffer. */
+  def update(buffer: InternalRow, buildRow: InternalRow): Unit = {
+    aggRow(buffer, buildRow)
+    updateProjection.target(buffer)(aggRow)
+  }
+
+  /** Evaluates a group's buffer into the aggregate result row (REUSED - read immediately). */
+  def eval(buffer: InternalRow): InternalRow = {
+    evalProjection(buffer)
+    aggregateResult
   }
 }

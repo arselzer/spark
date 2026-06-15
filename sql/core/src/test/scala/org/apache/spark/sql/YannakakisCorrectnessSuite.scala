@@ -943,6 +943,77 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertCountJoinCodegenMatches(query, "pure-count 3-relation chain count(*)")
   }
 
+  test("codegen: GROUPING count-join matches interpreted (group keys span relations)") {
+    // g1 lives in gj_a, g2 in gj_b, joined through the fact gj_f. Grouping by (g1, g2) forces the
+    // count-join that combines the two sides to GROUP inside the operator (groupRight non-empty) -
+    // the interpreted bufferMap/sumMap path. Fan-out so a miscount would change the per-group sums.
+    Seq((1, "p"), (2, "q")).toDF("ak", "g1").createOrReplaceTempView("gj_a")
+    Seq((1, 10, 100), (1, 11, 200), (2, 10, 300), (2, 11, 400))
+      .toDF("ak", "bk", "v").createOrReplaceTempView("gj_f")
+    Seq((10, "x"), (11, "y")).toDF("bk", "g2").createOrReplaceTempView("gj_b")
+    Seq(1, 1, 2).toDF("ak").createOrReplaceTempView("gj_d")  // fan-out on ak
+    val query = "select g1, g2, sum(v) as s, count(*) as c from gj_a a, gj_f f, gj_b b, gj_d d " +
+      "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2"
+    withSQLConf((yannakakisOn ++ Seq(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      // Confirm the test actually exercises a GROUPING count-join.
+      val plan = sql(query).queryExecution.executedPlan
+      val groupingCjs = plan.collect {
+        case cj: HashCountJoin if cj.groupRight.nonEmpty => cj
+      }
+      assert(groupingCjs.nonEmpty, s"expected a grouping count-join in:\n$plan")
+      // After grouped-path codegen lands, the grouping count-join supports codegen (RED: the
+      // groupRight.isEmpty gate currently makes this false).
+      assert(groupingCjs.forall(_.supportCodegen),
+        s"the grouping count-join should support whole-stage codegen:\n$plan")
+      val on = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      val off = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      assert(on == off, s"codegen $on != interp $off")
+    }
+    assertSameResults(query, "grouping count-join (2 group keys)")
+  }
+
+  test("codegen: grouped count-join under broadcast (getValue/iterator) matches interpreted") {
+    // Default broadcast (small dims) -> BroadcastHashCountJoin grouping path. Covers the broadcast
+    // branch of the grouped codegen (the prior grouping test forced the shuffled iterator branch).
+    Seq((1, "p"), (2, "q"), (3, "p")).toDF("ak", "g1").createOrReplaceTempView("bg_a")
+    Seq((1, 10, 100), (1, 11, 200), (2, 10, 300), (3, 11, 400))
+      .toDF("ak", "bk", "v").createOrReplaceTempView("bg_f")
+    Seq((10, "x"), (11, "y")).toDF("bk", "g2").createOrReplaceTempView("bg_b")
+    Seq(1, 1, 2, 3).toDF("ak").createOrReplaceTempView("bg_d")
+    val query = "select g1, g2, sum(v) as s, count(*) as c from bg_a a, bg_f f, bg_b b, bg_d d " +
+      "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2"
+    withSQLConf((yannakakisOn :+ (SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      val on = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      val off = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      assert(on == off, s"codegen $on != interp $off")
+    }
+    assertSameResults(query, "grouped count-join under broadcast")
+  }
+
+  test("codegen: grouped AVG count-join (Sum-decomposed buffer) matches interpreted") {
+    // AVG over a fan-out join, grouped by two cross-relation keys -> the grouping count-join
+    // carries Sum aggregates (numerator/denominator); exercises the grouped codegen Sum buffers.
+    Seq((1, "p"), (2, "q")).toDF("ak", "g1").createOrReplaceTempView("ag_a")
+    Seq((1, 10, 100.0), (1, 11, 200.0), (2, 10, 300.0), (2, 11, 400.0))
+      .toDF("ak", "bk", "v").createOrReplaceTempView("ag_f")
+    Seq((10, "x"), (11, "y")).toDF("bk", "g2").createOrReplaceTempView("ag_b")
+    Seq(1, 1, 2).toDF("ak").createOrReplaceTempView("ag_d")
+    assertSameResults(
+      "select g1, g2, avg(v) as a from ag_a a, ag_f f, ag_b b, ag_d d " +
+        "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2",
+      "grouped avg count-join")
+  }
+
   test("codegen: count-join on the shuffled-hash path matches interpreted") {
     // Broadcast disabled -> ShuffledHashCountJoin (keyIsUnique always false -> iterator branch).
     Seq(1, 1, 2, 2, 2).toDF("k").createOrReplaceTempView("sh_a")
@@ -1103,11 +1174,12 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "sum directly over a join")
   }
 
-  test("MEASURE: how many count-join operators in grouped counting queries are codegen-able") {
-    // Data point for whether building grouped-path codegen is worth it: the shipped codegen only
-    // covers non-grouping count-joins (groupRight empty). This tallies, across a spread of grouped
-    // counting queries, how many count-join operators are codegen-able vs. fall to the interpreted
-    // grouping path - i.e. does GROUP BY push grouping INTO the count-joins, or stay at the top?
+  test("count-join operators in grouped counting queries are all codegen-able") {
+    // Originally a measurement to scope grouped-path codegen: simple grouped counts keep grouping
+    // at the top HashAggregate (count-joins non-grouping, codegen-able), while complex aggregates
+    // like Q9 push grouping INTO the count-joins. With grouped-path codegen now implemented, BOTH
+    // are codegen-able - this asserts every count-join operator (hash; SMJ codegen is still off)
+    // across the spread reports supportCodegen = true.
     Seq((1, "g1", 10), (2, "g1", 20), (3, "g2", 30))
       .toDF("k", "g", "v").createOrReplaceTempView("m_fact")
     Seq(1, 1, 2, 3, 3).toDF("k").createOrReplaceTempView("m_d1")
@@ -1152,6 +1224,10 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       println(s"MEASURE TOTAL: $codegenable / $total count-join operators codegen-able")
       // scalastyle:on println
       assert(total > 0, "expected the grouped counting queries to produce count-joins")
+      // All count-joins here are broadcast/shuffled hash (no SMJ at this scale), and with
+      // grouped-path codegen every one - grouping or not - now supports whole-stage codegen.
+      assert(codegenable == total,
+        s"expected all $total count-join operators to be codegen-able, got $codegenable")
     }
   }
 }
