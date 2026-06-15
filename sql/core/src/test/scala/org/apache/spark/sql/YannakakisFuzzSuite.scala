@@ -149,10 +149,18 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     // bug source for the count-join path (the filter must be applied at/above the join where both
     // attributes are available, and rows whose matches all fail it must drop the carried count).
     val crossFilter = if (rng.nextInt(10) < 4) {
-      val fcol = pick(rng, Seq("f.fm1", "f.fm2"))
-      val di = 1 + rng.nextInt(nDims)
       val op = pick(rng, Seq("<", ">", "<=", ">=", "<>"))
-      s" where $fcol $op d$di.d${di}v"
+      val pred = if (nDims >= 2 && rng.nextBoolean()) {
+        // Span two relations the reduction does not directly inner-join (sibling dims in a star),
+        // optionally with a fact term too (a 3-relation predicate) - exercises the attribute-carry.
+        val Seq(di, dj) = rng.shuffle((1 to nDims).toList).take(2)
+        if (rng.nextBoolean()) s"d$di.d${di}v $op d$dj.d${dj}v"
+        else s"f.fm1 + d$di.d${di}v $op d$dj.d${dj}v"
+      } else {
+        val di = 1 + rng.nextInt(nDims)
+        s"f.${pick(rng, Seq("fm1", "fm2"))} $op d$di.d${di}v"
+      }
+      s" where $pred"
     } else ""
     s"select $selectList from $joins$crossFilter$groupClause"
   }
