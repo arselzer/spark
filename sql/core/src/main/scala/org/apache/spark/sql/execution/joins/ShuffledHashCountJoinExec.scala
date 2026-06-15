@@ -47,7 +47,12 @@ case class ShuffledHashCountJoinExec(
     countRight: Option[NamedExpression],
     aggregatesRight: Seq[AggregateExpression],
     groupRight: Seq[NamedExpression],
-    isSkewJoin: Boolean = false)
+    isSkewJoin: Boolean = false,
+    // #3-source: set by SparkStrategies when the build (right) join key is PROVABLY unique from
+    // the logical plan (build child's distinctKeys subset of the build join keys). When true, the
+    // relation's keyIsUnique is known statically (the build holds one row per key by construction),
+    // so the inner count codegen bakes the single-row getValue fast path with NO runtime check.
+    buildKeyKnownUnique: Boolean = false)
   extends HashCountJoin with ShuffledJoin {
 
   // The rewrite only ever emits inner count joins; the non-inner branches drop the carried count
@@ -361,13 +366,19 @@ case class ShuffledHashCountJoinExec(
     // Inline mutable state since not many join operations in a task
     val relationTerm = ctx.addMutableState(clsName, "relation",
       v => s"$v = $thisPlan.buildHashedRelation(inputs[1]);", forceInline = true)
-    HashedRelationInfo(relationTerm, keyIsUnique = false, isEmpty = false)
+    // #3-source: when the build join key is PROVABLY unique from the logical plan, the relation is
+    // guaranteed to hold one row per key, so report keyIsUnique statically and let the inner count
+    // codegen bake the getValue fast path with no runtime check. Otherwise report the conservative
+    // `false` and let buildKeyIsUniqueKnownStatically=false emit the runtime keyIsUnique() check.
+    HashedRelationInfo(relationTerm, keyIsUnique = buildKeyKnownUnique, isEmpty = false)
   }
 
-  // The relation is built at run time, so its key uniqueness is unknown at code-gen time: the
-  // count inner code tests relation.keyIsUnique() at run time and takes the getValue fast path
-  // when unique (broadcast count-joins know it statically and keep the default static branch).
-  protected override def buildKeyIsUniqueKnownStatically: Boolean = false
+  // The relation is built at run time, so its key uniqueness is normally unknown at code-gen time:
+  // the count inner code tests relation.keyIsUnique() at run time and takes the getValue fast path
+  // when unique. The exception is #3-source: when uniqueness is PROVEN statically from the logical
+  // plan (buildKeyKnownUnique), it is known at code-gen time, so skip the runtime check and bake
+  // the getValue fast path directly (broadcast count-joins always know it statically this way too).
+  protected override def buildKeyIsUniqueKnownStatically: Boolean = buildKeyKnownUnique
 
   override def doProduce(ctx: CodegenContext): String = {
     // Specialize `doProduce` code for full outer join and build-side outer join,

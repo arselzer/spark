@@ -524,6 +524,18 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
         j match {
           case ExtractCountJoinEquiJoinKeys(joinType, leftKeys, rightKeys, nonEquiCond,
           _, left, right, countLeft, countRight, aggregatesRight, groupRight, hint) =>
+            // #3-source: derive build-key uniqueness STATICALLY from the logical plan, never from
+            // estimated stats. The count-join always builds the RIGHT side, so the build key is
+            // unique iff the build child's logical `distinctKeys` contains an expression-set that
+            // is a subset of the build join keys (the same soundness criterion DistinctKeyVisitor
+            // uses for Inner joins). distinctKeys is only ever populated for relations that are
+            // provably distinct on those columns (Aggregate/Distinct/set-ops/limit-1/...), so a
+            // `true` here is a genuine guarantee, never a guess; raw scans report `Set.empty` and
+            // stay non-unique (the shuffled-hash runtime keyIsUnique() check stays the fallback).
+            val buildKeyKnownUnique = {
+              val buildJoinKeys = ExpressionSet(rightKeys)
+              right.distinctKeys.exists(_.subsetOf(buildJoinKeys))
+            }
             def createBroadcastHashCountJoin(onlyLookingAtHint: Boolean) = {
               val buildSide = getBroadcastCountJoinBuildSide(
                 left, right, joinType, hint, onlyLookingAtHint, conf)
@@ -561,7 +573,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
                     countLeft,
                     countRight,
                     aggregatesRight,
-                    groupRight))
+                    groupRight,
+                    buildKeyKnownUnique = buildKeyKnownUnique))
               }
             }
             def createSortMergeCountJoin() = {

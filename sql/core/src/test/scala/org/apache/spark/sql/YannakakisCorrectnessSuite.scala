@@ -1200,6 +1200,70 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
   }
 
+  // #3-source: when the build (right) join key is PROVABLY unique from the logical plan (the build
+  // child's distinctKeys subset the build join keys), the shuffled-hash count-join knows uniqueness
+  // STATICALLY at code-gen time. It must then bake the single-row getValue fast path directly and
+  // emit NO runtime relation.keyIsUnique() read (unlike the runtime-fast-path case above).
+  private def assertShuffledCountJoinHasStaticFastPath(query: String, hint: String): String = {
+    withSQLConf((yannakakisOn ++ Seq(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
+      val plan = sql(query).queryExecution.executedPlan
+      assert(plan.toString.contains("ShuffledHashCountJoin"),
+        s"$hint: expected a shuffled-hash count-join:\n$plan")
+      val code = org.apache.spark.sql.execution.debug.codegenString(plan)
+      assert(code.contains(".getValue("),
+        s"$hint: statically-unique count-join should emit the getValue fast branch:\n$code")
+      assert(!code.contains("keyIsUnique()"),
+        s"$hint: statically-unique count-join must NOT read relation.keyIsUnique() at runtime:\n" +
+          code)
+      code
+    }
+  }
+
+  test("codegen: shuffled count-join with a PROVABLY-unique build key takes the STATIC fast path") {
+    // The build side is `select distinct k from ...`, an Aggregate whose distinctKeys = {k}, which
+    // subsets the build join key -> #3-source proves uniqueness STATICALLY. The generated code must
+    // bake the getValue fast path and emit no runtime keyIsUnique() read; results match vanilla.
+    Seq(1, 1, 2, 2, 2, 3).toDF("k").createOrReplaceTempView("st_fact")
+    Seq(1, 1, 2, 3, 4, 4).toDF("k").createOrReplaceTempView("st_dim")
+    val query =
+      "select count(*) as c from st_fact f join (select distinct k from st_dim) d on f.k = d.k"
+    assertShuffledCountJoinHasStaticFastPath(query, "shuffled non-grouping static-unique-build-key")
+    assertCountJoinCodegenMatches(query, "shuffled non-grouping static-unique-build-key",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
+  }
+
+  test("codegen: static-unique count-join inside a GROUP BY query takes the STATIC fast path") {
+    // A provably-distinct build side (`select distinct k`) joined under an outer GROUP BY. The
+    // rewrite keeps the build child as the distinct Aggregate (distinctKeys = {k} subsets the build
+    // join key), so the count-join is statically unique and must bake the getValue fast path with
+    // no runtime keyIsUnique() read; the outer grouping is a separate HashAggregate above the join.
+    Seq(1, 1, 2, 2, 2, 3).toDF("k").createOrReplaceTempView("stg_fact")
+    Seq(1, 1, 2, 3, 4, 4).toDF("k").createOrReplaceTempView("stg_dim")
+    val query = "select f.k as gk, count(*) as c from stg_fact f join " +
+      "(select distinct k from stg_dim) d on f.k = d.k group by f.k"
+    assertShuffledCountJoinHasStaticFastPath(query, "static-unique under group-by")
+    assertCountJoinCodegenMatches(query, "static-unique under group-by",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
+  }
+
+  test("codegen: shuffled count-join with NOT-provably-unique build key keeps runtime check") {
+    // The build side is a raw scan (Project over an in-memory relation) whose distinctKeys is
+    // empty, so #3-source can NOT prove uniqueness. The operator must fall back to the runtime
+    // keyIsUnique() check (the safe path), while still emitting the getValue fast branch. Even
+    // though the data happens to have unique keys, we must not claim static uniqueness.
+    Seq(1, 1, 2, 2, 2, 3).toDF("k").createOrReplaceTempView("nu_fact")
+    Seq(1, 2, 3, 4).toDF("k").createOrReplaceTempView("nu_dim")
+    val query = "select count(*) as c from nu_fact f join nu_dim d on f.k = d.k"
+    val code = assertShuffledCountJoinHasRuntimeFastPath(query, "shuffled not-provably-unique")
+    assert(code.contains("keyIsUnique()"),
+      s"raw-scan build side must keep the runtime keyIsUnique() check:\n$code")
+    assertCountJoinCodegenMatches(query, "shuffled not-provably-unique",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
+  }
+
   // ---- Aggregate-dispatch correctness (rewrite rule) -------------------------------------
 
   test("unguarded AVG over a fan-out join matches vanilla (must not drop count multiplication)") {
@@ -1396,4 +1460,5 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
         s"expected all $total count-join operators to be codegen-able, got $codegenable")
     }
   }
+
 }
