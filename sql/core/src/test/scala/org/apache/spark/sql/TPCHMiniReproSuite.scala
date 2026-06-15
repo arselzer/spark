@@ -256,6 +256,45 @@ class TPCHMiniReproSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("TPC-H mini: count-join codegen matches interpreted (whole-stage on vs off)") {
+    createTables()
+    val failures = scala.collection.mutable.ListBuffer[String]()
+    var sawGroupingCodegen = false
+    val rewriteOn = Seq(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+    for ((name, query) <- queries) {
+      // Count-join operators and how many group (groupRight non-empty -> grouped codegen path).
+      val (totalCjs, groupingCjs) = withSQLConf(
+          (rewriteOn :+ (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
+        val cjs = sql(query).queryExecution.executedPlan.collect {
+          case cj: org.apache.spark.sql.execution.joins.HashCountJoin => cj.groupRight.nonEmpty
+        }
+        (cjs.size, cjs.count(identity))
+      }
+      val on = withSQLConf(
+          (rewriteOn :+ (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
+        sql(query).collect().toSeq
+      }
+      val off = withSQLConf(
+          (rewriteOn :+ (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false")): _*) {
+        sql(query).collect().toSeq
+      }
+      if (groupingCjs > 0) sawGroupingCodegen = true
+      val ok = rowsMatch(on, off)
+      // scalastyle:off println
+      println(s"TPCH-CG: $name -> ${if (ok) "OK" else "MISMATCH"} " +
+        s"(count-joins=$totalCjs, grouping=$groupingCjs)")
+      // scalastyle:on println
+      if (!ok) failures.append(s"$name: codegen $on != interpreted $off")
+    }
+    assert(failures.isEmpty, s"TPC-H count-join codegen diverged from interpreted:\n" +
+      failures.mkString("\n"))
+    assert(sawGroupingCodegen, "expected at least one TPC-H query to exercise grouped codegen")
+  }
+
   test("TPC-H mini repro: rewrite vs baseline") {
     createTables()
     val report = new StringBuilder
