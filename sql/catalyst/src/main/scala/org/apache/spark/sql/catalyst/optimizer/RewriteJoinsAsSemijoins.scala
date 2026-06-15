@@ -1171,6 +1171,14 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) logWarning(msg)
   }
 
+  // Equi-join key between two vertex attributes. Only cast the right side when the types
+  // genuinely differ: a no-op Cast (e.g. cast(int as int)) is never semanticEqual to its bare
+  // child, so it defeats HashPartitioning.satisfies and makes EnsureRequirements insert a
+  // redundant shuffle even when the child is already partitioned on that key.
+  private def equiKey(left: Expression, right: Expression): Expression =
+    if (right.dataType == left.dataType) EqualTo(left, right)
+    else EqualTo(left, Cast(right, left.dataType))
+
   // HTNode and HGEdge use identity hashCodes, so Set iteration order varies between JVM
   // runs, which makes join order (and thus plans and results) nondeterministic. Always
   // iterate children in a stable order based on the edge names (E1, E2, ...).
@@ -1192,7 +1200,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val overlappingVertices = vertices intersect childVertices
       val joinConditions = overlappingVertices
         .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
-        .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
+        .map(atts => equiKey(atts._1, atts._2))
         .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
       val semijoin = Join(prevJoin, c.buildBottomUpJoins,
         LeftSemi, Option(joinConditions), JoinHint(Option.empty, Option.empty))
@@ -1228,7 +1236,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       val overlappingVertices = vertices intersect childEdge.vertices
       val joinConditions = overlappingVertices
         .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
-        .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
+        .map(atts => equiKey(atts._1, atts._2))
         .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
       if ((needed intersect c.subtreeOutputSet).nonEmpty) {
         // child carries a needed attribute: inner-join to bring it up
@@ -1390,7 +1398,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
       val equalityConditions = overlappingVertices
         .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
-        .map(atts => EqualTo(atts._1, Cast(atts._2, atts._1.dataType)).asInstanceOf[Expression])
+        .map(atts => equiKey(atts._1, atts._2))
         .reduceLeft((e1, e2) => And(e1, e2).asInstanceOf[Expression])
 
       // Check for cross-relation filters that can be applied at this join

@@ -29,6 +29,9 @@ object BasicStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
 
   override def default(p: LogicalPlan): Statistics = p match {
     case p: LeafNode => p.computeStats()
+    // A count join is sized from its left (probe) child, not the cross-join product - delegate to
+    // the size-only estimator, which has that logic.
+    case _: CountJoin => fallback(p)
     case _: LogicalPlan =>
       val stats = p.children.map(_.stats)
       val rowCount = if (stats.exists(_.rowCount.isEmpty)) {

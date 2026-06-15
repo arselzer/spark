@@ -54,6 +54,17 @@ object SizeInBytesOnlyStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
    */
   override def default(p: LogicalPlan): Statistics = p match {
     case p: LeafNode => p.computeStats()
+    case cj: CountJoin =>
+      // A count join emits ~one row per left (probe) row (fewer when grouping) plus a count and
+      // aggregate columns - never the cross-join product of its children. Estimate the output
+      // size from the left child (scaled to the wider output row) so a small dimension subtree
+      // stays broadcastable instead of being mis-sized as left.size * right.size.
+      val leftSize = cj.left.stats.sizeInBytes
+      val leftRowSize = EstimationUtils.getSizePerRow(cj.left.output)
+      val outRowSize = EstimationUtils.getSizePerRow(cj.output)
+      val size =
+        if (leftRowSize <= 0) leftSize else (leftSize * outRowSize / leftRowSize).max(BigInt(1))
+      Statistics(sizeInBytes = size)
     case _: LogicalPlan =>
       Statistics(sizeInBytes = p.children.map(_.stats.sizeInBytes).filter(_ > 0L).product)
   }
