@@ -64,7 +64,11 @@ case class ShuffledHashCountJoinExec(
   override def output: Seq[Attribute] = left.output ++ Seq(countRight.get.toAttribute) ++
     aggregatesRight.map(_.resultAttribute) ++ groupRight.map(_.toAttribute)
 
-  override def outputPartitioning: Partitioning = super[ShuffledJoin].outputPartitioning
+  // The count-join output is left.output ++ count ++ aggResults ++ groupRight - it does NOT
+  // include the build (right) join-key attributes, so ShuffledJoin's PartitioningCollection(left,
+  // right) would advertise a partitioning on attributes no downstream operator can reference.
+  // Report only the left partitioning (matching SortMergeCountJoinExec).
+  override def outputPartitioning: Partitioning = left.outputPartitioning
 
   override def outputOrdering: Seq[SortOrder] = joinType match {
     // For outer joins where the outer side is build-side, order cannot be guaranteed.
