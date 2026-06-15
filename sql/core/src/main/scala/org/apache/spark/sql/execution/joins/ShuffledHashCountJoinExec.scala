@@ -364,6 +364,11 @@ case class ShuffledHashCountJoinExec(
     HashedRelationInfo(relationTerm, keyIsUnique = false, isEmpty = false)
   }
 
+  // The relation is built at run time, so its key uniqueness is unknown at code-gen time: the
+  // count inner code tests relation.keyIsUnique() at run time and takes the getValue fast path
+  // when unique (broadcast count-joins know it statically and keep the default static branch).
+  protected override def buildKeyIsUniqueKnownStatically: Boolean = false
+
   override def doProduce(ctx: CodegenContext): String = {
     // Specialize `doProduce` code for full outer join and build-side outer join,
     // because we need to iterate streamed and build side separately.

@@ -1113,6 +1113,50 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertCountJoinCodegenMatches(query, "unique-build-key count(*)")
   }
 
+  // Asserts a shuffled-hash count-join's generated code reads relation.keyIsUnique() at runtime and
+  // emits the single-row getValue fast branch (a shuffled relation is built at run time, so its key
+  // uniqueness is unknown at code-gen time; vanilla shuffled-hash inner joins therefore always take
+  // the iterator branch). Returns the generated code so callers can add path-specific assertions.
+  private def assertShuffledCountJoinHasRuntimeFastPath(query: String, hint: String): String = {
+    withSQLConf((yannakakisOn ++ Seq(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
+      val plan = sql(query).queryExecution.executedPlan
+      assert(plan.toString.contains("ShuffledHashCountJoin"),
+        s"$hint: expected a shuffled-hash count-join:\n$plan")
+      val code = org.apache.spark.sql.execution.debug.codegenString(plan)
+      assert(code.contains("keyIsUnique()"),
+        s"$hint: shuffled count-join should read relation.keyIsUnique() at runtime:\n$code")
+      assert(code.contains(".getValue("),
+        s"$hint: shuffled count-join should emit the getValue fast branch:\n$code")
+      code
+    }
+  }
+
+  test("codegen: shuffled-hash count-join with a unique build key takes the runtime fast path") {
+    // Non-grouping path (codegenCountInner). uq2_dim has unique keys, so relation.keyIsUnique() is
+    // true at run time -> the single-row getValue branch runs instead of the iterator branch.
+    Seq(1, 1, 2, 2, 2, 3).toDF("k").createOrReplaceTempView("uq2_fact")
+    Seq(1, 2, 3, 4).toDF("k").createOrReplaceTempView("uq2_dim")
+    val query = "select count(*) as c from uq2_fact f join uq2_dim d on f.k = d.k"
+    assertShuffledCountJoinHasRuntimeFastPath(query, "shuffled non-grouping unique-build-key")
+    assertCountJoinCodegenMatches(query, "shuffled non-grouping unique-build-key",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
+  }
+
+  test("codegen: shuffled-hash GROUPED count-join with a unique build key takes the runtime fast " +
+    "path") {
+    // Grouping path (codegenCountGroupedInner). The build (dim) carries the group key g and has a
+    // unique join key k, so relation.keyIsUnique() is true at run time -> grouped getValue branch.
+    Seq(1, 1, 2, 2, 2, 3).toDF("k").createOrReplaceTempView("uqg_fact")
+    Seq((1, "a"), (2, "b"), (3, "c"), (4, "d")).toDF("k", "g").createOrReplaceTempView("uqg_dim")
+    val query = "select g, count(*) as c from uqg_fact f join uqg_dim d on f.k = d.k group by g"
+    assertShuffledCountJoinHasRuntimeFastPath(query, "shuffled grouped unique-build-key")
+    assertCountJoinCodegenMatches(query, "shuffled grouped unique-build-key",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
+  }
+
   // ---- Aggregate-dispatch correctness (rewrite rule) -------------------------------------
 
   test("unguarded AVG over a fan-out join matches vanilla (must not drop count multiplication)") {

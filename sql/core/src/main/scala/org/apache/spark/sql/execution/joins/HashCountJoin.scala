@@ -785,30 +785,8 @@ trait HashCountJoin extends JoinCodegenSupport {
     }.mkString("\n")
 
     val matchBody = s"$buildEval\n$rightCountAccum\n$updateCode"
-    val matchLoop = if (keyIsUnique) {
-      s"""
-         |UnsafeRow $matched = $anyNull ? null : (UnsafeRow)$relationTerm.getValue(${keyEv.value});
-         |if ($matched != null) {
-         |  $checkCondition {
-         |    $matchBody
-         |  }
-         |}
-       """.stripMargin
-    } else {
-      val matches = ctx.freshName("matches")
-      val iteratorCls = classOf[Iterator[UnsafeRow]].getName
-      s"""
-         |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
-         |if ($matches != null) {
-         |  while ($matches.hasNext()) {
-         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
-         |    $checkCondition {
-         |      $matchBody
-         |    }
-         |  }
-         |}
-       """.stripMargin
-    }
+    val matchLoop = countMatchLoop(
+      ctx, relationTerm, keyEv, anyNull, matched, checkCondition, keyIsUnique, matchBody)
 
     // Post-loop: evaluate the aggregate results from the buffer.
     ctx.currentVars = flatBufVars
@@ -936,30 +914,8 @@ trait HashCountJoin extends JoinCodegenSupport {
          |$updateCode
        """.stripMargin
 
-    val matchLoop = if (keyIsUnique) {
-      s"""
-         |UnsafeRow $matched = $anyNull ? null : (UnsafeRow)$relationTerm.getValue(${keyEv.value});
-         |if ($matched != null) {
-         |  $checkCondition {
-         |    $matchBody
-         |  }
-         |}
-       """.stripMargin
-    } else {
-      val matches = ctx.freshName("matches")
-      val iteratorCls = classOf[Iterator[UnsafeRow]].getName
-      s"""
-         |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
-         |if ($matches != null) {
-         |  while ($matches.hasNext()) {
-         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
-         |    $checkCondition {
-         |      $matchBody
-         |    }
-         |  }
-         |}
-       """.stripMargin
-    }
+    val matchLoop = countMatchLoop(
+      ctx, relationTerm, keyEv, anyNull, matched, checkCondition, keyIsUnique, matchBody)
 
     // Per-group emit: read the aggregate-result and group-key fields into locals, then consume.
     val aggResultAttributes = aggregatesRight.map(_.resultAttribute)
@@ -1277,6 +1233,71 @@ trait HashCountJoin extends JoinCodegenSupport {
   }
 
   protected def prepareRelation(ctx: CodegenContext): HashedRelationInfo
+
+  /**
+   * Whether the build relation's key uniqueness is known at code-gen time. Broadcast count-joins
+   * materialize the relation before code-gen, so prepareRelation returns its true `keyIsUnique`
+   * and the inner count code bakes the matching branch statically. Shuffled-hash count-joins build
+   * the relation at run time, so prepareRelation reports a conservative `false`; overriding this to
+   * `false` makes the inner count code instead test relation.keyIsUnique() at run time and still
+   * take the single-row getValue fast path for unique build keys (which is common for the count
+   * build side, as it carries grouped/aggregated partial state with one row per join key).
+   */
+  protected def buildKeyIsUniqueKnownStatically: Boolean = true
+
+  /**
+   * Builds the per-stream-row match loop shared by the count inner paths. `matchBody` is the code
+   * run for each passing build match and may reference `matched`. When uniqueness is known at
+   * code-gen time (broadcast) the branch is selected statically; otherwise (shuffled-hash) both
+   * branches are emitted and selected at run time from relation.keyIsUnique(), so a unique build
+   * key still takes the single-row getValue fast path instead of allocating a one-element iterator.
+   */
+  protected def countMatchLoop(
+      ctx: CodegenContext,
+      relationTerm: String,
+      keyEv: ExprCode,
+      anyNull: String,
+      matched: String,
+      checkCondition: String,
+      keyIsUnique: Boolean,
+      matchBody: String): String = {
+    val uniqueLoop =
+      s"""
+         |UnsafeRow $matched = $anyNull ? null : (UnsafeRow)$relationTerm.getValue(${keyEv.value});
+         |if ($matched != null) {
+         |  $checkCondition {
+         |    $matchBody
+         |  }
+         |}
+       """.stripMargin
+    val matches = ctx.freshName("matches")
+    val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+    val nonUniqueLoop =
+      s"""
+         |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
+         |if ($matches != null) {
+         |  while ($matches.hasNext()) {
+         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |    $checkCondition {
+         |      $matchBody
+         |    }
+         |  }
+         |}
+       """.stripMargin
+    if (buildKeyIsUniqueKnownStatically) {
+      if (keyIsUnique) uniqueLoop else nonUniqueLoop
+    } else {
+      val kiu = ctx.addMutableState("boolean", "cjKeyIsUnique",
+        v => s"$v = $relationTerm.keyIsUnique();", forceInline = true)
+      s"""
+         |if ($kiu) {
+         |  $uniqueLoop
+         |} else {
+         |  $nonUniqueLoop
+         |}
+       """.stripMargin
+    }
+  }
 }
 
 object HashCountJoin extends CastSupport with SQLConfHelper {
