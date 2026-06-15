@@ -144,7 +144,17 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     val groupSelect = groupCols.zipWithIndex.map { case (g, i) => s"$g as g$i" }
     val selectList = (groupSelect ++ aggSelect).mkString(", ")
     val groupClause = if (groupCols.nonEmpty) " group by " + groupCols.mkString(", ") else ""
-    s"select $selectList from $joins$groupClause"
+
+    // ~40% of the time add a non-equi cross-relation filter (fact col vs a dim col), a historical
+    // bug source for the count-join path (the filter must be applied at/above the join where both
+    // attributes are available, and rows whose matches all fail it must drop the carried count).
+    val crossFilter = if (rng.nextInt(10) < 4) {
+      val fcol = pick(rng, Seq("f.fm1", "f.fm2"))
+      val di = 1 + rng.nextInt(nDims)
+      val op = pick(rng, Seq("<", ">", "<=", ">=", "<>"))
+      s" where $fcol $op d$di.d${di}v"
+    } else ""
+    s"select $selectList from $joins$crossFilter$groupClause"
   }
 
   test("fuzz: random acyclic join+aggregate queries match vanilla (values + schema)") {
