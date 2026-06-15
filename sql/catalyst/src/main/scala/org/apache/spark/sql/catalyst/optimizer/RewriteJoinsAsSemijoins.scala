@@ -2716,6 +2716,24 @@ class Hypergraph (private val items: Seq[LogicalPlan],
       return null
     }
 
+    // Cost gate (when enabled): the bag is materialized EAGERLY with ordinary inner joins, before
+    // any semijoin reduction. Only do so when that join is bounded - every residual relation
+    // except the largest must be broadcast-eligible by size, so the bag is a chain of broadcast
+    // joins and cannot blow up. A bag with two large relations risks a cyclic-join explosion that
+    // vanilla's join reordering might avoid, so decline and fall back. (Off in the test suites via
+    // yannakakisCostGateEnabled=false, so the cyclic tests still exercise the path.)
+    val sqlConf = SQLConf.get
+    if (sqlConf.yannakakisCostGateEnabled) {
+      val thr = BigInt(sqlConf.autoBroadcastJoinThreshold)
+      val sizes = residual.map(_.planReference.stats.sizeInBytes).sorted
+      if (thr < 0 || sizes.dropRight(1).exists(_ > thr)) {
+        if (RewriteJoinsAsSemijoins.DEBUG_LOGGING) {
+          logWarning("cyclic decomposition: bag not broadcast-bounded, falling back")
+        }
+        return null
+      }
+    }
+
     // Equi-join condition between two relations on every hypergraph vertex they share. For a
     // vertex v, both sides may output several attributes of v's equivalence class; pick one
     // attribute per side (any pair is equal under the equivalence) and AND the equalities.

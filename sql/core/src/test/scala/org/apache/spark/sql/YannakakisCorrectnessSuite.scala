@@ -1704,6 +1704,54 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("cyclic cost gate: a non-broadcast-bounded bag falls back, results stay correct") {
+    createTriangleTables()
+    val query =
+      "select count(*) as c from tri_r r join tri_s s on r.b = s.b " +
+        "join tri_t t on r.a = t.a and s.c = t.c"
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+    // The bare triangle becomes a whole-query bag, applied as a "guarded single-node bag" - the one
+    // reliable signal that the cyclic rewrite fired (the bag itself is plain inner joins, so the
+    // plan carries no CountJoin either way). We assert on that log in both directions.
+
+    // Cost gate ON + a 1-byte broadcast threshold: no triangle relation is broadcast-eligible, so
+    // the bag is not broadcast-bounded; materializeBag returns null, the decomposition fails, and
+    // the query falls back to the original plan (rewrite declines) - still correct.
+    val (gatedRows, gatedFired) = runCyclicCapturingFire(query,
+      Seq(SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true",
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "1"))
+    assert(!gatedFired, "cost gate + tiny broadcast threshold must decline the cyclic bag")
+    assertRowsMatch(gatedRows, expected, "cost-gated cyclic query")
+
+    // Gate off (suite default): the same cyclic query DOES fire and is correct.
+    val (firedRows, fired) = runCyclicCapturingFire(query, Seq.empty)
+    assert(fired, "with the cost gate off the cyclic rewrite should fire")
+    assertRowsMatch(firedRows, expected, "ungated cyclic query")
+  }
+
+  // Runs `query` with the cyclic-bags flag on (plus `extraConf`) under a log appender, returning
+  // (rows, didTheGuardedSingleNodeBagRewriteFire).
+  private def runCyclicCapturingFire(
+      query: String, extraConf: Seq[(String, String)]): (Seq[Row], Boolean) = {
+    val appender = new LogAppender("single-node bag")
+    var rows: Seq[Row] = null
+    withLogAppender(appender) {
+      withSQLConf((cyclicBagsOn ++ extraConf): _*) { rows = sql(query).collect().toSeq }
+    }
+    val fired = appender.loggingEvents.exists(
+      _.getMessage.getFormattedMessage.contains("guarded single-node bag"))
+    (rows, fired)
+  }
+
+  private def assertRowsMatch(actual: Seq[Row], expected: Seq[Row], hint: String): Unit = {
+    val a = actual.sortBy(_.toString)
+    val e = expected.sortBy(_.toString)
+    assert(a == e, s"$hint\nexpected: ${e.mkString(" | ")}\nactual  : ${a.mkString(" | ")}")
+  }
+
   /** Asserts the LEFT-OUTER split fired (logs "left-outer split") AND results match vanilla. */
   private def assertLeftOuterSplitAndCorrect(query: String, hint: String): Unit = {
     val appender = new LogAppender("left-outer split rewrite")
