@@ -943,6 +943,59 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertCountJoinCodegenMatches(query, "pure-count 3-relation chain count(*)")
   }
 
+  // Forces the shuffled grouping count-join, asserts it is codegen-able, and that whole-stage
+  // codegen ON produces the same rows as OFF (interpreted) and as vanilla. The gate for the
+  // grouped-codegen buffer-update inlining.
+  private def assertGroupingCodegenMatches(query: String, hint: String): Unit = {
+    withSQLConf((yannakakisOn ++ Seq(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      val plan = sql(query).queryExecution.executedPlan
+      val groupingCjs = plan.collect { case cj: HashCountJoin if cj.groupRight.nonEmpty => cj }
+      assert(groupingCjs.nonEmpty, s"$hint: expected a grouping count-join in:\n$plan")
+      assert(groupingCjs.forall(_.supportCodegen),
+        s"$hint: grouping count-join should support whole-stage codegen")
+      val on = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      val off = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+        sql(query).collect().toSeq.map(_.toString).sorted
+      }
+      assert(on == off, s"$hint: codegen $on != interp $off")
+    }
+    assertSameResults(query, hint)
+  }
+
+  test("codegen: GROUPING count-join with decimal SUM matches interpreted") {
+    // SUM over a DECIMAL(18,4) carried in the grouping count-join buffer - exercises the inlined
+    // updateColumn decimal/avoidSetNullAt path.
+    Seq((1, "p"), (2, "q")).toDF("ak", "g1").createOrReplaceTempView("dg_a")
+    Seq((1, 10, "123.45"), (1, 11, "200.50"), (2, 10, "300.00"), (2, 11, "0.01"))
+      .toDF("ak", "bk", "v0").selectExpr("ak", "bk", "cast(v0 as decimal(18,4)) as v")
+      .createOrReplaceTempView("dg_f")
+    Seq((10, "x"), (11, "y")).toDF("bk", "g2").createOrReplaceTempView("dg_b")
+    Seq(1, 1, 2).toDF("ak").createOrReplaceTempView("dg_d")
+    assertGroupingCodegenMatches(
+      "select g1, g2, sum(v) as s, count(*) as c from dg_a a, dg_f f, dg_b b, dg_d d " +
+        "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2",
+      "grouping decimal sum")
+  }
+
+  test("codegen: GROUPING count-join with multiple aggregates matches interpreted") {
+    // sum(long) + sum(double) + count(*): three aggregate functions in one buffer - exercises the
+    // per-function buffer offsets in the inlined update.
+    Seq((1, "p"), (2, "q")).toDF("ak", "g1").createOrReplaceTempView("mg_a")
+    Seq((1, 10, 100, 1.5), (1, 11, 200, 2.5), (2, 10, 300, 3.5), (2, 11, 400, 4.5))
+      .toDF("ak", "bk", "v1", "v2").createOrReplaceTempView("mg_f")
+    Seq((10, "x"), (11, "y")).toDF("bk", "g2").createOrReplaceTempView("mg_b")
+    Seq(1, 1, 2).toDF("ak").createOrReplaceTempView("mg_d")
+    assertGroupingCodegenMatches(
+      "select g1, g2, sum(v1) as s1, sum(v2) as s2, count(*) as c " +
+        "from mg_a a, mg_f f, mg_b b, mg_d d " +
+        "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2",
+      "grouping multi-aggregate")
+  }
+
   test("codegen: GROUPING count-join matches interpreted (group keys span relations)") {
     // g1 lives in gj_a, g2 in gj_b, joined through the fact gj_f. Grouping by (g1, g2) forces the
     // count-join that combines the two sides to GROUP inside the operator (groupRight non-empty) -

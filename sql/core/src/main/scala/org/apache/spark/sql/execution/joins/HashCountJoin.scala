@@ -848,7 +848,7 @@ trait HashCountJoin extends JoinCodegenSupport {
       return "// empty HashedRelation: count inner join returns nothing"
     }
     val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
-    val (matched, checkCondition, _) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
+    val (matched, checkCondition, buildVars) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
     val numOutput = metricTerm(ctx, "numOutputRows")
 
     // Ordinals index streamedOutput (= left) and buildOutput (= right), as in the non-grouped path.
@@ -887,6 +887,41 @@ trait HashCountJoin extends JoinCodegenSupport {
     val rightCountExpr =
       if (rightCountOrdinal != -1) s"$matched.getLong($rightCountOrdinal)" else "1L"
 
+    // Inline the per-match aggregate buffer update instead of the GroupedCountAggregator.update
+    // virtual call + interpreted MutableProjection: mirror codegenCountInner, but write into the
+    // per-group buffer ROW's columns via updateColumn. Buffer slots read from `buf` (INPUT_ROW);
+    // build columns read from the lazy buildVars (the HashAggregate doConsumeWithKeys pattern).
+    val aggFns = aggregatesRight.map(_.aggregateFunction.asInstanceOf[DeclarativeAggregate])
+    val bufferSchema = aggFns.flatMap(_.aggBufferAttributes)
+    val updateExprs = aggregatesRight.map { e =>
+      e.mode match {
+        case Partial | Complete =>
+          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].updateExpressions
+        case _ =>
+          e.aggregateFunction.asInstanceOf[DeclarativeAggregate].mergeExpressions
+      }
+    }
+    val bufferStartOffsets = aggFns.map(_.aggBufferAttributes.length).scanLeft(0)(_ + _)
+    // Force-evaluate (once per match) the build columns the update reads; buildVars are lazy.
+    val buildUpdateEval = evaluateRequiredVariables(
+      buildPlan.output, buildVars, AttributeSet(updateExprs.flatten.flatMap(_.references)))
+    // Buffer ordinals (null in currentVars) fall through to INPUT_ROW = buf; build ordinals read
+    // from buildVars. Read-before-write per function: evaluate all of a function's slot exprs
+    // (which reference the OLD buffer values) before writing any of them back.
+    ctx.INPUT_ROW = buf
+    ctx.currentVars = (Array.fill[ExprCode](bufferSchema.length)(null) ++ buildVars).toSeq
+    val bufferEvals = updateExprs.map(u =>
+      bindReferences(u, bufferSchema ++ buildPlan.output).map(_.genCode(ctx)))
+    ctx.INPUT_ROW = null
+    val updateCode = bufferEvals.zipWithIndex.map { case (evals, i) =>
+      val base = bufferStartOffsets(i)
+      val writes = evals.zipWithIndex.map { case (ev, j) =>
+        val attr = aggFns(i).aggBufferAttributes(j)
+        CodeGenerator.updateColumn(buf, attr.dataType, base + j, ev, attr.nullable)
+      }
+      s"${evaluateVariables(evals)}\n${writes.mkString("\n")}"
+    }.mkString("\n")
+
     val matchBody =
       s"""
          |long $rightCount = $rightCountExpr;
@@ -897,7 +932,8 @@ trait HashCountJoin extends JoinCodegenSupport {
          |  $bufMap.put($gkey.copy(), $buf);
          |}
          |$buf.setLong($countOrd, $buf.getLong($countOrd) + $rightCount);
-         |$aggTerm.update($buf, $matched);
+         |$buildUpdateEval
+         |$updateCode
        """.stripMargin
 
     val matchLoop = if (keyIsUnique) {
@@ -1324,8 +1360,8 @@ class GroupedCountAggregator(
   private val bufferSchema = aggregateFunctions.flatMap(_.aggBufferAttributes)
   // The per-group buffer carries the fan-out count in one extra trailing LongType slot, so the
   // grouped codegen needs only one map (group -> buffer) and no boxed Long count map. The
-  // aggregate update/eval projections only touch slots 0..countOrdinal-1; the count slot is
-  // maintained directly by the caller (see codegenCountGroupedInner).
+  // inlined aggregate update (see codegenCountGroupedInner) and the eval projection only touch
+  // slots 0..countOrdinal-1; the count slot is maintained directly by the caller.
   val countOrdinal: Int = bufferSchema.length
   private val bufferTypes = bufferSchema.map(_.dataType) :+ LongType
   private val useUnsafeBuffer = bufferTypes.forall(UnsafeRow.isMutable)
@@ -1337,30 +1373,6 @@ class GroupedCountAggregator(
     }
     MutableProjection.create(initExpressions, Nil)
   }
-
-  private val mergeExpressions =
-    aggregateFunctions.zip(
-      aggregatesRight.map(ae => (ae.mode, ae.isDistinct, ae.filter))).flatMap {
-      case (ae: DeclarativeAggregate, (mode, _, filter)) =>
-        mode match {
-          case Partial | Complete =>
-            if (filter.isDefined) {
-              ae.updateExpressions.zip(ae.aggBufferAttributes).map {
-                case (updateExpr, attr) => If(filter.get, updateExpr, attr)
-              }
-            } else {
-              ae.updateExpressions
-            }
-          case _ => ae.mergeExpressions
-        }
-      case (agg: AggregateFunction, _) => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
-    }
-  // update() runs over JoinedRow(buffer, buildRow). The buffer now has the trailing count slot, so
-  // a placeholder attribute must sit between bufferSchema and rightOutput or the build columns
-  // would be read one ordinal too early (the count slot's position).
-  private val countSlotAttr = AttributeReference("cjFanoutCount", LongType, nullable = false)()
-  private val updateProjection =
-    MutableProjection.create(mergeExpressions, (bufferSchema :+ countSlotAttr) ++ rightOutput)
 
   private val evalExpressions = aggregateFunctions.map {
     case ae: DeclarativeAggregate => ae.evaluateExpression
@@ -1374,7 +1386,6 @@ class GroupedCountAggregator(
   }
 
   private val groupingProjection = UnsafeProjection.create(groupRight, rightOutput)
-  private val aggRow = new JoinedRow
 
   /** Group key for a build row. The returned UnsafeRow is REUSED - copy before using as a key. */
   def groupKey(buildRow: InternalRow): UnsafeRow = groupingProjection(buildRow)
@@ -1386,12 +1397,6 @@ class GroupedCountAggregator(
     initProjection.target(buffer)(EmptyRow)   // initialises the aggregate slots 0..countOrdinal-1
     buffer.setLong(countOrdinal, 0L)          // the carried fan-out count
     buffer
-  }
-
-  /** Folds one build row into a group's buffer. */
-  def update(buffer: InternalRow, buildRow: InternalRow): Unit = {
-    aggRow(buffer, buildRow)
-    updateProjection.target(buffer)(aggRow)
   }
 
   /** Evaluates a group's buffer into the aggregate result row (REUSED - read immediately). */
