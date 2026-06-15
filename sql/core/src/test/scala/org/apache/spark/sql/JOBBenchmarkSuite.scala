@@ -183,39 +183,72 @@ class JOBBenchmarkSuite extends QueryTest with SharedSparkSession {
     // scalastyle:on println
   }
 
-  test("JOB grouped count(*) codegen matches vanilla (real-data grouping count-joins)") {
+  test("JOB grouped-codegen benchmark: grouping count-join on vs off (real-data)") {
     assume(new File(imdbDir).isDirectory, s"IMDB parquet dataset not present at $imdbDir")
     loadImdb()
-    // 1a's join graph, grouped by columns from TWO different relations (title and company_type)
-    // so the group keys can't all reach one relation - grouping is pushed INTO a count-join (the
-    // path the Q9 unit tests cover synthetically) on real-scale data.
+    // 1a's join graph, grouped by columns from TWO different relations (title + company_type) so
+    // the group keys can't all reach one relation -> grouping is pushed INTO a count-join (the path
+    // codegenCountGroupedInner handles), unlike single-relation grouping that stays at the top
+    // HashAggregate. count(*) and SUM variants hit the count-only and Sum-buffer grouped paths.
     val file = new File(s"$jobDir/1a.sql")
     assume(file.exists(), "1a.sql not present")
     val src = scala.io.Source.fromFile(file)
     val raw = try src.mkString.trim.stripSuffix(";") finally src.close()
-    val fromIdx = raw.toLowerCase(java.util.Locale.ROOT).indexOf("from")
-    val gq = s"SELECT t.production_year AS py, ct.id AS ctid, count(*) AS c " +
-      s"${raw.substring(fromIdx)} group by t.production_year, ct.id"
+    val from = raw.substring(raw.toLowerCase(java.util.Locale.ROOT).indexOf("from"))
+    val queries = Seq(
+      "grouped count(*)" ->
+        (s"SELECT t.production_year AS py, ct.id AS ctid, count(*) AS c $from " +
+          "group by t.production_year, ct.id"),
+      "grouped sum" ->
+        (s"SELECT t.production_year AS py, ct.id AS ctid, sum(mi_idx.id) AS s $from " +
+          "group by t.production_year, ct.id"))
+    val iters = 5
     val aqeOff = Seq(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
-    // Confirm a grouping count-join is actually present and codegen-able under the rewrite.
-    withSQLConf((aqeOff ++ yannakakisOn): _*) {
-      val plan = sql(gq).queryExecution.executedPlan
-      val groupingCjs = plan.collect {
-        case cj: org.apache.spark.sql.execution.joins.HashCountJoin if cj.groupRight.nonEmpty => cj
+    val offConf = aqeOff :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false")
+    val interpConf = aqeOff ++ yannakakisOn :+
+      (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false")
+    val codegenConf = aqeOff ++ yannakakisOn :+
+      (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
+    // scalastyle:off println
+    println("JOB-GCG: query | grouping-cjs | off | on(interp) | on(codegen) | match")
+    var sawGroupingCodegen = false
+    for ((label, gq) <- queries) {
+      // Confirm the rewrite pushes grouping INTO a codegen-able count-join.
+      val groupingCjs = withSQLConf((codegenConf): _*) {
+        sql(gq).queryExecution.executedPlan.collect {
+          case cj: org.apache.spark.sql.execution.joins.HashCountJoin
+            if cj.groupRight.nonEmpty => cj.supportCodegen
+        }
       }
-      // scalastyle:off println
-      println(s"JOB-GROUPED: grouping count-joins=${groupingCjs.size}, " +
-        s"all codegen-able=${groupingCjs.forall(_.supportCodegen)}")
-      // scalastyle:on println
+      Seq(offConf, interpConf, codegenConf).foreach { c =>
+        withSQLConf(c: _*) { try sql(gq).collect() catch { case _: Throwable => } }  // warm up
+      }
+      val offTs = scala.collection.mutable.ArrayBuffer[Long]()
+      val intTs = scala.collection.mutable.ArrayBuffer[Long]()
+      val cgTs = scala.collection.mutable.ArrayBuffer[Long]()
+      var offRows: Seq[Row] = null
+      var cgRows: Seq[Row] = null
+      for (_ <- 0 until iters) {
+        val (o, oMs) = withSQLConf(offConf: _*) { timeMs(sql(gq).collect().toSeq) }
+        val (i, iMs) = withSQLConf(interpConf: _*) { timeMs(sql(gq).collect().toSeq) }
+        val (c, cMs) = withSQLConf(codegenConf: _*) { timeMs(sql(gq).collect().toSeq) }
+        o.foreach { r => offTs += oMs; offRows = r }
+        i.foreach { _ => intTs += iMs }
+        c.foreach { r => cgTs += cMs; cgRows = r }
+      }
+      val matched = offRows != null && cgRows != null &&
+        offRows.map(_.toString).sorted == cgRows.map(_.toString).sorted
+      println(s"JOB-GCG: $label | grouping-cjs=${groupingCjs.size}(codegen=" +
+        s"${groupingCjs.count(identity)}) | off=${median(offTs.toSeq)}ms | " +
+        s"interp=${median(intTs.toSeq)}ms | codegen=${median(cgTs.toSeq)}ms | match=$matched")
+      // Any grouping count-join present must be codegen-able, and results must match vanilla.
+      assert(groupingCjs.forall(identity),
+        s"$label: a grouping count-join is not codegen-able")
+      assert(matched, s"$label grouped codegen result must match vanilla")
+      sawGroupingCodegen ||= groupingCjs.nonEmpty
     }
-    val on = withSQLConf((aqeOff ++ yannakakisOn :+
-      (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
-      sql(gq).collect().toSeq.map(_.toString).sorted
-    }
-    val off = withSQLConf((aqeOff :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false")): _*) {
-      sql(gq).collect().toSeq.map(_.toString).sorted
-    }
-    assert(on == off,
-      s"grouped count(*) codegen must match vanilla (${on.size} vs ${off.size} rows)")
+    // At least one query must exercise the grouped-codegen path, else this measures nothing.
+    assert(sawGroupingCodegen, "no query pushed grouping into a count-join; benchmark is moot")
+    // scalastyle:on println
   }
 }
