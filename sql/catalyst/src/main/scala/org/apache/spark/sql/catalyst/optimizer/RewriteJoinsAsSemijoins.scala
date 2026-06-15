@@ -1088,6 +1088,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
   private case object LoSum extends LoMerge
   private case object LoMin extends LoMerge
   private case object LoMax extends LoMerge
+  // AVG is mergeable as two partials [sum(x), count(x)] per half, recombined as
+  // SUM(sums)/SUM(counts) in the merge. Only used when the average's output is DoubleType (byte/
+  // short/int/long/float/double inputs), where Average == Divide(sum.cast, count.cast) exactly;
+  // DECIMAL/interval averages keep the safe fallback (no exact precision parity).
+  private case object LoAvg extends LoMerge
 
   /**
    * Rewrites `Aggregate(g, aggs, A OUTER JOIN B)` (LEFT/RIGHT/FULL) using the decomposition
@@ -1113,10 +1118,12 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
    *  - the merge re-aggregates the union of the partials and casts each result back to the
    *    original aggregate's type, preserving both the output exprIds and the output schema.
    *
+   * AVG is supported when its output is DoubleType (non-decimal, non-interval inputs): it is
+   * carried as two partials [sum(x), count(x)] per half and recombined as SUM(sums)/SUM(counts).
    * Returns None (fall back to the original plan) for a missing join condition, any non-mergeable
-   * aggregate (AVG/DISTINCT/percentile/stddev/FILTER, nested/mixed aggregates, a bare un-aliased
-   * aggregate), or when the matched half does not accelerate (so the split would only multiply the
-   * join with no benefit), and whenever the merged plan drops a required input.
+   * aggregate (DECIMAL/interval AVG, DISTINCT/percentile/stddev/FILTER, nested/mixed aggregates, a
+   * bare un-aliased aggregate), or when the matched half does not accelerate (so the split would
+   * only multiply the join with no benefit), and whenever the merged plan drops a required input.
    */
   private def tryRewriteOuter(
       agg: Aggregate,
@@ -1144,8 +1151,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     val bOutputSet = right.outputSet
 
     // Classify each result expression: a grouping-derived expression (no aggregate), or an Alias
-    // over a single mergeable aggregate. Anything else (bare aggregate, AVG/DISTINCT/percentile/
-    // stddev, FILTER, or an expression mixing/nesting aggregates) makes the split bail.
+    // over a single mergeable aggregate (count/sum/min/max, or avg with DoubleType output).
+    // Anything else (DECIMAL/interval avg, DISTINCT/percentile/stddev, FILTER, or an expression
+    // mixing/nesting aggregates) makes the split bail.
     def mergeKindOf(ae: AggregateExpression): Option[LoMerge] =
       if (ae.isDistinct || ae.filter.isDefined) None
       else ae.aggregateFunction match {
@@ -1153,6 +1161,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
         case _: Sum => Some(LoSum)
         case _: Min => Some(LoMin)
         case _: Max => Some(LoMax)
+        // AVG only when its output is DoubleType (non-decimal, non-interval inputs); see [[LoAvg]].
+        case avg: Average if avg.dataType == DoubleType => Some(LoAvg)
         case _ => None
       }
     val classified: Seq[Option[(NamedExpression, Option[LoMerge])]] = aggExpressions.map { ne =>
@@ -1170,6 +1180,22 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     val aggSlots: Seq[(NamedExpression, LoMerge)] =
       cats.collect { case (ne, Some(k)) => (ne, k) }
     if (aggSlots.isEmpty) return None // no aggregate to merge - nothing to do
+
+    // A slot contributes `slotWidth` partial columns to each half: 1 for sum/min/max, 2 =
+    // [sum(x), count(x)] for avg. `remap` is toInner for the matched half (routed through the
+    // count-join, which fan-out-weights both sum and count), identity for the anti halves.
+    def slotWidth(kind: LoMerge): Int = kind match { case LoAvg => 2; case _ => 1 }
+    def slotPartials(ne: NamedExpression, kind: LoMerge,
+                     remap: Expression => Expression): Seq[Expression] = {
+      val child = ne.asInstanceOf[Alias].child
+      kind match {
+        case LoAvg =>
+          val x = remap(child.asInstanceOf[AggregateExpression]
+            .aggregateFunction.asInstanceOf[Average].child)
+          Seq(Sum(x).toAggregateExpression(), Count(x :: Nil).toAggregateExpression())
+        case _ => Seq(remap(child))
+      }
+    }
 
     val innerJoin = Join(left, right, Inner, cond, hint)
     // Re-point every reference to the INNER join's output attributes. The LEFT join marks B's
@@ -1189,8 +1215,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     val gkMatched = innerGrouping.map(g => Alias(g, "lojoin_gk")())
     // Fresh exprIds for the matched aggregate slots too, so the union's output exprIds are all
     // fresh and never collide with the original output exprIds re-used by the final merge.
-    val matchedAggExprs = aggSlots.map { case (ne, _) =>
-      Alias(toInner(ne.asInstanceOf[Alias].child), ne.name)()
+    val matchedAggExprs = aggSlots.flatMap { case (ne, k) =>
+      slotPartials(ne, k, e => toInner(e)).map(p => Alias(p, "lojoin_agg")())
     }
     val matchedResultExprs = gkMatched ++ matchedAggExprs
     val matchedHalf =
@@ -1216,9 +1242,10 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     val antiJoin = Join(left, right, LeftAnti, cond, hint)
     val antiChild = Project(antiProjectList, antiJoin)
     val gkAnti = grouping.map(g => Alias(g, "lojoin_gk")())
-    // Rebuild each aggregate slot with a fresh exprId (the union branches must be disjoint).
-    val antiAggExprs = aggSlots.map { case (ne, _) =>
-      Alias(ne.asInstanceOf[Alias].child, ne.name)()
+    // Rebuild each aggregate slot's partials with fresh exprIds (the union branches must be
+    // disjoint). The anti join has no fan-out, so the partials are plain aggregates.
+    val antiAggExprs = aggSlots.flatMap { case (ne, k) =>
+      slotPartials(ne, k, identity).map(p => Alias(p, "lojoin_agg")())
     }
     val antiResultExprs = gkAnti ++ antiAggExprs
     val antiHalf = Aggregate(grouping, antiResultExprs, antiChild)
@@ -1239,8 +1266,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
         JoinHint(hint.rightHint, hint.leftHint))
       val rightAntiChild = Project(rightAntiProjectList, rightAntiJoin)
       val gkRightAnti = grouping.map(g => Alias(g, "lojoin_gk")())
-      val rightAntiAggExprs = aggSlots.map { case (ne, _) =>
-        Alias(ne.asInstanceOf[Alias].child, ne.name)()
+      val rightAntiAggExprs = aggSlots.flatMap { case (ne, k) =>
+        slotPartials(ne, k, identity).map(p => Alias(p, "lojoin_agg")())
       }
       Some(Aggregate(grouping, gkRightAnti ++ rightAntiAggExprs, rightAntiChild))
     } else None
@@ -1265,12 +1292,24 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
           case other => other
         }, out.name)(exprId = out.exprId)
       case (ne, Some(kind)) =>
-        val part = unionAggParts(aggIdx)
-        aggIdx += 1
+        val parts = (0 until slotWidth(kind)).map(i => unionAggParts(aggIdx + i))
+        aggIdx += slotWidth(kind)
         val merged: Expression = kind match {
-          case LoSum => Sum(part).toAggregateExpression()
-          case LoMin => Min(part).toAggregateExpression()
-          case LoMax => Max(part).toAggregateExpression()
+          case LoSum => Sum(parts(0)).toAggregateExpression()
+          case LoMin => Min(parts(0)).toAggregateExpression()
+          case LoMax => Max(parts(0)).toAggregateExpression()
+          case LoAvg =>
+            // Recombine across halves: SUM(per-half sums) / SUM(per-half counts). Mirrors the
+            // count-join path's Average reconstruction (Divide, casting to DoubleDecimal unless
+            // both operands already accept DoubleType); the outer Cast yields the avg's type.
+            val totalSum = Sum(parts(0)).toAggregateExpression()
+            val totalCnt = Sum(parts(1)).toAggregateExpression()
+            if (DoubleType.acceptsType(totalSum.dataType) &&
+              DoubleType.acceptsType(totalCnt.dataType)) {
+              Divide(totalSum, totalCnt)
+            } else {
+              Divide(Cast(totalSum, DoubleDecimal), Cast(totalCnt, DoubleDecimal))
+            }
         }
         val out = ne.toAttribute
         Alias(Cast(merged, out.dataType), out.name)(exprId = out.exprId)

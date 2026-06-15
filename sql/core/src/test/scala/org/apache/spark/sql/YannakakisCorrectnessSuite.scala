@@ -1965,9 +1965,36 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "LEFT OUTER over a multi-relation right subtree")
   }
 
-  test("LEFT OUTER falls back for AVG (not a mergeable aggregate)") {
+  test("LEFT OUTER avg over a B column is accelerated (double output) and matches vanilla") {
     createLeftOuterTables()
-    val query = "select g, avg(b.x) as a from lo_a a left join lo_b b on a.k = b.k group by g"
+    // avg(b.x): B-only-unmatched groups (k=3,4) have all-NULL b.x, so avg is NULL there.
+    assertLeftOuterSplitAndCorrect(
+      "select g, avg(b.x) as a from lo_a a left join lo_b b on a.k = b.k group by g",
+      "LEFT OUTER avg(b.x) double output")
+  }
+
+  test("LEFT OUTER avg over an A-only measure (fan-out weighted) matches vanilla") {
+    createLeftOuterTables()
+    // avg(a.v): matched rows are fan-out weighted, unmatched A rows counted once - the merge
+    // recombines total sum / total count across the matched + anti halves.
+    assertLeftOuterSplitAndCorrect(
+      "select g, avg(a.v) as a, count(*) as c from lo_a a left join lo_b b on a.k = b.k group by g",
+      "LEFT OUTER avg(a.v) A-only fan-out")
+  }
+
+  test("FULL OUTER avg over both sides matches vanilla") {
+    createFullOuterTables()
+    assertFullOuterSplitAndCorrect(
+      "select g, avg(a.v) as av, avg(b.x) as bx from fo_a a full outer join fo_b b on a.k = b.k" +
+        " group by g",
+      "FULL OUTER avg over both sides")
+  }
+
+  test("LEFT OUTER falls back for avg over a DECIMAL column (precision parity)") {
+    Seq((1, "A"), (2, "A"), (3, "B")).toDF("k", "g").createOrReplaceTempView("dec_a")
+    Seq((1, BigDecimal("10.25")), (1, BigDecimal("20.50")), (2, BigDecimal("30.75")))
+      .toDF("k", "d").createOrReplaceTempView("dec_b")
+    val query = "select g, avg(b.d) as a from dec_a a left join dec_b b on a.k = b.k group by g"
     var expected: Seq[Row] = null
     withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
       expected = sql(query).collect().toSeq
@@ -1976,7 +2003,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       val df = sql(query)
       checkAnswer(df, expected)
       assert(!df.queryExecution.optimizedPlan.toString.contains("CountJoin"),
-        "AVG over a LEFT join must fall back (no count-join split)")
+        "avg over a DECIMAL column must fall back (no exact Average precision parity)")
     }
   }
 
