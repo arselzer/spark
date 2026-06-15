@@ -412,20 +412,34 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             case ae => isDuplicateInsensitive(ae)
           }
           if (allDuplicateInsensitive && hasNonMinMaxDupInsensitive) {
-            if (hg.crossRelationFilters.isEmpty && conf.yannakakisDistinctEnabled) {
-              val needed = groupAttributes ++ aggregateAttributes
+            if (conf.yannakakisDistinctEnabled) {
+              // Carry the filter attributes through the reduction too, then apply the filters once
+              // all their attributes are available (mirrors the guarded 0MA path). 0MA aggregates
+              // are duplicate-insensitive, so the inner-join carries and the dedup are lossless.
+              val filterRefs = AttributeSet(hg.crossRelationFilters.flatMap(_.references))
+              val needed = groupAttributes ++ aggregateAttributes ++ filterRefs
               val distinctRoot =
                 Option(jointree.findNodeContainingAttributesEquiv(aggregateAttributes))
                   .orElse(Option(jointree.findNodeContainingAttributesEquiv(groupAttributes)))
                   .map(_.reroot)
                   .getOrElse(jointree)
               val reducedJoin = distinctRoot.buildBottomUpDistinctJoin(needed, isTop = true)
-              val newAgg = Aggregate(groupingExpressions, resultExpressions, reducedJoin)
+              if (hg.crossRelationFilters.nonEmpty && !filterRefs.subsetOf(reducedJoin.outputSet)) {
+                // A filter references an attribute the reduction could not carry to a common node
+                // (it spans relations never inner-joined together) - fall back rather than apply a
+                // filter over missing attributes.
+                debugLog("non-guarded 0MA: cross-relation filter refs not all carried - keeping " +
+                  "original plan")
+                return agg
+              }
+              val filtered = hg.crossRelationFilters.foldLeft[LogicalPlan](reducedJoin)(
+                (p, f) => Filter(f, p))
+              val newAgg = Aggregate(groupingExpressions, resultExpressions, filtered)
               logInfo("new aggregate (distinct-reduced)")
               debugLog("time difference: " + (System.nanoTime() - startTime))
               return newAgg
             }
-            // cross-relation filters or disabled: not supported.
+            // distinct path disabled: not supported.
             debugLog("duplicate-insensitive non-guarded aggregates not supported here")
             return agg
           }

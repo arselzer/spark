@@ -151,6 +151,24 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "non-guarded count(distinct) 3-relation path")
   }
 
+  test("non-guarded 0MA with a cross-relation filter is distinct-reduced and correct") {
+    // Closes the limitation: a non-guarded duplicate-insensitive query (count(distinct x); g in r1,
+    // x in r3) with a cross-relation filter (r1.a < r3.x, spanning the chain ENDS) used to bail
+    // because the non-guarded distinct path didn't handle filters. It now carries the filter's
+    // attributes through the reduction (inner-joining the connecting subtrees r1-r2-r3) and applies
+    // the filter, exactly like the guarded 0MA path. That the filter spans the chain ends also
+    // exercises the attribute-carry across distant relations (the subsetOf guard must NOT fire).
+    Seq(("A", 1, 5), ("A", 2, 15)).toDF("g", "k", "a").createOrReplaceTempView("nf_r1")
+    Seq((1, 10), (2, 20)).toDF("k", "m").createOrReplaceTempView("nf_r2")
+    Seq((10, 7), (10, 8), (20, 12)).toDF("m", "x").createOrReplaceTempView("nf_r3")
+    assertDistinctReducedAndCorrect("""
+      select g, count(distinct x) as c
+      from nf_r1, nf_r2, nf_r3
+      where nf_r1.k = nf_r2.k and nf_r2.m = nf_r3.m and nf_r1.a < nf_r3.x
+      group by g""",
+      "non-guarded 0MA + cross-relation filter")
+  }
+
   test("non-guarded sum(distinct) over a 3-relation path is rewritten and correct") {
     Seq((1, 10)).toDF("g", "k").createOrReplaceTempView("sd_r1")
     Seq((10, 100), (10, 200)).toDF("k", "m").createOrReplaceTempView("sd_r2")
