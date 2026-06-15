@@ -932,16 +932,90 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       aggExpressions: Seq[NamedExpression],
       projectList: Seq[NamedExpression],
       join: Join): LogicalPlan = {
-    try {
-      validateOrFallback(agg,
-        rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-          join, keyRefs = Seq(), uniqueConstraints = Seq()))
-    } catch {
-      case scala.util.control.NonFatal(e) =>
-        logWarning("yannakakis rewrite failed; falling back to the original plan: " +
-          e.getMessage)
-        agg
+    trySplitMixedDistinct(agg, groupingExpressions, aggExpressions, projectList, join).getOrElse {
+      try {
+        validateOrFallback(agg,
+          rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+            join, keyRefs = Seq(), uniqueConstraints = Seq()))
+      } catch {
+        case scala.util.control.NonFatal(e) =>
+          logWarning("yannakakis rewrite failed; falling back to the original plan: " +
+            e.getMessage)
+          agg
+      }
     }
+  }
+
+  /**
+   * Handles aggregates that mix duplicate-insensitive aggregates (min/max, DISTINCT count/sum/avg,
+   * collect_set, ...) with counting aggregates (plain count/sum/avg/percentile). These cannot share
+   * one count-join pipeline: the counting aggregates need the join fan-out multiplied in, while the
+   * duplicate-insensitive ones need it ignored. Split the aggregate into two halves over the SAME
+   * join - a duplicate-insensitive half (rewritten via the 0MA/semijoin path) and a counting half
+   * (rewritten via the counting path) - then rejoin the per-group results on the grouping keys.
+   *
+   * Each half is rewritten via the normal entry path (so neither needs new aggregation logic). The
+   * split is only committed when BOTH halves are accelerated; otherwise it would replace one join
+   * with two (one possibly un-reduced), a pessimization, so we fall back to the original plan.
+   * Returns None when the aggregate is not mixed or cannot be cleanly split.
+   */
+  private def trySplitMixedDistinct(
+      agg: Aggregate,
+      grouping: Seq[Expression],
+      aggExpressions: Seq[NamedExpression],
+      projectList: Seq[NamedExpression],
+      join: Join): Option[LogicalPlan] = {
+    val aggs = aggExpressions.flatMap(_.collect { case ae: AggregateExpression => ae })
+    val (dupInsensitive, counting) = aggs.partition(isDuplicateInsensitive)
+    if (dupInsensitive.isEmpty || counting.isEmpty) return None  // not mixed
+
+    // Route each result expression to exactly one half: a grouping-derived expression (no
+    // aggregate; code 0), or an Alias over a single aggregate (duplicate-insensitive = 1, counting
+    // = 2). A bare aggregate not under an Alias, or an expression mixing aggregate classes, cannot
+    // be split cleanly -> bail (None).
+    val classified = aggExpressions.map { ne =>
+      val contained = ne.collect { case ae: AggregateExpression => ae }
+      if (contained.isEmpty) Some((ne, 0))
+      else ne match {
+        case Alias(ae: AggregateExpression, _) =>
+          Some((ne, if (isDuplicateInsensitive(ae)) 1 else 2))
+        case _ => None
+      }
+    }
+    if (classified.exists(_.isEmpty)) return None
+    val cats = classified.flatten
+    val groupResultExprs = cats.collect { case (ne, 0) => ne }
+    val distinctResultExprs = cats.collect { case (ne, 1) => ne }
+    val additiveResultExprs = cats.collect { case (ne, 2) => ne }
+    if (distinctResultExprs.isEmpty || additiveResultExprs.isEmpty) return None
+
+    // Fresh per-half group-key aliases, used only for the recombine join (null-safe so NULL group
+    // keys match like GROUP BY). The distinct half also carries the original grouping-derived
+    // result expressions (original exprIds) for the final projection.
+    val distinctJoinKeys = grouping.map(g => Alias(g, "cjsplit_gk")())
+    val additiveJoinKeys = grouping.map(g => Alias(g, "cjsplit_gk")())
+
+    val distinctHalf =
+      Aggregate(grouping, distinctJoinKeys ++ groupResultExprs ++ distinctResultExprs, agg.child)
+    val additiveHalf = Aggregate(grouping, additiveJoinKeys ++ additiveResultExprs, agg.child)
+
+    val distinctRewritten = rewriteOrFallback(
+      distinctHalf, grouping, distinctHalf.aggregateExpressions, projectList, join)
+    val additiveRewritten = rewriteOrFallback(
+      additiveHalf, grouping, additiveHalf.aggregateExpressions, projectList, join)
+    if ((distinctRewritten eq distinctHalf) || (additiveRewritten eq additiveHalf)) {
+      // At least one half was not accelerated - do not double the join.
+      return None
+    }
+
+    val joinCond = distinctJoinKeys.zip(additiveJoinKeys).map {
+      case (l, r) => EqualNullSafe(l.toAttribute, r.toAttribute): Expression
+    }.reduceOption(And)
+    val recombined = Join(distinctRewritten, additiveRewritten, Inner, joinCond, JoinHint.NONE)
+    // Project the original aggregate output (same exprIds, original order), dropping the helper
+    // join-key columns from each half.
+    logInfo("new aggregate (mixed-distinct split)")
+    Some(Project(aggExpressions.map(_.toAttribute), recombined))
   }
 
   /**

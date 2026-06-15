@@ -312,17 +312,28 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "non-guarded multiple distinct args")
   }
 
-  test("non-guarded mixed distinct and additive aggregates bail out and stay correct") {
+  test("non-guarded mixed distinct and additive aggregates split and stay correct") {
     Seq((1, 10)).toDF("g", "k").createOrReplaceTempView("md_r1")
     Seq((10, 100), (10, 200)).toDF("k", "m").createOrReplaceTempView("md_r2")
     Seq((100, 7, 1.0), (200, 8, 2.0)).toDF("m", "x", "v").createOrReplaceTempView("md_r3")
-    // count(distinct x) + sum(v): not all duplicate-insensitive -> must NOT take distinct path
-    assertNotRewrittenButCorrect("""
+    // count(distinct x) + sum(v) over a 3-relation path: mixed duplicate-insensitive + counting.
+    // The rewrite splits into a distinct half (0MA semijoin reduction) and a counting half
+    // (count-join), rejoined on g. Both halves accelerate, so the split fires.
+    val query = """
       select g, count(distinct x) as c, sum(v) as s
       from md_r1, md_r2, md_r3
       where md_r1.k = md_r2.k and md_r2.m = md_r3.m
-      group by g""",
-      "mixed distinct + additive")
+      group by g"""
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+    withSQLConf(yannakakisOn: _*) {
+      val df = sql(query)
+      checkAnswer(df, expected)
+      assert(df.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        "mixed distinct + additive should split and rewrite (counting half -> CountJoin)")
+    }
   }
 
   test("count(distinct) over fan-out join returns correct results (Q16 shape)") {
@@ -625,11 +636,14 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       planMarker = "LeftSemi")
   }
 
-  test("mixed distinct and plain aggregates bail out and stay correct") {
+  test("mixed distinct and plain aggregates split and stay correct") {
     Seq((1, "A", 10, 1.0), (2, "A", 10, 2.0), (3, "B", 30, 3.0))
       .toDF("k", "g", "x", "y").createOrReplaceTempView("mx1")
     Seq(1, 1, 2, 3).toDF("k").createOrReplaceTempView("mx2")
 
+    // count(distinct x) + sum(y), guarded (g, x, y all in mx1). The rewrite splits into a distinct
+    // half (0MA) and a counting half (count-join) and rejoins on g; the count-multiplication for
+    // sum(y) must not inflate count(distinct x).
     val query = """
       select g, count(distinct x) as c, sum(y) as s
       from mx1 join mx2 on mx1.k = mx2.k
@@ -641,8 +655,8 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     withSQLConf(yannakakisOn: _*) {
       val df = sql(query)
       val plan = df.queryExecution.optimizedPlan.toString
-      assert(!plan.contains("CountJoin") && !plan.contains("LeftSemi"),
-        "mixed distinct+plain aggregates must not be rewritten (phase 1):\n" + plan)
+      assert(plan.contains("CountJoin"),
+        "mixed distinct+plain aggregates should split and rewrite:\n" + plan)
       checkAnswer(df, expected)
     }
   }
@@ -1402,6 +1416,38 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertSameResults(
       "select sum(v) as s from nj_a a join nj_b b on a.k = b.k",
       "sum directly over a join")
+  }
+
+  test("mixed DISTINCT + additive aggregates: split fires and matches vanilla (grouped)") {
+    // a.k=1 appears twice -> the join fans b's k=1 row out twice. count(distinct x) must IGNORE
+    // that fan-out (distinct x stays {10,20}=2), while sum(y)/count(*) must COUNT it. These two
+    // requirements are incompatible in one count-join pipeline, so the rewrite splits the aggregate
+    // into a duplicate-insensitive half (0MA) and a counting half, then rejoins on the group key.
+    Seq(1, 1, 2).toDF("k").createOrReplaceTempView("mxd_a")
+    Seq((1, "P", 10, 100), (2, "P", 20, 200))
+      .toDF("k", "g", "x", "y").createOrReplaceTempView("mxd_b")
+    val query = "select g, count(distinct x) as cd, sum(y) as s, count(*) as c " +
+      "from mxd_a a join mxd_b b on a.k = b.k group by g"
+    withSQLConf((yannakakisOn :+ (SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      val plan = sql(query).queryExecution.executedPlan.toString
+      assert(plan.contains("CountJoin"),
+        s"mixed-distinct rewrite should fire (split into distinct + counting halves):\n$plan")
+    }
+    assertSameResults(query, "mixed distinct + additive (grouped)")
+  }
+
+  test("mixed DISTINCT + additive aggregates: split fires and matches vanilla (global)") {
+    // No GROUP BY -> the two halves each produce one row and recombine via a 1x1 cross join.
+    Seq(1, 1, 2).toDF("k").createOrReplaceTempView("mxg_a")
+    Seq((1, 10, 100), (2, 20, 200)).toDF("k", "x", "y").createOrReplaceTempView("mxg_b")
+    val query = "select count(distinct x) as cd, sum(y) as s, count(*) as c " +
+      "from mxg_a a join mxg_b b on a.k = b.k"
+    withSQLConf((yannakakisOn :+ (SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      val plan = sql(query).queryExecution.executedPlan.toString
+      assert(plan.contains("CountJoin"),
+        s"mixed-distinct rewrite should fire (split, global):\n$plan")
+    }
+    assertSameResults(query, "mixed distinct + additive (global)")
   }
 
   test("count-join operators in grouped counting queries are all codegen-able") {
