@@ -601,83 +601,81 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             resultExpressionsWithAliasesReplaced)
 
           // Adapt the result expressions to make use of the frequency attribute
-          val rewrittenResultExpressions = resultExpressionsWithAliasesReplaced.map {
-            expr =>
-              expr.transformDown {
-                case ae: AggregateExpression =>
-                  debugLog("aggregate expression: " + ae)
-                  val resultAtt = equivalentAggregateExpressions.getExprState(ae).map(_.expr)
-                    .getOrElse(ae).asInstanceOf[AggregateExpression].resultAttribute
-                  debugLog("resultAtt: " + resultAtt)
-                  ae.aggregateFunction match {
-                    case a: Count =>
-                      // count(x) adds the row's count when x is non-NULL and skips the
-                      // row otherwise; the old Multiply(children.head, count) form was
-                      // only correct for count(1)-style children
-                      val nullableInputs = a.children.filter(_.nullable)
-                      val countInput: Expression = if (nullableInputs.isEmpty) {
-                        countingAttribute
-                      } else {
-                        If(nullableInputs.map(IsNull(_): Expression).reduce(Or),
-                          Literal(0L, LongType), countingAttribute)
-                      }
-                      Sum(countInput).toAggregateExpression()
-                    case _ =>
-                      // The final aggregation buffer's attributes will be
-                      // `finalAggregationAttributes`,
-                      // so replace each aggregate expression by its corresponding
-                      // attribute in the set:
-                      ae.transformDown {
-                        case a: AggregateFunction =>
-                          a match {
-                            // TODO this could be simplified by merging Sum and Count cases
-                            case Sum(_, _) =>
-                              if (lastSumMap.contains(resultAtt)) {
-                                val lastSumAtt = lastSumMap(resultAtt)
-                                //       val lastMultiplyExpr = nextMultiplicationMap(resultAtt)
-                                a.withNewChildren(Seq(lastSumAtt))
-                              }
-                              else {
-                                // Multiply in the type SUM(c) would use so the count multiplication
-                                // does not overflow c's narrow type (e.g. Int) where vanilla's
-                                // promoted Sum accumulator would not (cf. the guarded Sum case).
-                                val c = a.children.head
-                                val wideType = Sum(c).dataType
-                                a.withNewChildren(
-                                  Seq(Multiply(Cast(c, wideType),
-                                    Cast(countingAttribute, wideType))))
-                              }
-                            case _ =>
-                              // MIN, MAX
-                              if (lastAggMap.contains(resultAtt)) {
-                                val lastResultAtt = lastAggMap(resultAtt).resultAttribute
-
-                                a.withNewChildren(
-                                  Seq(lastResultAtt))
-
-                              }
-                              else {
-                                // If the att is not in the lastAggMap, it means that the attribute
-                                // occurred in the root of the tree - and only gets propagated
-                                // up on the left.
-                                //  Therefore, there is no intermediate aggregation function
-                                //  in-between and we can directly access the attribute.
-                                a
-                              }
+          // Rewrite each aggregate / grouping expression. Recurse MANUALLY and stop at each
+          // rewritten aggregate rather than using transformDown, which re-descends into the
+          // replacement (TreeNode.transformDownWithPruning line 506) - that would let the
+          // cast-back below re-match and multiply the count in a second time (cf. the guarded
+          // path). Original SQL aggregates never nest, so each is rewritten exactly once.
+          def rewriteUnguardedExpr(e: Expression): Expression = e match {
+            case ae: AggregateExpression =>
+              val resultAtt = equivalentAggregateExpressions.getExprState(ae).map(_.expr)
+                .getOrElse(ae).asInstanceOf[AggregateExpression].resultAttribute
+              val rewritten = ae.aggregateFunction match {
+                case a: Count =>
+                  // count(x) adds the row's count when x is non-NULL and skips the
+                  // row otherwise; the old Multiply(children.head, count) form was
+                  // only correct for count(1)-style children
+                  val nullableInputs = a.children.filter(_.nullable)
+                  val countInput: Expression = if (nullableInputs.isEmpty) {
+                    countingAttribute
+                  } else {
+                    If(nullableInputs.map(IsNull(_): Expression).reduce(Or),
+                      Literal(0L, LongType), countingAttribute)
+                  }
+                  Sum(countInput).toAggregateExpression()
+                case _ =>
+                  // Replace each aggregate function by its count-multiplied form.
+                  ae.transformDown {
+                    case a: AggregateFunction =>
+                      a match {
+                        // TODO this could be simplified by merging Sum and Count cases
+                        case Sum(_, _) =>
+                          if (lastSumMap.contains(resultAtt)) {
+                            val lastSumAtt = lastSumMap(resultAtt)
+                            a.withNewChildren(Seq(lastSumAtt))
+                          }
+                          else {
+                            // Multiply in the type SUM(c) would use so the count multiplication
+                            // does not overflow c's narrow type (e.g. Int) where vanilla's
+                            // promoted Sum accumulator would not (cf. the guarded Sum case).
+                            val c = a.children.head
+                            val wideType = Sum(c).dataType
+                            a.withNewChildren(
+                              Seq(Multiply(Cast(c, wideType),
+                                Cast(countingAttribute, wideType))))
+                          }
+                        case _ =>
+                          // MIN, MAX
+                          if (lastAggMap.contains(resultAtt)) {
+                            val lastResultAtt = lastAggMap(resultAtt).resultAttribute
+                            a.withNewChildren(Seq(lastResultAtt))
+                          }
+                          else {
+                            // If the att is not in the lastAggMap, it means that the attribute
+                            // occurred in the root of the tree - and only gets propagated
+                            // up on the left.
+                            //  Therefore, there is no intermediate aggregation function
+                            //  in-between and we can directly access the attribute.
+                            a
                           }
                       }
                   }
-
-              case expression if !expression.foldable =>
-                // Since we're using `namedGroupingAttributes` to extract the grouping key
-                // columns, we need to replace grouping key expressions with their corresponding
-                // attributes. We do not rely on the equality check at here since attributes may
-                // differ cosmetically. Instead, we use semanticEquals.
-                groupExpressionMap.collectFirst {
-                  case (expr, ne) if expr semanticEquals expression => ne.toAttribute
-                }.getOrElse(expression)
-            }.asInstanceOf[NamedExpression]
+              }
+              // Cast back to the original aggregate result type: the wide count-multiply can
+              // re-clamp a decimal's precision/scale (e.g. DECIMAL(28,4) -> DECIMAL(38,6)), which
+              // would change the output schema and fail plan validation. Cast-back keeps the
+              // schema identical to vanilla (mirrors the guarded Sum branch); a no-op otherwise.
+              Cast(rewritten, ae.dataType)
+            case expr if !expr.foldable =>
+              // Replace grouping key expressions with their corresponding attributes. Attributes
+              // may differ cosmetically, so match via semanticEquals rather than equality.
+              groupExpressionMap.collectFirst {
+                case (g, ne) if g semanticEquals expr => ne.toAttribute
+              }.getOrElse(expr.mapChildren(rewriteUnguardedExpr))
+            case other => other
           }
+          val rewrittenResultExpressions = resultExpressionsWithAliasesReplaced.map(e =>
+            rewriteUnguardedExpr(e).asInstanceOf[NamedExpression])
           debugLog("rewrittenResultExpressions: " + rewrittenResultExpressions)
 
           // Prune columns: only include columns that are needed by the aggregate

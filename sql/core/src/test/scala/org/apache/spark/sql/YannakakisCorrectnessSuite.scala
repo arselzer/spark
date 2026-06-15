@@ -1076,6 +1076,32 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "unguarded avg over fan-out")
   }
 
+  test("unguarded SUM over a high-scale decimal preserves the output schema") {
+    // f.x is DECIMAL(18,4); the count-multiply widens to SUM(f.x)'s type DECIMAL(28,4), and
+    // DEC(28,4)*DEC(28,4) clamps to DECIMAL(38,6) - diverging from vanilla SUM(DECIMAL(18,4)) =
+    // DECIMAL(28,4). Grouping by d.k (dim) while summing f.x (fact) forces the unguarded path.
+    // assertSameResults only compares cell values, so assert the SCHEMA explicitly here.
+    Seq((1, BigDecimal("1234.5678")), (2, BigDecimal("0.0001")))
+      .toDF("k", "x0").selectExpr("k", "cast(x0 as decimal(18,4)) as x")
+      .createOrReplaceTempView("decu_fact")
+    Seq(1, 1, 1, 2).toDF("k").createOrReplaceTempView("decu_dim")
+    val query =
+      "select d.k as k, sum(f.x) as s from decu_fact f join decu_dim d on f.k = d.k group by d.k"
+    var vanillaSchema: org.apache.spark.sql.types.StructType = null
+    var vanillaRows: Seq[String] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      val df = sql(query)
+      vanillaSchema = df.schema
+      vanillaRows = df.collect().toSeq.map(_.toString).sorted
+    }
+    withSQLConf(yannakakisOn: _*) {
+      val df = sql(query)
+      assert(df.schema == vanillaSchema,
+        s"rewritten schema ${df.schema.catalogString} != vanilla ${vanillaSchema.catalogString}")
+      assert(df.collect().toSeq.map(_.toString).sorted == vanillaRows, "values differ from vanilla")
+    }
+  }
+
   test("guarded AVG over a fan-out join matches vanilla (count-multiplied numerator/denominator)") {
     // {g, x} both in fact -> guarded; dim duplicates the key (x2 fan-out). The guarded path
     // computes SUM(x*count)/SUM(count). Vanilla per g=X over [100,100,200,200] -> avg = 150.0.
