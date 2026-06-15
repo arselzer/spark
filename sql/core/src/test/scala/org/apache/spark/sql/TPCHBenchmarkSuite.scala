@@ -19,6 +19,7 @@ package org.apache.spark.sql
 
 import java.io.File
 
+import org.apache.spark.sql.catalyst.util.resourceToString
 import org.apache.spark.sql.execution.joins.HashCountJoin
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -137,7 +138,12 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
     loadTpch()
     val iters = 3
     val aqeOff = Seq(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
-    val offConf = aqeOff :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false")
+    // off = vanilla Spark with whole-stage codegen ON (the default; set explicitly so the
+    // off-vs-on(codegen) comparison is unambiguously codegen-vs-codegen and can't silently
+    // change if the default ever does).
+    val offConf = aqeOff ++ Seq(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "false",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
     val interpConf = aqeOff ++ yannakakisOn :+
       (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false")
     val codegenConf = aqeOff ++ yannakakisOn :+
@@ -174,5 +180,56 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
       assert(matched, s"$name codegen result must match vanilla")
     }
     // scalastyle:on println
+  }
+
+  test("TPC-H full 22-query sweep: rewrite matches vanilla (sf1)") {
+    assume(new File(tpchDir).isDirectory, s"TPC-H parquet dataset not present at $tpchDir")
+    loadTpch()
+    val rewriteOn = Seq(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+    val report = new StringBuilder
+    val failures = scala.collection.mutable.ListBuffer[String]()
+    // scalastyle:off println
+    for (name <- (1 to 22).map(i => s"q$i")) {
+      val query =
+        try resourceToString(s"tpch/$name.sql",
+          classLoader = Thread.currentThread().getContextClassLoader)
+        catch { case _: Throwable => null }
+      val verdict = if (query == null) "NO-SQL" else {
+        var baseline: Either[Throwable, Seq[Row]] = null
+        try withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+          baseline = Right(sql(query).collect().toSeq)
+        } catch { case t: Throwable => baseline = Left(t) }
+        var rewritten: Either[Throwable, (Seq[Row], Boolean)] = null
+        try withSQLConf(rewriteOn: _*) {
+          val df = sql(query)
+          val rows = df.collect().toSeq
+          val plan = df.queryExecution.executedPlan.toString
+          rewritten = Right((rows, plan.contains("CountJoin") || plan.contains("LeftSemi")))
+        } catch { case t: Throwable => rewritten = Left(t) }
+        (baseline, rewritten) match {
+          case (Left(t), _) => s"BASELINE-FAIL ${t.getClass.getSimpleName}"
+          case (Right(_), Left(t)) =>
+            val root = Option(t.getCause).getOrElse(t)
+            s"EXCEPTION ${root.getClass.getSimpleName}: " +
+              Option(root.getMessage).getOrElse("").take(160)
+          case (Right(b), Right((r, applied))) =>
+            val tag = if (applied) "applied" else "NOT-applied"
+            if (rowsMatch(b, r)) s"OK ($tag, ${b.size} rows)" else s"MISMATCH ($tag)"
+        }
+      }
+      val line = s"TPCH-SWEEP: $name -> $verdict"
+      println(line)
+      report.append(line).append('\n')
+      if (verdict.startsWith("MISMATCH") || verdict.startsWith("EXCEPTION")) failures.append(line)
+    }
+    println("TPCH-SWEEP-SUMMARY:\n" + report)
+    // scalastyle:on println
+    assert(failures.isEmpty,
+      s"TPC-H rewrite regressed on ${failures.size} query/queries (MISMATCH=wrong results, " +
+        s"EXCEPTION=rewrite threw; BASELINE-FAIL/NO-SQL excluded):\n" + failures.mkString("\n"))
   }
 }

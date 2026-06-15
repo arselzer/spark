@@ -133,7 +133,11 @@ class JOBBenchmarkSuite extends QueryTest with SharedSparkSession {
     // Pin AQE off so the WholeStageCodegen `*(n)` markers are visible in the static plan and the
     // codegen on/off comparison is not perturbed by adaptive replanning.
     val aqeOff = Seq(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
-    val offConf = aqeOff :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false")
+    // off = vanilla Spark with whole-stage codegen ON (default, set explicitly so off vs
+    // on(codegen) is unambiguously codegen-vs-codegen).
+    val offConf = aqeOff ++ Seq(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "false",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
     val interpConf = aqeOff ++ yannakakisOn :+
       (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false")
     val codegenConf = aqeOff ++ yannakakisOn :+
@@ -204,7 +208,11 @@ class JOBBenchmarkSuite extends QueryTest with SharedSparkSession {
           "group by t.production_year, ct.id"))
     val iters = 5
     val aqeOff = Seq(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
-    val offConf = aqeOff :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false")
+    // off = vanilla Spark with whole-stage codegen ON (default, set explicitly so off vs
+    // on(codegen) is unambiguously codegen-vs-codegen).
+    val offConf = aqeOff ++ Seq(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "false",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
     val interpConf = aqeOff ++ yannakakisOn :+
       (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false")
     val codegenConf = aqeOff ++ yannakakisOn :+
