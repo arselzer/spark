@@ -61,12 +61,18 @@ to the inner join's output (`toInner`) to recover real nullability (else `count(
 away). (3) The merge casts each result back to the original aggregate type, preserving output
 exprIds and schema. A `missingInput` guard falls back if the split drops a required attribute.
 
-**Limitations.** Falls back (correct, unaccelerated) for AVG/DISTINCT/percentile and other
-non-mergeable aggregates, and when the matched half does not accelerate (avoids multiplying the join
-for no benefit). AVG over an outer join is mergeable in principle (carry `sum` and `count` partials,
-divide in the merge) but is **deferred**: reconstructing AVG as `SUM(sum)/SUM(count)` risks
-decimal-precision divergence from Spark's `Average`, which requires exact Average-semantics
-mirroring. DISTINCT and percentile are genuinely non-decomposable across the union.
+**AVG.** Supported when the average's output is `DoubleType` (byte/short/int/long/float/double
+inputs). Each half carries two partials `[sum(x), count(x)]` — the matched half through the
+count-join, which fan-out-weights both — recombined in the merge as `SUM(sums)/SUM(counts)` and cast
+to the average's type. This mirrors Spark's own `Average`, which for `DoubleType` output is exactly
+`Divide(sum.cast(double), count.cast(double))`, so values and schema match. DECIMAL and interval
+averages keep the safe fallback (their `Average` uses a specific decimal/interval division whose
+precision the simple `SUM/SUM` reconstruction would not match bit-for-bit).
+
+**Limitations.** Falls back (correct, unaccelerated) for DECIMAL/interval AVG, DISTINCT, percentile,
+and other non-mergeable aggregates, and when the matched half does not accelerate (avoids
+multiplying the join for no benefit). DISTINCT and percentile are genuinely non-decomposable across
+the union.
 
 ## Extension 3 — Cyclic joins (off by default; flag `spark.sql.yannakakis.cyclicBagsEnabled`)
 
@@ -140,9 +146,9 @@ the fact that TPC-H and JOB are acyclic inner-join workloads on which the extens
 
 ## Limitations and future work
 
-- **AVG/DISTINCT/percentile over outer joins.** AVG is mergeable via a `sum`+`count` carry; deferred
-  pending exact decimal-precision parity with Spark's `Average`. DISTINCT and percentile do not
-  decompose across the union.
+- **DECIMAL/interval AVG, DISTINCT, percentile over outer joins.** Double-output AVG is supported
+  (`sum`+`count` carry). DECIMAL/interval AVG falls back pending exact precision parity with Spark's
+  `Average`; DISTINCT and percentile do not decompose across the union.
 - **Cyclic is generality-only.** The bag uses binary joins. A genuine performance contribution on
   cyclic queries requires a worst-case-optimal join *that aggregates*. Concretely: because the bag
   is **counted** and never enumerated, the relevant cost is `N^fhtw` and, on irreducible chordless
