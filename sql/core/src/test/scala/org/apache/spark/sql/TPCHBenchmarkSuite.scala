@@ -40,7 +40,10 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
       .set(SQLConf.SHUFFLE_PARTITIONS.key, "16")
       .set(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key, (10L * 1024 * 1024).toString)
 
-  private val tpchDir = "/tmp/tpch-sf1-pq"
+  // Scale factor / dataset is configurable (env var inherited by the forked test JVM, or -D):
+  //   TPCH_DIR=/tmp/tpch-sf3-pq  (or -Dtpch.dir=...); default sf1.
+  private val tpchDir =
+    sys.env.getOrElse("TPCH_DIR", System.getProperty("tpch.dir", "/tmp/tpch-sf1-pq"))
 
   private val yannakakisOn = Seq(
     SQLConf.YANNAKAKIS_ENABLED.key -> "true",
@@ -105,6 +108,7 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
       (SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
     val mismatches = scala.collection.mutable.ListBuffer[String]()
     // scalastyle:off println
+    println(s"TPCH-BENCH: dataset = $tpchDir")
     println("TPCH-BENCH: query | count-joins(grouping) | off | on(interp) | on(codegen) | match")
     for (name <- (1 to 22).map(i => s"q$i")) {
       val q =
