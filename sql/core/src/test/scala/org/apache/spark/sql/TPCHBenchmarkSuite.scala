@@ -197,4 +197,40 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
       s"TPC-H rewrite regressed on ${failures.size} query/queries (MISMATCH=wrong results, " +
         s"EXCEPTION=rewrite threw; BASELINE-FAIL/NO-SQL excluded):\n" + failures.mkString("\n"))
   }
+
+  test("DUMP slowdown-query plans (vanilla vs rewrite) for analysis") {
+    assume(new File(tpchDir).isDirectory, s"TPC-H parquet dataset not present at $tpchDir")
+    loadTpch()
+    val aqeOff = Seq(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+    val rewriteOn = aqeOff ++ Seq(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
+    val vanilla = aqeOff ++ Seq(
+      SQLConf.YANNAKAKIS_ENABLED.key -> "false",
+      SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
+    // The four queries where the rewrite (codegen) is slower than vanilla at sf1.
+    for (name <- Seq("q7", "q8", "q11", "q18")) {
+      val q = resourceToString(s"tpch/$name.sql",
+        classLoader = Thread.currentThread().getContextClassLoader)
+      val vplan = withSQLConf(vanilla: _*) { sql(q).queryExecution.executedPlan.toString }
+      val rplan = withSQLConf(rewriteOn: _*) { sql(q).queryExecution.executedPlan.toString }
+      def exchanges(p: String): Int = p.linesIterator.count(_.contains("Exchange"))
+      def broadcasts(p: String): Int = p.linesIterator.count(_.contains("BroadcastExchange"))
+      val sb = new StringBuilder
+      sb.append(s"=== $name ===\n")
+      sb.append(s"VANILLA exchanges=${exchanges(vplan)} broadcasts=${broadcasts(vplan)}\n")
+      sb.append(vplan).append("\n\n")
+      sb.append(s"REWRITE exchanges=${exchanges(rplan)} broadcasts=${broadcasts(rplan)}\n")
+      sb.append(rplan).append("\n")
+      java.nio.file.Files.write(
+        java.nio.file.Paths.get(s"/tmp/tpch-slow-$name.txt"),
+        sb.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+      // scalastyle:off println
+      println(s"DUMP: $name -> /tmp/tpch-slow-$name.txt | vanilla exch=${exchanges(vplan)} " +
+        s"bcast=${broadcasts(vplan)} | rewrite exch=${exchanges(rplan)} bcast=${broadcasts(rplan)}")
+      // scalastyle:on println
+    }
+  }
 }

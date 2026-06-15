@@ -874,12 +874,15 @@ trait HashCountJoin extends JoinCodegenSupport {
 
     val rowCls = classOf[InternalRow].getName
     val mapCls = "java.util.LinkedHashMap"
-    val bufMap = ctx.freshName("bufMap")
-    val sumMap = ctx.freshName("sumMap")
+    // One reused per-task map (group key -> buffer); cleared at the top of each stream-row body
+    // (it is fully drained by the emit loop before the next row). The fan-out count lives in the
+    // buffer's trailing slot (countOrd), so there is no separate boxed-Long count map.
+    val bufMap = ctx.addMutableState(s"$mapCls<UnsafeRow, $rowCls>", "cjBufMap",
+      v => s"$v = new $mapCls<UnsafeRow, $rowCls>();", forceInline = true)
     val rightCount = ctx.freshName("rightCount")
     val gkey = ctx.freshName("gkey")
     val buf = ctx.freshName("buf")
-    val gkeyCopy = ctx.freshName("gkeyCopy")
+    val countOrd = aggregatesRight.map(_.aggregateFunction).flatMap(_.aggBufferAttributes).length
 
     val rightCountExpr =
       if (rightCountOrdinal != -1) s"$matched.getLong($rightCountOrdinal)" else "1L"
@@ -890,14 +893,10 @@ trait HashCountJoin extends JoinCodegenSupport {
          |UnsafeRow $gkey = $aggTerm.groupKey($matched);
          |$rowCls $buf = ($rowCls) $bufMap.get($gkey);
          |if ($buf == null) {
-         |  UnsafeRow $gkeyCopy = $gkey.copy();
          |  $buf = $aggTerm.newBuffer();
-         |  $bufMap.put($gkeyCopy, $buf);
-         |  $sumMap.put($gkeyCopy, Long.valueOf($rightCount));
-         |} else {
-         |  $sumMap.put($gkey,
-         |    Long.valueOf(((Long) $sumMap.get($gkey)).longValue() + $rightCount));
+         |  $bufMap.put($gkey.copy(), $buf);
          |}
+         |$buf.setLong($countOrd, $buf.getLong($countOrd) + $rightCount);
          |$aggTerm.update($buf, $matched);
        """.stripMargin
 
@@ -959,8 +958,7 @@ trait HashCountJoin extends JoinCodegenSupport {
     s"""
        |${keyEv.code}
        |$leftCountSetup
-       |$mapCls<UnsafeRow, $rowCls> $bufMap = new $mapCls<UnsafeRow, $rowCls>();
-       |$mapCls<UnsafeRow, Long> $sumMap = new $mapCls<UnsafeRow, Long>();
+       |$bufMap.clear();
        |$matchLoop
        |$inputEval
        |java.util.Iterator $iter = $bufMap.entrySet().iterator();
@@ -968,7 +966,7 @@ trait HashCountJoin extends JoinCodegenSupport {
        |  java.util.Map.Entry $entry = (java.util.Map.Entry) $iter.next();
        |  UnsafeRow $gkeyOut = (UnsafeRow) $entry.getKey();
        |  $rowCls $bufOut = ($rowCls) $entry.getValue();
-       |  long $cnt = ((Long) $sumMap.get($gkeyOut)).longValue() * $leftCount;
+       |  long $cnt = $bufOut.getLong($countOrd) * $leftCount;
        |  $rowCls $aggResRow = $aggTerm.eval($bufOut);
        |  ${aggReads.map(_._1).mkString("\n")}
        |  ${groupReads.map(_._1).mkString("\n")}
@@ -1324,8 +1322,14 @@ class GroupedCountAggregator(
 
   private val aggregateFunctions = aggregatesRight.map(_.aggregateFunction).toIndexedSeq
   private val bufferSchema = aggregateFunctions.flatMap(_.aggBufferAttributes)
-  private val useUnsafeBuffer = bufferSchema.map(_.dataType).forall(UnsafeRow.isMutable)
-  private val unsafeProjection = UnsafeProjection.create(bufferSchema.map(_.dataType).toArray)
+  // The per-group buffer carries the fan-out count in one extra trailing LongType slot, so the
+  // grouped codegen needs only one map (group -> buffer) and no boxed Long count map. The
+  // aggregate update/eval projections only touch slots 0..countOrdinal-1; the count slot is
+  // maintained directly by the caller (see codegenCountGroupedInner).
+  val countOrdinal: Int = bufferSchema.length
+  private val bufferTypes = bufferSchema.map(_.dataType) :+ LongType
+  private val useUnsafeBuffer = bufferTypes.forall(UnsafeRow.isMutable)
+  private val unsafeProjection = UnsafeProjection.create(bufferTypes.toArray)
 
   private val initProjection = {
     val initExpressions = aggregateFunctions.flatMap {
@@ -1351,8 +1355,12 @@ class GroupedCountAggregator(
         }
       case (agg: AggregateFunction, _) => Seq.fill(agg.aggBufferAttributes.length)(NoOp)
     }
+  // update() runs over JoinedRow(buffer, buildRow). The buffer now has the trailing count slot, so
+  // a placeholder attribute must sit between bufferSchema and rightOutput or the build columns
+  // would be read one ordinal too early (the count slot's position).
+  private val countSlotAttr = AttributeReference("cjFanoutCount", LongType, nullable = false)()
   private val updateProjection =
-    MutableProjection.create(mergeExpressions, bufferSchema ++ rightOutput)
+    MutableProjection.create(mergeExpressions, (bufferSchema :+ countSlotAttr) ++ rightOutput)
 
   private val evalExpressions = aggregateFunctions.map {
     case ae: DeclarativeAggregate => ae.evaluateExpression
@@ -1371,11 +1379,12 @@ class GroupedCountAggregator(
   /** Group key for a build row. The returned UnsafeRow is REUSED - copy before using as a key. */
   def groupKey(buildRow: InternalRow): UnsafeRow = groupingProjection(buildRow)
 
-  /** A fresh, initialised aggregate buffer for a new group. */
+  /** A fresh, initialised aggregate buffer for a new group, with the trailing count slot zeroed. */
   def newBuffer(): InternalRow = {
-    val bufferRow = new SpecificInternalRow(bufferSchema.map(_.dataType))
+    val bufferRow = new SpecificInternalRow(bufferTypes)
     val buffer = if (useUnsafeBuffer) unsafeProjection.apply(bufferRow).copy() else bufferRow
-    initProjection.target(buffer)(EmptyRow)
+    initProjection.target(buffer)(EmptyRow)   // initialises the aggregate slots 0..countOrdinal-1
+    buffer.setLong(countOrdinal, 0L)          // the carried fan-out count
     buffer
   }
 
