@@ -225,4 +225,123 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
       s"${failures.size}/$iters fuzz failures (showing up to 12):\n" +
         failures.take(12).mkString("\n----\n"))
   }
+
+  private val cyclicBagsOn =
+    yannakakisOn :+ (SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED.key -> "true")
+
+  private def rmeasure(rng: Random): Integer =
+    if (rng.nextInt(8) == 0) null else Int.box(rng.nextInt(60) - 10)
+
+  // Runs `query` with `onConf` and asserts both rows and schema match vanilla; returns a failure
+  // description or None. (Mirrors the acyclic test's comparison, parameterized by the conf so the
+  // cyclic test can run it with cyclic-bags enabled.)
+  private def compareAgainstVanilla(
+      query: String, onConf: Seq[(String, String)], seed: Int): Option[String] = {
+    try {
+      var vSchema: StructType = null
+      var vRows: Seq[Row] = null
+      // AQE off: this is a LOGICAL-correctness oracle, and AQE's runtime re-optimization adds
+      // session-dependent non-determinism (more so for the complex bag plans) that is orthogonal
+      // to whether the rewrite is correct.
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false",
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        val df = sql(query); vSchema = df.schema; vRows = df.collect().toSeq
+      }
+      withSQLConf((onConf :+ (SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+        val df = sql(query)
+        if (!schemaMatch(df.schema, vSchema)) {
+          Some(s"seed=$seed SCHEMA ${df.schema.catalogString} != " +
+            s"${vSchema.catalogString}\n$query")
+        } else if (!rowsMatch(df.collect().toSeq, vRows)) {
+          Some(s"seed=$seed VALUES mismatch\n$query")
+        } else {
+          None
+        }
+      }
+    } catch {
+      case e: Throwable =>
+        Some(s"seed=$seed EXCEPTION ${e.getClass.getSimpleName}: " +
+          s"${Option(e.getMessage).getOrElse("")}\n$query")
+    }
+  }
+
+  // Registers a cyclic query's relations (a triangle or a 4-cycle, ~half the time with a fringe
+  // relation joined to one cycle vertex so the bag becomes a LEAF in a larger tree and the
+  // count-over-bags machinery is actually exercised, rather than the tautological bare-bag case)
+  // with random fan-out data, and returns the query. Vertices live in a small domain so the cycle
+  // has many solutions (non-trivial counts).
+  private def genCyclicQuery(rng: Random, sfx: Int): String = {
+    val maxV = 3
+    // Unique per-seed view names so seeds never share tables in the shared session (the topology
+    // registers a variable set of relations, so fixed names could leave a prior seed's stale view).
+    def regRel(view: String, vcols: Seq[String], mcol: String): Unit = {
+      val schema = StructType(vcols.map(c => StructField(c, IntegerType)) :+
+        StructField(mcol, IntegerType))
+      val n = 5 + rng.nextInt(10)
+      val rows = (0 until n).map(_ =>
+        Row((vcols.map(_ => rkey(rng, maxV)) :+ rmeasure(rng)): _*))
+      spark.createDataFrame(spark.sparkContext.parallelize(rows), schema)
+        .createOrReplaceTempView(view)
+    }
+    val (nr, ns, nt, nu, nf) =
+      (s"cyc_r_$sfx", s"cyc_s_$sfx", s"cyc_t_$sfx", s"cyc_u_$sfx", s"cyc_f_$sfx")
+    val fourCycle = rng.nextBoolean()
+    val (cycleJoin, vertexCols, measures) = if (!fourCycle) {
+      regRel(nr, Seq("r_a", "r_b"), "r_m")
+      regRel(ns, Seq("s_b", "s_c"), "s_m")
+      regRel(nt, Seq("t_a", "t_c"), "t_m")
+      (s"$nr r join $ns s on r.r_b = s.s_b " +
+         s"join $nt t on s.s_c = t.t_c and t.t_a = r.r_a",
+       Seq("r.r_a", "r.r_b", "s.s_c"), Seq("r.r_m", "s.s_m", "t.t_m"))
+    } else {
+      regRel(nr, Seq("r_a", "r_b"), "r_m")
+      regRel(ns, Seq("s_b", "s_c"), "s_m")
+      regRel(nt, Seq("t_c", "t_d"), "t_m")
+      regRel(nu, Seq("u_d", "u_a"), "u_m")
+      (s"$nr r join $ns s on r.r_b = s.s_b join $nt t on s.s_c = t.t_c " +
+         s"join $nu u on t.t_d = u.u_d and u.u_a = r.r_a",
+       Seq("r.r_a", "r.r_b", "s.s_c", "t.t_d"), Seq("r.r_m", "s.s_m", "t.t_m", "u.u_m"))
+    }
+    val (joins, allVertex, allMeasures) = if (rng.nextBoolean()) {
+      regRel(nf, Seq("f_a"), "f_m")
+      (cycleJoin + s" join $nf f on f.f_a = r.r_a",
+        vertexCols :+ "f.f_a", measures :+ "f.f_m")
+    } else {
+      (cycleJoin, vertexCols, measures)
+    }
+    val allCols = allVertex ++ allMeasures
+    def agg(): String = rng.nextInt(7) match {
+      case 0 => "count(*)"
+      case 1 => s"count(${pick(rng, allCols)})"
+      case 2 => s"count(distinct ${pick(rng, allCols)})"
+      case 3 => s"sum(${pick(rng, allMeasures)})"
+      case 4 => s"avg(${pick(rng, allMeasures)})"
+      case 5 => s"min(${pick(rng, allCols)})"
+      case _ => s"max(${pick(rng, allCols)})"
+    }
+    val aggSelect = (0 until (1 + rng.nextInt(2))).map(j => s"${agg()} as a$j")
+    val groupCols = rng.shuffle(allVertex.toList).take(rng.nextInt(2))
+    val groupSelect = groupCols.zipWithIndex.map { case (g, i) => s"$g as g$i" }
+    val filter = if (allMeasures.size >= 2 && rng.nextInt(10) < 4) {
+      val Seq(m1, m2) = rng.shuffle(allMeasures.toList).take(2)
+      s" where $m1 ${pick(rng, Seq("<", ">", "<=", ">=", "<>"))} $m2"
+    } else ""
+    val selectList = (groupSelect ++ aggSelect).mkString(", ")
+    val groupClause = if (groupCols.nonEmpty) " group by " + groupCols.mkString(", ") else ""
+    s"select $selectList from $joins$filter$groupClause"
+  }
+
+  test("fuzz: random cyclic (triangle/4-cycle) queries match vanilla (cyclic bags on)") {
+    val iters = sys.env.getOrElse("CYCLIC_FUZZ_ITERS", "300").toInt
+    val failures = ArrayBuffer[String]()
+    (1 to iters).foreach { seed =>
+      val rng = new Random((seed + 100000).toLong)
+      val query = genCyclicQuery(rng, seed)
+      compareAgainstVanilla(query, cyclicBagsOn, seed).foreach(failures += _)
+    }
+    info(s"cyclic fuzz: checked $iters queries, ${failures.size} failures")
+    assert(failures.isEmpty,
+      s"${failures.size}/$iters cyclic fuzz failures (showing up to 12):\n" +
+        failures.take(12).mkString("\n----\n"))
+  }
 }

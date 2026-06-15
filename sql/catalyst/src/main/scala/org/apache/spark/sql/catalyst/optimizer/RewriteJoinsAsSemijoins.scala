@@ -1460,8 +1460,14 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
 
 class HGEdge(val vertices: Set[String], val name: String, val planReference: LogicalPlan,
              val attributeToVertex: mutable.Map[ExprId, String]) {
-  val vertexToAttribute: Map[String, Attribute] = planReference.outputSet.map(
-      att => (attributeToVertex.getOrElse(att.exprId, null), att))
+  // Sort the output before toMap so a vertex with several output attributes (e.g. a bag whose
+  // materialized join exposes r_a AND u_a, both mapped to vertex a) resolves to a DETERMINISTIC
+  // attribute. outputSet is hash-ordered, so without this toMap would keep whichever attribute
+  // came last per JVM run, producing run-to-run-varying (and occasionally wrong) cyclic plans.
+  // For a normal single-relation edge there is one attribute per vertex, so this is a no-op.
+  val vertexToAttribute: Map[String, Attribute] = planReference.outputSet.toSeq
+    .sortBy(_.exprId.id)
+    .map(att => (attributeToVertex.getOrElse(att.exprId, null), att))
     .toMap
   def attributes: AttributeSet = {
     planReference.outputSet
