@@ -24,7 +24,7 @@ import org.apache.spark.sql.catalyst.dsl.expressions.DslExpression
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.RightOuter
+import org.apache.spark.sql.catalyst.plans.{FullOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern
@@ -949,14 +949,14 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       plan.transformDownWithPruning(_.containsPattern(TreePattern.AGGREGATE), ruleId) {
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
-        join@Join(_, _, LeftOuter | RightOuter, _, _)), _) =>
-          // LEFT/RIGHT OUTER: split into a matched (inner) half + an unmatched (left-anti) half
-          // and merge per group. Falls back to the original `agg` on any unsupported shape.
-          tryRewriteLeftOuter(agg, groupingExpressions, aggExpressions, projectList, join)
+        join@Join(_, _, LeftOuter | RightOuter | FullOuter, _, _)), _) =>
+          // LEFT/RIGHT/FULL OUTER: split into a matched (inner) half plus one anti half per
+          // null-extended side, and merge per group. Falls back to `agg` on any unsupported shape.
+          tryRewriteOuter(agg, groupingExpressions, aggExpressions, projectList, join)
             .getOrElse(agg)
         case agg@Aggregate(groupingExpressions, aggExpressions,
-        join@Join(_, _, LeftOuter | RightOuter, _, _), _) =>
-          tryRewriteLeftOuter(agg, groupingExpressions, aggExpressions, join.output, join)
+        join@Join(_, _, LeftOuter | RightOuter | FullOuter, _, _), _) =>
+          tryRewriteOuter(agg, groupingExpressions, aggExpressions, join.output, join)
             .getOrElse(agg)
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
@@ -1090,45 +1090,50 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
   private case object LoMax extends LoMerge
 
   /**
-   * Rewrites `Aggregate(g, aggs, A LEFT OUTER JOIN B)` using the decomposition
+   * Rewrites `Aggregate(g, aggs, A OUTER JOIN B)` (LEFT/RIGHT/FULL) using the decomposition
    *
-   *   A LEFT JOIN B  ==  (A INNER JOIN B)  UNION ALL  (A LEFT ANTI JOIN B, B-cols -> typed NULL)
+   *   A LEFT  JOIN B  ==  (A INNER JOIN B)  U  (A LEFT ANTI JOIN B, B-cols -> typed NULL)
+   *   A FULL  JOIN B  ==  (A INNER JOIN B)  U  (A LEFT ANTI JOIN B, B-cols -> typed NULL)
+   *                                         U  (B LEFT ANTI JOIN A, A-cols -> typed NULL)
    *
    * so the aggregate splits into a matched half over the inner join (which reuses the existing
-   * count-join rewrite via [[rewriteOrFallback]]) and an unmatched half over the anti join (a
-   * plain aggregate - the anti join has no fan-out). The two per-group partial results are then
-   * UNION-ed and re-aggregated per group, merging count(*)/count(x)/sum with SUM, min with MIN
-   * and max with MAX. RIGHT OUTER is normalised to LEFT OUTER by swapping the sides.
+   * count-join rewrite via [[rewriteOrFallback]]) and one unmatched half per null-extended side
+   * over an anti join (a plain aggregate - the anti join has no fan-out). The per-group partial
+   * results are UNION-ed and re-aggregated per group, merging count(*)/count(x)/sum with SUM, min
+   * with MIN and max with MAX. RIGHT OUTER is normalised to LEFT OUTER by swapping the sides; FULL
+   * OUTER adds the symmetric third (B-only) half.
    *
    * Correctness rests on three points:
-   *  - the anti join keeps exactly the A rows that get NULL-extended by the LEFT join, so the two
-   *    halves partition the LEFT join's rows;
-   *  - in the unmatched half every B column (in BOTH grouping keys and aggregate arguments) is
-   *    projected to a typed NULL literal, so count(b.x)=0, sum/min/max(b.x)=NULL, count(*) still
-   *    counts the row, and a B grouping key collapses to the NULL group - exactly the LEFT join's
-   *    NULL extension; A-only aggregates still see the real A values;
+   *  - the anti join(s) keep exactly the rows that get NULL-extended by the outer join, so the
+   *    halves partition the outer join's rows (LEFT: matched + A-only; FULL: + B-only);
+   *  - in each unmatched half every column of the null-extended side (in BOTH grouping keys and
+   *    aggregate arguments) is projected to a typed NULL literal, so count(x)=0, sum/min/max(x)=
+   *    NULL, count(*) still counts the row, and such a grouping key collapses to the NULL group -
+   *    exactly the outer join's NULL extension; the preserved side's aggregates see real values;
    *  - the merge re-aggregates the union of the partials and casts each result back to the
    *    original aggregate's type, preserving both the output exprIds and the output schema.
    *
-   * Returns None (fall back to the original plan) for FULL OUTER, a missing join condition, any
-   * non-mergeable aggregate (AVG/DISTINCT/percentile/stddev/FILTER, nested/mixed aggregates, a
-   * bare un-aliased aggregate), or when the matched half does not accelerate (so the split would
-   * only double the join with no benefit), and whenever the merged plan drops a required input.
+   * Returns None (fall back to the original plan) for a missing join condition, any non-mergeable
+   * aggregate (AVG/DISTINCT/percentile/stddev/FILTER, nested/mixed aggregates, a bare un-aliased
+   * aggregate), or when the matched half does not accelerate (so the split would only multiply the
+   * join with no benefit), and whenever the merged plan drops a required input.
    */
-  private def tryRewriteLeftOuter(
+  private def tryRewriteOuter(
       agg: Aggregate,
       grouping: Seq[Expression],
       aggExpressions: Seq[NamedExpression],
       projectList: Seq[NamedExpression],
       join: Join): Option[LogicalPlan] = {
     if (!conf.yannakakisEnabled) return None
-    // Normalise RIGHT OUTER to LEFT OUTER by swapping the join sides (always sound). FULL OUTER
-    // and a conditionless (cartesian) outer join are not handled.
-    val normJoin = join.joinType match {
-      case LeftOuter => join
+    // Normalise RIGHT OUTER to LEFT OUTER by swapping the join sides (always sound). FULL OUTER is
+    // kept as-is and handled with an extra (B-only) anti half below. A conditionless (cartesian)
+    // outer join is not handled.
+    val (normJoin, isFullOuter) = join.joinType match {
+      case LeftOuter => (join, false)
       case RightOuter =>
-        Join(join.right, join.left, LeftOuter, join.condition,
-          JoinHint(join.hint.rightHint, join.hint.leftHint))
+        (Join(join.right, join.left, LeftOuter, join.condition,
+          JoinHint(join.hint.rightHint, join.hint.leftHint)), false)
+      case FullOuter => (join, true)
       case _ => return None
     }
     if (normJoin.condition.isEmpty) return None
@@ -1218,7 +1223,29 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     val antiResultExprs = gkAnti ++ antiAggExprs
     val antiHalf = Aggregate(grouping, antiResultExprs, antiChild)
 
-    val union = Union(matchedRewritten :: antiHalf :: Nil)
+    // FULL OUTER only: the symmetric B-only half - B rows with no A match, A columns -> typed NULL.
+    // `Join(right, left, LeftAnti, cond)` keeps exactly the B rows the FULL join NULL-extends on A.
+    val rightAntiHalf: Option[LogicalPlan] = if (isFullOuter) {
+      val aOutputSet = left.outputSet
+      val rightAntiProjectList: Seq[NamedExpression] = projectList.map {
+        case attr: Attribute if aOutputSet.contains(attr) =>
+          Alias(Literal(null, attr.dataType), attr.name)(exprId = attr.exprId)
+        case ne =>
+          ne.transformDown {
+            case a: Attribute if aOutputSet.contains(a) => Literal(null, a.dataType)
+          }.asInstanceOf[NamedExpression]
+      }
+      val rightAntiJoin = Join(right, left, LeftAnti, cond,
+        JoinHint(hint.rightHint, hint.leftHint))
+      val rightAntiChild = Project(rightAntiProjectList, rightAntiJoin)
+      val gkRightAnti = grouping.map(g => Alias(g, "lojoin_gk")())
+      val rightAntiAggExprs = aggSlots.map { case (ne, _) =>
+        Alias(ne.asInstanceOf[Alias].child, ne.name)()
+      }
+      Some(Aggregate(grouping, gkRightAnti ++ rightAntiAggExprs, rightAntiChild))
+    } else None
+
+    val union = Union(matchedRewritten :: antiHalf :: rightAntiHalf.toList)
     val unionGk = union.output.take(grouping.size)
     val unionAggParts = union.output.drop(grouping.size)
 
@@ -1252,10 +1279,10 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
 
     // Guard against the split dropping any required input (mirrors validateOrFallback).
     if (merged.collectFirst { case p if p.missingInput.nonEmpty => p }.nonEmpty) {
-      logWarning("yannakakis LEFT OUTER split dropped required attributes; falling back")
+      logWarning("yannakakis OUTER split dropped required attributes; falling back")
       return None
     }
-    logInfo("new aggregate (left-outer split)")
+    logInfo(s"new aggregate (${if (isFullOuter) "full" else "left"}-outer split)")
     Some(merged)
   }
 

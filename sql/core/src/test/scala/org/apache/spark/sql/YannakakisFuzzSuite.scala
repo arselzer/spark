@@ -112,13 +112,14 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     val nDims = 1 + rng.nextInt(3)
     val usedDims = 1 to nDims
     val star = rng.nextBoolean()
-    // ~35% of the time make the fact->d1 join a LEFT/RIGHT OUTER join (the rest inner). This
-    // exercises the outer-join decomposition (matched inner + unmatched anti) against vanilla.
-    // RIGHT is written so that the kept side is still the fact (fz_d1 d1 right join fz_fact f),
-    // which the rewrite normalises back to LEFT.
+    // ~40% of the time make the fact->d1 join a LEFT/RIGHT/FULL OUTER join (the rest inner). This
+    // exercises the outer-join decomposition (matched inner + one anti half per null-extended side)
+    // against vanilla. RIGHT is written so the kept side is still the fact (fz_d1 d1 right join
+    // fz_fact f), which the rewrite normalises back to LEFT; FULL adds the symmetric B-only half.
     val outerKind = rng.nextInt(100) match {
-      case n if n < 20 => "left"
-      case n if n < 35 => "right"
+      case n if n < 15 => "left"
+      case n if n < 28 => "right"
+      case n if n < 41 => "full"
       case _ => "inner"
     }
     // Star: fact joins each dim on f.k{i}=d{i}.d{i}k. Chain: fact-d1, d1-d2 (via shared key space),
@@ -127,6 +128,7 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
       val firstJoin = outerKind match {
         case "left" => "fz_fact f left join fz_d1 d1 on f.k1 = d1.d1k"
         case "right" => "fz_d1 d1 right join fz_fact f on f.k1 = d1.d1k"
+        case "full" => "fz_fact f full outer join fz_d1 d1 on f.k1 = d1.d1k"
         case _ => "fz_fact f join fz_d1 d1 on f.k1 = d1.d1k"
       }
       firstJoin + usedDims.drop(1)
@@ -135,6 +137,7 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
       val parts = new StringBuilder(outerKind match {
         case "left" => "fz_fact f left join fz_d1 d1 on f.k1 = d1.d1k"
         case "right" => "fz_d1 d1 right join fz_fact f on f.k1 = d1.d1k"
+        case "full" => "fz_fact f full outer join fz_d1 d1 on f.k1 = d1.d1k"
         case _ => "fz_fact f join fz_d1 d1 on f.k1 = d1.d1k"
       })
       if (nDims >= 2) parts.append(" join fz_d2 d2 on d1.d1v = d2.d2k")

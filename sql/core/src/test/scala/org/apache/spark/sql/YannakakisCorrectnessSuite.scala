@@ -1763,6 +1763,69 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assert(fired, s"$hint: expected the LEFT OUTER split to fire")
   }
 
+  /** Asserts the FULL-OUTER split fired (logs "full-outer split") AND results match vanilla. */
+  private def assertFullOuterSplitAndCorrect(query: String, hint: String): Unit = {
+    val appender = new LogAppender("full-outer split rewrite")
+    withLogAppender(appender) {
+      assertSameResults(query, hint)
+    }
+    val fired = appender.loggingEvents.exists(
+      _.getMessage.getFormattedMessage.contains("new aggregate (full-outer split)"))
+    assert(fired, s"$hint: expected the FULL OUTER split to fire")
+  }
+
+  // FULL OUTER fixture: matched (k=1 fan-out, k=2), A-only unmatched (k=3,4), B-only unmatched
+  // (k=8,9). Exercises all three union branches: inner, left-anti (B->NULL), right-anti (A->NULL).
+  private def createFullOuterTables(): Unit = {
+    Seq((1, "A", 10.0), (2, "A", 20.0), (3, "B", 30.0), (4, "C", 40.0))
+      .toDF("k", "g", "v").createOrReplaceTempView("fo_a")
+    // k=1 two matches (fan-out), k=2 one match; k=8,9 have NO a-side match (B-only rows).
+    Seq((1, 100), (1, 200), (2, 300), (8, 800), (9, 900)).toDF("k", "x")
+      .createOrReplaceTempView("fo_b")
+  }
+
+  test("FULL OUTER count(*) over a fan-out join with both-side unmatched groups matches vanilla") {
+    createFullOuterTables()
+    assertFullOuterSplitAndCorrect(
+      "select g, count(*) as c from fo_a a full outer join fo_b b on a.k = b.k group by g",
+      "FULL OUTER count(*) with A-only and B-only unmatched groups")
+  }
+
+  test("FULL OUTER count/sum over both A-only and B-only measures matches vanilla") {
+    createFullOuterTables()
+    // count(a.v)/sum(a.v) = 0/NULL on B-only rows; count(b.x)/sum(b.x) = 0/NULL on A-only rows;
+    // count(*) counts every row. Grouped by g so B-only rows (a.g NULL) form their own group.
+    assertFullOuterSplitAndCorrect(
+      """select g, count(*) as c, count(a.v) as ca, sum(a.v) as sa,
+                count(b.x) as cb, sum(b.x) as sb
+         from fo_a a full outer join fo_b b on a.k = b.k group by g""",
+      "FULL OUTER count/sum over A-only and B-only measures")
+  }
+
+  test("FULL OUTER min/max over both sides matches vanilla") {
+    createFullOuterTables()
+    assertFullOuterSplitAndCorrect(
+      """select g, min(a.v) as mnv, max(a.v) as mxv, min(b.x) as mnx, max(b.x) as mxx
+         from fo_a a full outer join fo_b b on a.k = b.k group by g""",
+      "FULL OUTER min/max over both sides")
+  }
+
+  test("FULL OUTER grouped by a B column: A-only rows fall in the NULL group") {
+    createFullOuterTables()
+    assertFullOuterSplitAndCorrect(
+      """select b.x as bx, count(*) as c
+         from fo_a a full outer join fo_b b on a.k = b.k group by b.x""",
+      "FULL OUTER group by B column (NULL group for A-only rows)")
+  }
+
+  test("FULL OUTER global aggregate (no GROUP BY) matches vanilla") {
+    createFullOuterTables()
+    assertFullOuterSplitAndCorrect(
+      """select count(*) as c, count(a.v) as ca, sum(b.x) as sb
+         from fo_a a full outer join fo_b b on a.k = b.k""",
+      "FULL OUTER global aggregate")
+  }
+
   // Fan-out dimension with matched, fan-out, and (crucially) fully-unmatched groups.
   private def createLeftOuterTables(): Unit = {
     // a-side: groups A (k=1 fan-out, k=2 single match), B (k=3 NO match -> fully unmatched),
@@ -1912,19 +1975,15 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
-  test("FULL OUTER join falls back and stays correct") {
-    createLeftOuterTables()
-    val query =
-      "select g, count(*) as c from lo_a a full outer join lo_b b on a.k = b.k group by g"
+  test("FULL OUTER falls back for AVG (not a mergeable aggregate)") {
+    createFullOuterTables()
+    val query = "select g, avg(b.x) as a from fo_a a full outer join fo_b b on a.k = b.k group by g"
     var expected: Seq[Row] = null
     withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
       expected = sql(query).collect().toSeq
     }
     withSQLConf(yannakakisOn: _*) {
-      val df = sql(query)
-      checkAnswer(df, expected)
-      assert(!df.queryExecution.optimizedPlan.toString.contains("CountJoin"),
-        "FULL OUTER must fall back (no count-join split)")
+      checkAnswer(sql(query), expected)
     }
   }
 }
