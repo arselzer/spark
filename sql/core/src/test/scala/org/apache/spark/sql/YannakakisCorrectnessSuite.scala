@@ -1703,4 +1703,180 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
         "cyclic query must NOT be rewritten when cyclicBagsEnabled is off")
     }
   }
+
+  /** Asserts the LEFT-OUTER split fired (logs "left-outer split") AND results match vanilla. */
+  private def assertLeftOuterSplitAndCorrect(query: String, hint: String): Unit = {
+    val appender = new LogAppender("left-outer split rewrite")
+    withLogAppender(appender) {
+      assertSameResults(query, hint)
+    }
+    val fired = appender.loggingEvents.exists(
+      _.getMessage.getFormattedMessage.contains("new aggregate (left-outer split)"))
+    assert(fired, s"$hint: expected the LEFT OUTER split to fire")
+  }
+
+  // Fan-out dimension with matched, fan-out, and (crucially) fully-unmatched groups.
+  private def createLeftOuterTables(): Unit = {
+    // a-side: groups A (k=1 fan-out, k=2 single match), B (k=3 NO match -> fully unmatched),
+    // C (k=4 NO match). v is an A-only measure that must still be summed for unmatched rows.
+    Seq((1, "A", 10.0), (2, "A", 20.0), (3, "B", 30.0), (4, "C", 40.0))
+      .toDF("k", "g", "v").createOrReplaceTempView("lo_a")
+    // b-side: k=1 has two matches (fan-out), k=2 one match; k=3/k=4 absent (unmatched).
+    Seq((1, 100), (1, 200), (2, 300)).toDF("k", "x").createOrReplaceTempView("lo_b")
+  }
+
+  test("LEFT OUTER count(*) over a fan-out join with unmatched groups matches vanilla") {
+    createLeftOuterTables()
+    // g=A: k=1 -> 2 rows, k=2 -> 1 row => 3; g=B,C: unmatched but LEFT JOIN keeps the row => 1
+    assertLeftOuterSplitAndCorrect(
+      "select g, count(*) as c from lo_a a left join lo_b b on a.k = b.k group by g",
+      "LEFT OUTER count(*) with unmatched groups")
+  }
+
+  test("LEFT OUTER count(b.x) is 0 for fully-unmatched groups, count(*) > 0") {
+    createLeftOuterTables()
+    // count(b.x): A -> 3, B -> 0, C -> 0 ; count(*): A -> 3, B -> 1, C -> 1
+    assertLeftOuterSplitAndCorrect(
+      """select g, count(*) as c_all, count(b.x) as c_x, sum(b.x) as s_x
+         from lo_a a left join lo_b b on a.k = b.k group by g""",
+      "LEFT OUTER count(b.x)=0, sum(b.x)=null for unmatched groups")
+  }
+
+  test("LEFT OUTER sum of an A-only measure still counts unmatched rows") {
+    createLeftOuterTables()
+    // sum(a.v) by g: A -> 10*2 (k=1 fan-out) + 20 = 40, B -> 30, C -> 40
+    assertLeftOuterSplitAndCorrect(
+      "select g, sum(a.v) as s from lo_a a left join lo_b b on a.k = b.k group by g",
+      "LEFT OUTER sum(a.v) over A-only measure")
+  }
+
+  test("LEFT OUTER min/max over B column are NULL for unmatched groups") {
+    createLeftOuterTables()
+    assertLeftOuterSplitAndCorrect(
+      """select g, min(b.x) as mn, max(b.x) as mx, count(*) as c
+         from lo_a a left join lo_b b on a.k = b.k group by g""",
+      "LEFT OUTER min/max(b.x) null for unmatched groups")
+  }
+
+  test("LEFT OUTER grouped by a B column: unmatched rows fall in the NULL group") {
+    createLeftOuterTables()
+    // group by b.x: real x values for matched rows, plus a single NULL group for all unmatched.
+    assertLeftOuterSplitAndCorrect(
+      "select b.x as bx, count(*) as c from lo_a a left join lo_b b on a.k = b.k group by b.x",
+      "LEFT OUTER group by B column (NULL group for unmatched)")
+  }
+
+  test("LEFT OUTER grouped by an A column AND a B column matches vanilla") {
+    createLeftOuterTables()
+    assertLeftOuterSplitAndCorrect(
+      """select g, b.x as bx, count(*) as c, sum(b.x) as s
+         from lo_a a left join lo_b b on a.k = b.k group by g, b.x""",
+      "LEFT OUTER group by A and B columns")
+  }
+
+  test("LEFT OUTER global aggregate (no GROUP BY) matches vanilla") {
+    createLeftOuterTables()
+    // count(*) = 3 matched + 2 unmatched = 5 ; count(b.x) = 3 ; sum(a.v) sums all 5 a rows.
+    assertLeftOuterSplitAndCorrect(
+      """select count(*) as c_all, count(b.x) as c_x, sum(b.x) as s_x, sum(a.v) as s_v,
+                min(b.x) as mn, max(b.x) as mx
+         from lo_a a left join lo_b b on a.k = b.k""",
+      "LEFT OUTER global aggregate")
+  }
+
+  test("RIGHT OUTER is normalised to LEFT OUTER and matches vanilla") {
+    createLeftOuterTables()
+    // b RIGHT JOIN a == a LEFT JOIN b: every a row is kept, unmatched ones get NULL b.x.
+    assertLeftOuterSplitAndCorrect(
+      """select g, count(*) as c, count(b.x) as cx, sum(b.x) as s
+         from lo_b b right join lo_a a on a.k = b.k group by g""",
+      "RIGHT OUTER normalised to LEFT OUTER")
+  }
+
+  test("LEFT OUTER TPC-H Q13 shape (customer LEFT JOIN orders, count of orderkey)") {
+    Seq(1, 2, 3, 4, 5).toDF("c_custkey").createOrReplaceTempView("q13_customer")
+    // customer 1 -> 3 orders, customer 2 -> 1 order, customers 3/4/5 -> no orders.
+    Seq((10, 1), (11, 1), (12, 1), (20, 2)).toDF("o_orderkey", "o_custkey")
+      .createOrReplaceTempView("q13_orders")
+    // Faithful Q13 inner shape: per-customer order count (0 for customers with no orders),
+    // then the distribution of those counts. Inner half = customer/orders count-join; the
+    // unmatched customers (count 0) come from the anti half.
+    val query = """
+      select c_count, count(*) as custdist
+      from (
+        select c_custkey, count(o_orderkey) as c_count
+        from q13_customer left join q13_orders on c_custkey = o_custkey
+        group by c_custkey
+      ) c_orders
+      group by c_count"""
+    assertSameResults(query, "TPC-H Q13 shape (customer LEFT JOIN orders)")
+  }
+
+  test("LEFT OUTER with a non-equi join condition (extra predicate on B) matches vanilla") {
+    createLeftOuterTables()
+    // The anti half must use the SAME condition: rows matching k but failing x>150 are unmatched.
+    assertLeftOuterSplitAndCorrect(
+      """select g, count(*) as c, count(b.x) as cx, sum(b.x) as s
+         from lo_a a left join lo_b b on a.k = b.k and b.x > 150 group by g""",
+      "LEFT OUTER with extra B predicate in the join condition")
+  }
+
+  test("LEFT OUTER over a 3-relation right subtree (nested inner join) matches vanilla") {
+    Seq((1, "A"), (2, "A"), (3, "B")).toDF("k", "g").createOrReplaceTempView("lo3_a")
+    Seq((1, 10), (1, 20), (2, 30)).toDF("k", "m").createOrReplaceTempView("lo3_b")
+    Seq((10, 100), (20, 200), (30, 300), (40, 400)).toDF("m", "w")
+      .createOrReplaceTempView("lo3_c")
+    // a LEFT JOIN (b inner-join c): group A keeps fan-out, group B (k=3) is fully unmatched.
+    assertLeftOuterSplitAndCorrect(
+      """select g, count(*) as c, count(w) as cw, sum(w) as sw
+         from lo3_a a left join (
+           select b.k as k, c.w as w from lo3_b b join lo3_c c on b.m = c.m
+         ) bc on a.k = bc.k
+         group by g""",
+      "LEFT OUTER over a multi-relation right subtree")
+  }
+
+  test("LEFT OUTER falls back for AVG (not a mergeable aggregate)") {
+    createLeftOuterTables()
+    val query = "select g, avg(b.x) as a from lo_a a left join lo_b b on a.k = b.k group by g"
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+    withSQLConf(yannakakisOn: _*) {
+      val df = sql(query)
+      checkAnswer(df, expected)
+      assert(!df.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        "AVG over a LEFT join must fall back (no count-join split)")
+    }
+  }
+
+  test("LEFT OUTER falls back for count(distinct) (not a mergeable aggregate)") {
+    createLeftOuterTables()
+    val query =
+      "select g, count(distinct b.x) as c from lo_a a left join lo_b b on a.k = b.k group by g"
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+    withSQLConf(yannakakisOn: _*) {
+      checkAnswer(sql(query), expected)
+    }
+  }
+
+  test("FULL OUTER join falls back and stays correct") {
+    createLeftOuterTables()
+    val query =
+      "select g, count(*) as c from lo_a a full outer join lo_b b on a.k = b.k group by g"
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+    withSQLConf(yannakakisOn: _*) {
+      val df = sql(query)
+      checkAnswer(df, expected)
+      assert(!df.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        "FULL OUTER must fall back (no count-join split)")
+    }
+  }
 }

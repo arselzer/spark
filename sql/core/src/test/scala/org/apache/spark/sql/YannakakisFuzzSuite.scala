@@ -112,16 +112,36 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     val nDims = 1 + rng.nextInt(3)
     val usedDims = 1 to nDims
     val star = rng.nextBoolean()
+    // ~35% of the time make the fact->d1 join a LEFT/RIGHT OUTER join (the rest inner). This
+    // exercises the outer-join decomposition (matched inner + unmatched anti) against vanilla.
+    // RIGHT is written so that the kept side is still the fact (fz_d1 d1 right join fz_fact f),
+    // which the rewrite normalises back to LEFT.
+    val outerKind = rng.nextInt(100) match {
+      case n if n < 20 => "left"
+      case n if n < 35 => "right"
+      case _ => "inner"
+    }
     // Star: fact joins each dim on f.k{i}=d{i}.d{i}k. Chain: fact-d1, d1-d2 (via shared key space),
     // d2-d3. The chain reuses the same integer key domain so joins are non-trivial.
     val joins = if (star) {
-      "fz_fact f " + usedDims.map(i => s"join fz_d$i d$i on f.k$i = d$i.d${i}k").mkString(" ")
+      val firstJoin = outerKind match {
+        case "left" => "fz_fact f left join fz_d1 d1 on f.k1 = d1.d1k"
+        case "right" => "fz_d1 d1 right join fz_fact f on f.k1 = d1.d1k"
+        case _ => "fz_fact f join fz_d1 d1 on f.k1 = d1.d1k"
+      }
+      firstJoin + usedDims.drop(1)
+        .map(i => s" join fz_d$i d$i on f.k$i = d$i.d${i}k").mkString
     } else {
-      val parts = new StringBuilder("fz_fact f join fz_d1 d1 on f.k1 = d1.d1k")
+      val parts = new StringBuilder(outerKind match {
+        case "left" => "fz_fact f left join fz_d1 d1 on f.k1 = d1.d1k"
+        case "right" => "fz_d1 d1 right join fz_fact f on f.k1 = d1.d1k"
+        case _ => "fz_fact f join fz_d1 d1 on f.k1 = d1.d1k"
+      })
       if (nDims >= 2) parts.append(" join fz_d2 d2 on d1.d1v = d2.d2k")
       if (nDims >= 3) parts.append(" join fz_d3 d3 on d2.d2v = d3.d3k")
       parts.toString
     }
+    val isOuter = outerKind != "inner"
     val numCols = Seq("f.fm1", "f.fm2", "f.fm3") ++ usedDims.map(i => s"d$i.d${i}v")
     val allCols = numCols ++ usedDims.map(i => s"d$i.d${i}g") ++ Seq("f.k1")
 
@@ -148,7 +168,9 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     // ~40% of the time add a non-equi cross-relation filter (fact col vs a dim col), a historical
     // bug source for the count-join path (the filter must be applied at/above the join where both
     // attributes are available, and rows whose matches all fail it must drop the carried count).
-    val crossFilter = if (rng.nextInt(10) < 4) {
+    // Skipped for outer joins: a WHERE predicate on a dim column would convert the outer join back
+    // to an inner one, so it would no longer exercise the outer-join decomposition.
+    val crossFilter = if (!isOuter && rng.nextInt(10) < 4) {
       val op = pick(rng, Seq("<", ">", "<=", ">=", "<>"))
       val pred = if (nDims >= 2 && rng.nextBoolean()) {
         // Span two relations the reduction does not directly inner-join (sibling dims in a star),

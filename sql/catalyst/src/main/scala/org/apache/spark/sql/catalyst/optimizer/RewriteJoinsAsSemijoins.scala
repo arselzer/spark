@@ -23,7 +23,8 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.dsl.expressions.DslExpression
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.RightOuter
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern
@@ -948,6 +949,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       plan.transformDownWithPruning(_.containsPattern(TreePattern.AGGREGATE), ruleId) {
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
+        join@Join(_, _, LeftOuter | RightOuter, _, _)), _) =>
+          // LEFT/RIGHT OUTER: split into a matched (inner) half + an unmatched (left-anti) half
+          // and merge per group. Falls back to the original `agg` on any unsupported shape.
+          tryRewriteLeftOuter(agg, groupingExpressions, aggExpressions, projectList, join)
+            .getOrElse(agg)
+        case agg@Aggregate(groupingExpressions, aggExpressions,
+        join@Join(_, _, LeftOuter | RightOuter, _, _), _) =>
+          tryRewriteLeftOuter(agg, groupingExpressions, aggExpressions, join.output, join)
+            .getOrElse(agg)
+        case agg@Aggregate(groupingExpressions, aggExpressions,
+        project@Project(projectList,
         join@Join(_, _, _: InnerLike, _, _)), _) =>
           // InnerLike also matches Cross: a cross join whose join predicates were normalised into
           // its condition (or that has none) is semantically an inner join here.
@@ -1065,6 +1077,186 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     // join-key columns from each half.
     logInfo("new aggregate (mixed-distinct split)")
     Some(Project(aggExpressions.map(_.toAttribute), recombined))
+  }
+
+  /**
+   * One mergeable aggregate slot of a LEFT OUTER split: the original aggregate result expression
+   * (an Alias over a single count/sum/min/max) plus how its per-half partial results combine in
+   * the final merge aggregate (count(*)/count(x)/sum -> SUM, min -> MIN, max -> MAX).
+   */
+  private sealed trait LoMerge
+  private case object LoSum extends LoMerge
+  private case object LoMin extends LoMerge
+  private case object LoMax extends LoMerge
+
+  /**
+   * Rewrites `Aggregate(g, aggs, A LEFT OUTER JOIN B)` using the decomposition
+   *
+   *   A LEFT JOIN B  ==  (A INNER JOIN B)  UNION ALL  (A LEFT ANTI JOIN B, B-cols -> typed NULL)
+   *
+   * so the aggregate splits into a matched half over the inner join (which reuses the existing
+   * count-join rewrite via [[rewriteOrFallback]]) and an unmatched half over the anti join (a
+   * plain aggregate - the anti join has no fan-out). The two per-group partial results are then
+   * UNION-ed and re-aggregated per group, merging count(*)/count(x)/sum with SUM, min with MIN
+   * and max with MAX. RIGHT OUTER is normalised to LEFT OUTER by swapping the sides.
+   *
+   * Correctness rests on three points:
+   *  - the anti join keeps exactly the A rows that get NULL-extended by the LEFT join, so the two
+   *    halves partition the LEFT join's rows;
+   *  - in the unmatched half every B column (in BOTH grouping keys and aggregate arguments) is
+   *    projected to a typed NULL literal, so count(b.x)=0, sum/min/max(b.x)=NULL, count(*) still
+   *    counts the row, and a B grouping key collapses to the NULL group - exactly the LEFT join's
+   *    NULL extension; A-only aggregates still see the real A values;
+   *  - the merge re-aggregates the union of the partials and casts each result back to the
+   *    original aggregate's type, preserving both the output exprIds and the output schema.
+   *
+   * Returns None (fall back to the original plan) for FULL OUTER, a missing join condition, any
+   * non-mergeable aggregate (AVG/DISTINCT/percentile/stddev/FILTER, nested/mixed aggregates, a
+   * bare un-aliased aggregate), or when the matched half does not accelerate (so the split would
+   * only double the join with no benefit), and whenever the merged plan drops a required input.
+   */
+  private def tryRewriteLeftOuter(
+      agg: Aggregate,
+      grouping: Seq[Expression],
+      aggExpressions: Seq[NamedExpression],
+      projectList: Seq[NamedExpression],
+      join: Join): Option[LogicalPlan] = {
+    if (!conf.yannakakisEnabled) return None
+    // Normalise RIGHT OUTER to LEFT OUTER by swapping the join sides (always sound). FULL OUTER
+    // and a conditionless (cartesian) outer join are not handled.
+    val normJoin = join.joinType match {
+      case LeftOuter => join
+      case RightOuter =>
+        Join(join.right, join.left, LeftOuter, join.condition,
+          JoinHint(join.hint.rightHint, join.hint.leftHint))
+      case _ => return None
+    }
+    if (normJoin.condition.isEmpty) return None
+    val left = normJoin.left
+    val right = normJoin.right
+    val cond = normJoin.condition
+    val hint = normJoin.hint
+    val bOutputSet = right.outputSet
+
+    // Classify each result expression: a grouping-derived expression (no aggregate), or an Alias
+    // over a single mergeable aggregate. Anything else (bare aggregate, AVG/DISTINCT/percentile/
+    // stddev, FILTER, or an expression mixing/nesting aggregates) makes the split bail.
+    def mergeKindOf(ae: AggregateExpression): Option[LoMerge] =
+      if (ae.isDistinct || ae.filter.isDefined) None
+      else ae.aggregateFunction match {
+        case _: Count => Some(LoSum)
+        case _: Sum => Some(LoSum)
+        case _: Min => Some(LoMin)
+        case _: Max => Some(LoMax)
+        case _ => None
+      }
+    val classified: Seq[Option[(NamedExpression, Option[LoMerge])]] = aggExpressions.map { ne =>
+      val contained = ne.collect { case ae: AggregateExpression => ae }
+      if (contained.isEmpty) Some((ne, None)) // grouping-derived
+      else ne match {
+        case Alias(ae: AggregateExpression, _) if contained.size == 1 =>
+          mergeKindOf(ae).map(k => (ne, Some(k)))
+        case _ => None
+      }
+    }
+    if (classified.exists(_.isEmpty)) return None
+    val cats = classified.flatten
+    // Aggregate slots (Alias over a mergeable aggregate), in result order.
+    val aggSlots: Seq[(NamedExpression, LoMerge)] =
+      cats.collect { case (ne, Some(k)) => (ne, k) }
+    if (aggSlots.isEmpty) return None // no aggregate to merge - nothing to do
+
+    val innerJoin = Join(left, right, Inner, cond, hint)
+    // Re-point every reference to the INNER join's output attributes. The LEFT join marks B's
+    // columns nullable; the inner half must see them with their real (non-nullable) nullability,
+    // or e.g. count(b.x) would compile to a NULL-skipping form that references raw b.x and the
+    // count-join (which folds sum/count of b.x into its right aggregate) would then have dropped
+    // it. Attribute exprIds are preserved across join types, so a by-exprId remap suffices.
+    val innerAttrs = innerJoin.output.map(a => a.exprId -> a).toMap
+    def toInner[T <: Expression](e: T): T = e.transformUp {
+      case a: Attribute => innerAttrs.getOrElse(a.exprId, a)
+    }.asInstanceOf[T]
+    val innerProjectList = projectList.map(toInner)
+    val innerGrouping = grouping.map(toInner)
+
+    // Explicit per-half group-key columns (so the union/merge can group even when a key is not in
+    // the SELECT list). Fresh exprIds; null-safe handling happens via GROUP BY in the merge.
+    val gkMatched = innerGrouping.map(g => Alias(g, "lojoin_gk")())
+    // Fresh exprIds for the matched aggregate slots too, so the union's output exprIds are all
+    // fresh and never collide with the original output exprIds re-used by the final merge.
+    val matchedAggExprs = aggSlots.map { case (ne, _) =>
+      Alias(toInner(ne.asInstanceOf[Alias].child), ne.name)()
+    }
+    val matchedResultExprs = gkMatched ++ matchedAggExprs
+    val matchedHalf =
+      Aggregate(innerGrouping, matchedResultExprs, Project(innerProjectList, innerJoin))
+    val matchedRewritten =
+      rewriteOrFallback(matchedHalf, innerGrouping, matchedResultExprs, innerProjectList, innerJoin)
+    if (matchedRewritten eq matchedHalf) {
+      // The inner half was not accelerated: do not replace one join with two (matched inner +
+      // unmatched anti) for no benefit.
+      return None
+    }
+
+    // Unmatched half: project B's columns to typed NULL in the project list, keeping each
+    // attribute's exprId so the grouping/aggregate expressions still resolve.
+    val antiProjectList: Seq[NamedExpression] = projectList.map {
+      case attr: Attribute if bOutputSet.contains(attr) =>
+        Alias(Literal(null, attr.dataType), attr.name)(exprId = attr.exprId)
+      case ne =>
+        ne.transformDown {
+          case a: Attribute if bOutputSet.contains(a) => Literal(null, a.dataType)
+        }.asInstanceOf[NamedExpression]
+    }
+    val antiJoin = Join(left, right, LeftAnti, cond, hint)
+    val antiChild = Project(antiProjectList, antiJoin)
+    val gkAnti = grouping.map(g => Alias(g, "lojoin_gk")())
+    // Rebuild each aggregate slot with a fresh exprId (the union branches must be disjoint).
+    val antiAggExprs = aggSlots.map { case (ne, _) =>
+      Alias(ne.asInstanceOf[Alias].child, ne.name)()
+    }
+    val antiResultExprs = gkAnti ++ antiAggExprs
+    val antiHalf = Aggregate(grouping, antiResultExprs, antiChild)
+
+    val union = Union(matchedRewritten :: antiHalf :: Nil)
+    val unionGk = union.output.take(grouping.size)
+    val unionAggParts = union.output.drop(grouping.size)
+
+    // Final merge: group by the union's group-key columns; re-aggregate the partials and cast
+    // each back to the original aggregate's type. Group-derived result expressions are rebuilt
+    // over the union's group keys. All outputs keep the ORIGINAL aggregate's exprIds.
+    var aggIdx = 0
+    val mergeResultExprs: Seq[NamedExpression] = cats.map {
+      case (ne, None) =>
+        var rewritten: Expression = ne
+        grouping.zip(unionGk).foreach { case (g, uk) =>
+          rewritten = rewritten.transformDown { case e if e.semanticEquals(g) => uk }
+        }
+        val out = ne.toAttribute
+        Alias(rewritten match {
+          case Alias(child, _) => child
+          case other => other
+        }, out.name)(exprId = out.exprId)
+      case (ne, Some(kind)) =>
+        val part = unionAggParts(aggIdx)
+        aggIdx += 1
+        val merged: Expression = kind match {
+          case LoSum => Sum(part).toAggregateExpression()
+          case LoMin => Min(part).toAggregateExpression()
+          case LoMax => Max(part).toAggregateExpression()
+        }
+        val out = ne.toAttribute
+        Alias(Cast(merged, out.dataType), out.name)(exprId = out.exprId)
+    }
+    val merged = Aggregate(unionGk, mergeResultExprs, union)
+
+    // Guard against the split dropping any required input (mirrors validateOrFallback).
+    if (merged.collectFirst { case p if p.missingInput.nonEmpty => p }.nonEmpty) {
+      logWarning("yannakakis LEFT OUTER split dropped required attributes; falling back")
+      return None
+    }
+    logInfo("new aggregate (left-outer split)")
+    Some(merged)
   }
 
   /**
