@@ -111,21 +111,32 @@ fan-out join each reduced row carries value `x` with multiplicity `count`, so th
 non-null inputs. From these:
 
 - `VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP`: `m2 = Sxx − Sx²/n`, then `m2/n`, `m2/(n−1)`, `√·`.
+- `SKEWNESS/KURTOSIS`: the 3rd/4th central sums `m3`, `m4` from `Sxxx = SUM(x³·c)`, `Sxxxx = SUM(x⁴·c)`
+  (referenced only here, so var/stddev plans are unchanged), then `√n·m3/√(m2³)` and `n·m4/m2² − 3`.
 - `COVAR_POP/COVAR_SAMP/CORR`: `ck = Sxy − Sx·Sy/n`, `xMk = Sxx − Sx²/n`, `yMk = Syy − Sy²/n`, then
   `ck/n`, `ck/(n−1)`, `ck/√(xMk·yMk)`.
+- `REGR_SLOPE/INTERCEPT/R2/SXY`: `ck`/`m2` combinations of the same partials (`slope = ck/var(x)`,
+  `intercept = ȳ − slope·x̄`, `r2 = ck²/(var(x)·var(y))`, `sxy = ck`).
 - `regr_count/avgx/avgy/sxx/syy` are Spark `RuntimeReplaceableAggregate`s that expand to
   `Count`/`Average`/variance before the rule runs, so they ride the existing paths for free.
 
-In each case the rewrite reproduces Spark's `CentralMomentAgg`/`Covariance`/`Corr`
-`evaluateExpression` **exactly** — same `n=0`/`n=1` guards and `nullOnDivideByZero` result — so values
-and schema match. The power-sum form equals Spark's Welford recurrence in exact arithmetic; on the
-value ranges these queries hit it agrees to floating-point tolerance. This gives an in-database
-statistical/ML-aggregate capability over joins for free from the count machinery.
+In each case the rewrite reproduces Spark's `CentralMomentAgg`/`Covariance`/`Corr`/regression
+`evaluateExpression` **exactly** — same `n=0`/`n=1`/`m2=0` guards and `nullOnDivideByZero` result — so
+values and schema match. The power-sum form equals Spark's Welford recurrence in exact arithmetic; on
+the value ranges these queries hit it agrees to floating-point tolerance.
 
-**Correctness.** A moment-only query is fan-out-SENSITIVE, so it must take the counting path (not the
-0MA semijoin path, which would drop the fan-out and yield an unweighted moment). **Falls back:**
-`DECIMAL`/interval moments (precision parity), `DISTINCT` moments, skew/kurtosis (3rd/4th), and the
-`DeclarativeAggregate` regr forms (`regr_slope/intercept/r2/sxy`).
+**The characterized class (and its boundary).** This is not a list of functions but one closure result:
+*the count-join computes exactly the aggregates expressible as a fixed-arity function of fan-out-weighted
+power sums `Σ xᵃyᵇ·count`* — equivalently, the commutative-semiring statistics over the annotated
+relation. That class is precisely `COUNT`, `SUM`, `AVG`, **all** central moments
+(`VAR`/`STDDEV`/skewness/kurtosis), covariance, correlation, and linear regression — an in-database
+statistical/ML-aggregate capability over joins, for free from the count machinery. It **provably
+excludes** `DISTINCT`, `percentile`/`median`: those depend on the full multiset of values, which no
+fixed-width moment vector captures — so they (and, for engineering precision-parity reasons,
+`DECIMAL`/interval moments) are the *principled* fallback boundary, not an arbitrary gap.
+
+**Correctness.** A moment query is fan-out-SENSITIVE, so it must take the counting path (not the 0MA
+semijoin path, which would drop the fan-out and yield an *unweighted* moment).
 
 ## Cost gate (fan-out-aware; off by default)
 
@@ -214,11 +225,12 @@ fan-out reduction, demonstrated by the curve above and the real-data results.
 - **DECIMAL/interval AVG, DISTINCT, percentile over outer joins.** Double-output AVG is supported
   (`sum`+`count` carry). DECIMAL/interval AVG falls back pending exact precision parity with Spark's
   `Average`; DISTINCT and percentile do not decompose across the union.
-- **Statistical aggregates** (Extension 4): VAR/STDDEV/COVAR/CORR (+ runtime-replaceable `regr_*`)
-  are supported for the DoubleType-output case. DECIMAL/interval moments, DISTINCT moments,
-  3rd/4th moments (skew/kurtosis), and the DeclarativeAggregate `regr_slope/intercept/r2/sxy` fall
-  back. A numerically-stable (vs power-sum) reconstruction is future work, though it is immaterial at
-  the value ranges tested.
+- **Statistical aggregates** (Extension 4): the **full** DoubleType-output class is supported —
+  VAR/STDDEV, skewness/kurtosis, COVAR/CORR, and `regr_*` (slope/intercept/r2/sxy + the
+  runtime-replaceable count/avgx/avgy/sxx/syy). Remaining fallbacks are the *principled* boundary
+  (`DISTINCT` moments, `percentile`/`median` — need the full multiset) plus the engineering one
+  (`DECIMAL`/interval moments — exact precision parity). A numerically-stable (vs power-sum)
+  reconstruction is future work, though immaterial at the value ranges tested.
 - **Cyclic is generality-only.** The bag uses binary joins. A genuine performance contribution on
   cyclic queries requires a worst-case-optimal join *that aggregates*. Concretely: because the bag
   is **counted** and never enumerated, the relevant cost is `N^fhtw` and, on irreducible chordless

@@ -82,8 +82,13 @@ the definitions of the aggregates evaluated on the annotated `π_{U_ρ}J`, which
 `J` because projecting onto a superset of `G ∪ refs(𝒜)` is loss-free for these aggregates. (4) needs
 only `supp`, preserved by Lemma 2. (5) is the quotient. ∎
 
-**Corollary 1.1 (second moments).** `VAR_POP/VAR_SAMP/STDDEV_*`, `COVAR_*`, and `CORR` are likewise
-computable from count-weighted power sums over `π_{U_ρ}J`. Writing `n = Σ count` (over non-null
+**Corollary 1.1 (power-sum-decomposable aggregates).** Every aggregate expressible as a fixed-arity
+function of fan-out-weighted power sums `Σ xᵃyᵇ·count` is computable from those sums over
+`π_{U_ρ}J` — by Theorem 1 applied to the derived monomials `xᵃyᵇ` (functions of the carried `x,y`).
+This is exactly `COUNT/SUM/AVG`, all central moments (`VAR/STDDEV`, skewness, kurtosis), covariance,
+correlation, and linear regression (`regr_*`). Conversely `DISTINCT`, `percentile`, and `median` are
+**not** in the class — they depend on the full value multiset, not a fixed-width moment vector — which
+is *why* they fall back (a principled boundary, not an implementation gap). Writing `n = Σ count` (over non-null
 inputs), `Sx = SUM(x·count)`, `Sxx = SUM(x²·count)` (and `Sy,Syy,Sxy` two-column), the second central
 moment `m2 = Sxx − Sx²/n` equals `Σ_t (x(t) − x̄)² · count_ρ(t)` — the moment over `J` — by Theorem 1
 applied to the derived expressions `x²` and `x` (both functions of the carried `x`). The variances /
