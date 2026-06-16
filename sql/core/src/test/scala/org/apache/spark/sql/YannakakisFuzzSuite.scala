@@ -347,4 +347,84 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
       s"${failures.size}/$iters cyclic fuzz failures (showing up to 12):\n" +
         failures.take(12).mkString("\n----\n"))
   }
+
+  // DIAGNOSTIC (not an oracle assertion): characterize the cyclic rewrite under AQE-ON, which the
+  // oracle above deliberately avoids. For each seed, against the SAME data, compute vanilla AQE-off
+  // (ground truth), vanilla AQE-on, and rewrite AQE-on twice. Classifies any divergence as
+  // (a) vanilla-itself-diverges-under-AQE, (b) rewrite+AQE wrong vs truth, (c) rewrite+AQE
+  // non-deterministic. Run: CYCLIC_AQE_ITERS=300 (env) with -z DIAGNOSTIC.
+  // ignore()d: a manual diagnostic (no oracle assertion, slow, and the AQE+batch behaviour probed
+  // is non-deterministic). Flip to test() and run with -z to re-investigate. Findings: the cyclic
+  // rewrite is correct for single isolated queries under AQE; in a long AQE-on shared-session batch
+  // it shows FLAKY divergence (varies run-to-run, vanilla's own truth varies too), not reducible to
+  // a deterministic isolated case. Suspect area if a stable repro appears: the mixed-distinct split
+  // (cjsplit_gk) interacting with AQE ReusedExchange across its two halves.
+  ignore("DIAGNOSTIC cyclic AQE: characterize rewrite vs vanilla under AQE-on") {
+    val iters = sys.env.getOrElse("CYCLIC_AQE_ITERS", "200").toInt
+    val aqeOn = SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true"
+    val aqeOff = SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false"
+    var vanillaAqeDiverged = 0
+    var rewriteAqeWrong = 0
+    var rewriteAqeNonDet = 0
+    val examples = ArrayBuffer[String]()
+    (1 to iters).foreach { seed =>
+      val rng = new Random((seed + 100000).toLong)
+      val query = genCyclicQuery(rng, seed)
+      val truth = withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false", aqeOff) {
+        sql(query).collect().toSeq
+      }
+      val vanAqe = withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false", aqeOn) {
+        sql(query).collect().toSeq
+      }
+      val (rw1, rw1Plan) = withSQLConf((cyclicBagsOn :+ aqeOn): _*) {
+        val df = sql(query); val rows = df.collect().toSeq
+        (rows, df.queryExecution.executedPlan.toString)
+      }
+      val rw2 = withSQLConf((cyclicBagsOn :+ aqeOn): _*) { sql(query).collect().toSeq }
+      if (!rowsMatch(vanAqe, truth)) vanillaAqeDiverged += 1
+      if (!rowsMatch(rw1, truth)) {
+        rewriteAqeWrong += 1
+        // Decisive: on the SAME views (same data, same session state), is rewrite AQE-OFF correct?
+        // If rwOff==truth and rw1(AQE-on)!=truth, AQE is unambiguously the differentiator.
+        val rwOff = withSQLConf((cyclicBagsOn :+ aqeOff): _*) { sql(query).collect().toSeq }
+        val hasReuse = rw1Plan.contains("ReusedExchange")
+        if (examples.size < 2) {
+          examples += s"seed=$seed WRONG vs truth\n$query" +
+            s"\n  truth         =${truth.sortBy(_.toString).take(8)}" +
+            s"\n  rw AQE-on     =${rw1.sortBy(_.toString).take(8)}" +
+            s"\n  rw AQE-off    =${rwOff.sortBy(_.toString).take(8)}" +
+            s"  matchesTruth=${rowsMatch(rwOff, truth)}" +
+            s"\n  AQE-on plan has ReusedExchange=$hasReuse"
+        }
+      }
+      if (!rowsMatch(rw1, rw2)) rewriteAqeNonDet += 1
+    }
+    // scalastyle:off println
+    println(s"CYCLIC-AQE DIAGNOSTIC over $iters seeds: vanillaAqeDiverged=$vanillaAqeDiverged " +
+      s"rewriteAqeWrong=$rewriteAqeWrong rewriteAqeNonDet=$rewriteAqeNonDet")
+    examples.foreach(println)
+    // scalastyle:on println
+  }
+
+  // DIAGNOSTIC: run ONE seed in isolation (via -z) so the shared session holds no prior-seed state.
+  // Prints the query and four results, isolating "real AQE bug" from "multi-seed contamination".
+  ignore("DIAGNOSTIC cyclic AQE: seed 31 in isolation") {
+    val seed = sys.env.getOrElse("CYCLIC_AQE_SEED", "31").toInt
+    val aqeOn = SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true"
+    val aqeOff = SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false"
+    val query = genCyclicQuery(new Random((seed + 100000).toLong), seed)
+    def run(conf: Seq[(String, String)]): Seq[Row] =
+      withSQLConf(conf: _*) { sql(query).collect().toSeq.sortBy(_.toString) }
+    val vanOff = run(Seq(SQLConf.YANNAKAKIS_ENABLED.key -> "false", aqeOff))
+    val vanOn = run(Seq(SQLConf.YANNAKAKIS_ENABLED.key -> "false", aqeOn))
+    val rwOff = run(cyclicBagsOn :+ aqeOff)
+    val rwOn = run(cyclicBagsOn :+ aqeOn)
+    // scalastyle:off println
+    println(s"SEED-$seed ISOLATED\n$query")
+    println(s"  vanilla AQE-off (truth): $vanOff")
+    println(s"  vanilla AQE-on         : $vanOn   match=${rowsMatch(vanOn, vanOff)}")
+    println(s"  rewrite AQE-off        : $rwOff   match=${rowsMatch(rwOff, vanOff)}")
+    println(s"  rewrite AQE-on         : $rwOn   match=${rowsMatch(rwOn, vanOff)}")
+    // scalastyle:on println
+  }
 }
