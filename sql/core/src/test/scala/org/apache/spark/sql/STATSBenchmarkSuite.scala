@@ -162,10 +162,15 @@ class STATSBenchmarkSuite extends QueryTest with SharedSparkSession {
     val offTimeout = sys.env.getOrElse("STATS_OFF_TIMEOUT", "15").toInt
     val onTimeout = sys.env.getOrElse("STATS_ON_TIMEOUT", "60").toInt
 
+    // Gate-ON config: does the CURRENT (broadcast-size) cost gate keep or skip the rewrite?
+    val gateOnConf = onConf :+ (SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true")
+
     var rewritten = 0
     var mismatches = 0
     var offDNF = 0
     var onDNF = 0
+    var gateSkips = 0       // queries the gate skips that would otherwise fire
+    var gateSkipsAWin = 0   // gate skips a query where vanilla DNF -> a lost big win
     val speedups = scala.collection.mutable.ArrayBuffer[Double]() // only where both finished
     // scalastyle:off println
     println(s"=== STATS-CEB: ${queries.length} queries, vanilla(<=${offTimeout}s) vs rewrite ===")
@@ -177,10 +182,21 @@ class STATSBenchmarkSuite extends QueryTest with SharedSparkSession {
           sql(q).queryExecution.optimizedPlan.toString.contains("CountJoin")
         } catch { case _: Throwable => false }
       if (fired) rewritten += 1
+      val gateKeeps =
+        try withSQLConf(gateOnConf: _*) {
+          sql(q).queryExecution.optimizedPlan.toString.contains("CountJoin")
+        } catch { case _: Throwable => false }
       val on = runCount(onConf, q, onTimeout, "on")
       val off = runCount(offConf, q, offTimeout, "off")
       if (off.isEmpty) offDNF += 1
       if (on.isEmpty) onDNF += 1
+      if (fired && !gateKeeps) {
+        gateSkips += 1
+        if (off.isEmpty) {
+          gateSkipsAWin += 1
+          println(f"  GATE-MISSKIP $name: vanilla DNF but the size-gate SKIPS the rewrite")
+        }
+      }
       (off, on) match {
         case (Some((vc, _)), Some((oc, _))) if vc != oc =>
           mismatches += 1; println(f"  MISMATCH $name: off=$vc on=$oc")
@@ -202,6 +218,8 @@ class STATSBenchmarkSuite extends QueryTest with SharedSparkSession {
       f"vanilla-DNF(>${offTimeout}s)=$offDNF | rewrite-DNF=$onDNF | mismatches=$mismatches")
     println(f"STATS-CEB: geomean speedup where BOTH finished (n=${speedups.size}) = " +
       f"${geomean(speedups.toSeq)}%.2fx ; vanilla DID-NOT-FINISH on $offDNF/${queries.length}")
+    println(f"STATS-CEB GATE (broadcast-size gate): skips $gateSkips/$rewritten rewrites; " +
+      f"$gateSkipsAWin of those are vanilla-DNF WINS wrongly thrown away")
     // scalastyle:on println
     assert(mismatches == 0, s"$mismatches STATS queries gave a different count under the rewrite")
   }

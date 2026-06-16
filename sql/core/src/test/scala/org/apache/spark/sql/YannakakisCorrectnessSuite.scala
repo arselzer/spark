@@ -79,6 +79,33 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("fan-out cost gate: skips a broadcast-friendly 2-table join, keeps a multi-way star") {
+    Seq((1, 10.0), (1, 20.0), (2, 30.0)).toDF("k", "v").createOrReplaceTempView("g_fact")
+    Seq(1, 1, 2).toDF("k").createOrReplaceTempView("g_d1")
+    Seq(1, 2, 2).toDF("k").createOrReplaceTempView("g_d2")
+    // degree-2 (fact-d1): broadcast-friendly + low fan-out -> the gate SKIPS (count-join overhead
+    // would not pay). degree-3 star (fact-d1-d2 all on k): multiplicative fan-out -> gate KEEPS it.
+    val q2 = "select sum(f.v) as s from g_fact f join g_d1 d1 on f.k = d1.k"
+    val q3 = "select sum(f.v) as s from g_fact f join g_d1 d1 on f.k = d1.k " +
+      "join g_d2 d2 on f.k = d2.k"
+    var e2: Seq[Row] = null
+    var e3: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      e2 = sql(q2).collect().toSeq; e3 = sql(q3).collect().toSeq
+    }
+    val gateOn = yannakakisOn :+ (SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true")
+    withSQLConf(gateOn: _*) {
+      val df2 = sql(q2)
+      checkAnswer(df2, e2)
+      assert(!df2.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        "gate should SKIP the broadcast-friendly degree-2 join")
+      val df3 = sql(q3)
+      checkAnswer(df3, e3)
+      assert(df3.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        "gate should KEEP the multi-way (degree-3) fan-out star")
+    }
+  }
+
   /** Higher-moment aggregate over a fan-out join: matches vanilla AND the count-join fired. */
   private def assertMomentAccelerated(query: String, hint: String): Unit = {
     assertSameResults(query, hint)

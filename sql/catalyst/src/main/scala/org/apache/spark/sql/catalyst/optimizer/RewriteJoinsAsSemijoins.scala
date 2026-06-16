@@ -60,6 +60,19 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     }
   }
 
+  /**
+   * Cost-gate decision: skip the rewrite (keep vanilla) only when vanilla is already near-optimal.
+   * The broadcast-size signal ALONE is wrong for fan-out blow-ups: relations can be small (all
+   * broadcast-eligible) yet a multi-way star join over them explodes the intermediate - on
+   * STATS-CEB the size gate skipped all 146 queries, throwing away 7 where vanilla does-not-finish
+   * while the count-join is >5-60x. A join key shared by >=3 relations (max hypergraph vertex
+   * degree) signals exactly that multiplicative fan-out, so we keep the rewrite for those. The
+   * asymmetry favours keeping: wrongly applying the count-join costs a little overhead, wrongly
+   * skipping a fan-out query can be catastrophic.
+   */
+  private def costGateSkips(items: Seq[LogicalPlan], hg: Hypergraph): Boolean =
+    baselineBroadcastsAllButLargest(items) && hg.maxKeyDegree < 3
+
   // A "product aggregate" is a SUM over 2+ non-count attributes from different relations (e.g.
   // SUM(a*b)); a "cross-relation filter" is a non-equi predicate spanning relations. Both are
   // extracted as DeferredComputations so the rewrite can detect product conflicts: when 2+
@@ -733,8 +746,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                 hg.getAttributeToVertex.get(out.exprId).contains(v))
                 .map(out => Alias(out, att.name)(exprId = att.exprId))))
 
-          if (baselineBroadcastsAllButLargest(items)) {
-            debugLog("cost gate: baseline broadcasts all but the largest relation - " +
+          if (costGateSkips(items, hg)) {
+            debugLog("cost gate: vanilla near-optimal (broadcast star, low fan-out) - " +
               "keeping original plan (count-join would only add cost)")
             return agg
           }
@@ -968,8 +981,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             val rewrittenResultExpressions = resultExpressions.map(e =>
               rewriteGuardedAggregate(e).asInstanceOf[NamedExpression])
 
-            if (baselineBroadcastsAllButLargest(items)) {
-              debugLog("cost gate: baseline broadcasts all but the largest relation - " +
+            if (costGateSkips(items, hg)) {
+              debugLog("cost gate: vanilla near-optimal (broadcast star, low fan-out) - " +
                 "keeping original plan (count-join would only add cost)")
               return agg
             }
@@ -2584,6 +2597,14 @@ class Hypergraph (private val items: Seq[LogicalPlan],
   private var attributeToVertex: mutable.Map[ExprId, String] = mutable.Map.empty
 
   def getAttributeToVertex: mutable.Map[ExprId, String] = attributeToVertex
+
+  // Max number of relations sharing a single join-key equivalence class (a hypergraph vertex's
+  // degree). >= 3 means a multi-way star on one key (e.g. 5 relations joined on UserId) - the
+  // regime where the join intermediate explodes multiplicatively and the count-join wins big. Read
+  // from the original edges (GYO works on copies), so it reflects the query's join structure.
+  def maxKeyDegree: Int =
+    edges.toSeq.flatMap(_.vertices).groupBy(identity).values.map(_.size).reduceOption(_ max _)
+      .getOrElse(0)
 
   private var equivalenceClasses: Set[Set[Attribute]] = Set.empty
 
