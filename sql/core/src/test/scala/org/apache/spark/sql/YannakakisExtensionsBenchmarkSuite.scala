@@ -154,4 +154,118 @@ class YannakakisExtensionsBenchmarkSuite extends QueryTest with SharedSparkSessi
       """select count(*) as c from ex_tri_r r join ex_tri_s s on r.b = s.b
          join ex_tri_t t on r.a = t.a and s.c = t.c""", cyclicOn)
   }
+
+  // ---- Scaling sweeps (K-run median + min/max) -----------------------------------------------
+  // Each sweep grows the relevant join's intermediate (fan-out) while holding the output bounded,
+  // and reports vanilla vs rewrite. Asserts rewrite == vanilla at every point.
+
+  // (median, min, max) ms over k timed runs after one warm-up.
+  private def timeK(conf: Seq[(String, String)], query: String, k: Int): (Long, Long, Long) = {
+    withSQLConf(conf: _*) { sql(query).collect() }
+    val ts = (1 to k).map(_ => withSQLConf(conf: _*) { timeMs(sql(query).collect())._2 }).sorted
+    (ts(ts.size / 2), ts.head, ts.last)
+  }
+
+  private def scaleRow(
+      label: String, query: String, onConf: Seq[(String, String)], k: Int): Unit = {
+    val vRows = withSQLConf(vanilla: _*) { sql(query).collect().toSeq }
+    val oRows = withSQLConf(onConf: _*) { sql(query).collect().toSeq }
+    assert(rowsMatch(vRows, oRows), s"$label: rewrite result differs from vanilla")
+    val v = timeK(vanilla, query, k)
+    val o = timeK(onConf, query, k)
+    val speedup = if (o._1 == 0) 0.0 else v._1.toDouble / o._1.toDouble
+    // scalastyle:off println
+    println(f"  $label%-22s vanilla=${v._1}%5d[${v._2}%d-${v._3}%d]ms" +
+      f"  rewrite=${o._1}%5d[${o._2}%d-${o._3}%d]ms  speedup=$speedup%4.2fx")
+    // scalastyle:on println
+  }
+
+  // Star fact-d1-d2 on key a (fan-out n/card per side); cross-dim predicate spans d1 and d2.
+  private def genStar(n: Int, card: Int): Unit = {
+    spark.range(0, n).selectExpr(s"id % $card as a", "cast(id % 1000 as double) as fm")
+      .createOrReplaceTempView("sc_f")
+    spark.range(0, n).selectExpr(s"id % $card as a", "id % 100 as x")
+      .createOrReplaceTempView("sc_d1")
+    spark.range(0, n).selectExpr(s"id % $card as a", "id % 100 as y")
+      .createOrReplaceTempView("sc_d2")
+  }
+
+  // Fact LEFT/FULL dim on key k, fan-out on both sides; dim keys shifted to leave some unmatched.
+  private def genOuterScale(n: Int, card: Int): Unit = {
+    spark.range(0, n)
+      .selectExpr(s"id % $card as k", "cast(id % 1000 as double) as fm", "id % 50 as g")
+      .createOrReplaceTempView("so_f")
+    spark.range(0, n).selectExpr(s"(id % ${card - 20}) + 10 as k", "cast(id % 100 as double) as x")
+      .createOrReplaceTempView("so_d")
+  }
+
+  private def genTriangleScale(n: Int, card: Int): Unit = {
+    spark.range(0, n).selectExpr(s"id % $card as a", s"(id * 3) % $card as b")
+      .createOrReplaceTempView("st_r")
+    spark.range(0, n).selectExpr(s"id % $card as b", s"(id * 5) % $card as c")
+      .createOrReplaceTempView("st_s")
+    spark.range(0, n).selectExpr(s"id % $card as a", s"(id * 5) % $card as c")
+      .createOrReplaceTempView("st_t")
+  }
+
+  test("scaling: CORE fan-out reduction (no spanning predicate) - the real perf curve") {
+    // The canonical count-join win: sum(f.fm) over a fan-out star F-d1-d2 with NO cross-dim
+    // predicate. Vanilla materializes the F join d1 join d2 blow-up (~n^3/card^2 rows) then sums;
+    // the rewrite computes sum(fm * cnt_d1 * cnt_d2) over the reduced relations, never building
+    // it. Scales are large enough that the join work dominates fixed overhead, so the speedup grows
+    // with fan-out. (Contrast the cross-relation-predicate sweep below: the predicate forces the
+    // cross-product, so it is a GENERALITY win, parity in time.)
+    // scalastyle:off println
+    println("=== EXT-SCALE: CORE fan-out reduction (sum over a fan-out star, no predicate) ===")
+    // scalastyle:on println
+    Seq(10000, 25000, 45000, 70000).foreach { n =>
+      genStar(n, 1000)
+      scaleRow(s"n=$n fanout=${n / 1000}",
+        "select sum(f.fm) as s from sc_f f join sc_d1 d1 on f.a = d1.a " +
+          "join sc_d2 d2 on f.a = d2.a", rewriteOn, k = 2)
+    }
+  }
+
+  test("scaling: cross-relation predicate (star) - generality, parity in time") {
+    // The predicate d1.x + d2.y > c spans the two dims, so evaluating it requires the (x,y) pairs -
+    // exactly the cross-product the count-join would otherwise avoid. So this is a GENERALITY win
+    // (the rewrite handles the query) at parity time, NOT a reduction speedup. Numbers are noisy at
+    // these scales; the point is no regression. Contrast the CORE sweep above (real win curve).
+    // scalastyle:off println
+    println("=== EXT-SCALE: cross-relation predicate (star) - generality, ~parity ===")
+    // scalastyle:on println
+    Seq(4000, 8000, 16000, 24000).foreach { n =>
+      genStar(n, 1000)
+      scaleRow(s"n=$n fanout=${n / 1000}",
+        "select count(*) as c, sum(f.fm) as s from sc_f f join sc_d1 d1 on f.a = d1.a " +
+          "join sc_d2 d2 on f.a = d2.a where d1.x + d2.y > 100", rewriteOn, k = 3)
+    }
+  }
+
+  test("scaling: LEFT and FULL OUTER - matched-half reduction as fan-out grows") {
+    // scalastyle:off println
+    println("=== EXT-SCALE: outer joins (matched half routed through the count-join) ===")
+    // scalastyle:on println
+    Seq(4000, 8000, 16000, 24000).foreach { n =>
+      genOuterScale(n, 1000)
+      scaleRow(s"LEFT n=$n",
+        "select g, count(*) as c, count(d.x) as cx, sum(d.x) as sx " +
+          "from so_f f left join so_d d on f.k = d.k group by g", rewriteOn, k = 3)
+      scaleRow(s"FULL n=$n",
+        "select g, count(*) as c, count(d.x) as cx, sum(d.x) as sx " +
+          "from so_f f full outer join so_d d on f.k = d.k group by g", rewriteOn, k = 3)
+    }
+  }
+
+  test("scaling: cyclic triangle on a denser graph - parity (no regression)") {
+    // scalastyle:off println
+    println("=== EXT-SCALE: cyclic triangle count(*) (bag == vanilla join; parity) ===")
+    // scalastyle:on println
+    Seq(3000, 6000, 12000).foreach { n =>
+      genTriangleScale(n, 300)
+      scaleRow(s"triangle n=$n",
+        "select count(*) as c from st_r r join st_s s on r.b = s.b " +
+          "join st_t t on r.a = t.a and s.c = t.c", cyclicOn, k = 3)
+    }
+  }
 }
