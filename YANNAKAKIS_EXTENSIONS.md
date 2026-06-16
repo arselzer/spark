@@ -101,6 +101,46 @@ queries. Two cyclic extensions were investigated and deliberately **not** implem
 work*): multiple disjoint cyclic components (near-degenerate in connected queries), and bag
 join-order robustness (unreachable — Spark's `ReorderJoin` delivers a connected order).
 
+## Extension 4 — Higher-moment / statistical aggregates (on by default)
+
+**Mechanism.** `AVG` already showed that a fan-out-weighted aggregate decomposes into count-weighted
+partials (`SUM(x·count)/SUM(count)`). The second moments are the same idea one degree up. Over a
+fan-out join each reduced row carries value `x` with multiplicity `count`, so the moment is a
+*count-weighted* moment, computed from count-weighted power sums:
+`n = SUM(c)`, `Sx = SUM(x·c)`, `Sxx = SUM(x²·c)` (and `Sy, Syy, Sxy` for two-column forms), all over
+non-null inputs. From these:
+
+- `VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP`: `m2 = Sxx − Sx²/n`, then `m2/n`, `m2/(n−1)`, `√·`.
+- `COVAR_POP/COVAR_SAMP/CORR`: `ck = Sxy − Sx·Sy/n`, `xMk = Sxx − Sx²/n`, `yMk = Syy − Sy²/n`, then
+  `ck/n`, `ck/(n−1)`, `ck/√(xMk·yMk)`.
+- `regr_count/avgx/avgy/sxx/syy` are Spark `RuntimeReplaceableAggregate`s that expand to
+  `Count`/`Average`/variance before the rule runs, so they ride the existing paths for free.
+
+In each case the rewrite reproduces Spark's `CentralMomentAgg`/`Covariance`/`Corr`
+`evaluateExpression` **exactly** — same `n=0`/`n=1` guards and `nullOnDivideByZero` result — so values
+and schema match. The power-sum form equals Spark's Welford recurrence in exact arithmetic; on the
+value ranges these queries hit it agrees to floating-point tolerance. This gives an in-database
+statistical/ML-aggregate capability over joins for free from the count machinery.
+
+**Correctness.** A moment-only query is fan-out-SENSITIVE, so it must take the counting path (not the
+0MA semijoin path, which would drop the fan-out and yield an unweighted moment). **Falls back:**
+`DECIMAL`/interval moments (precision parity), `DISTINCT` moments, skew/kurtosis (3rd/4th), and the
+`DeclarativeAggregate` regr forms (`regr_slope/intercept/r2/sxy`).
+
+## Cost gate (fan-out-aware; off by default)
+
+The rewrite is not always a win: on a no-fan-out join the count machinery only adds overhead. The
+cost gate decides whether to fire. Crucially, the signal is **fan-out**, not input size: the
+count-join's benefit is the *intermediate* blow-up, which is independent of how big the inputs are. A
+size-only gate is actively wrong — on STATS-CEB every table is broadcast-eligible, so a broadcast-size
+gate skips **all 146** queries, throwing away the **7** where vanilla does-not-finish (>5–60×). The
+gate therefore skips only when vanilla is broadcast-friendly **and** there is no high-fan-out join key
+(a key shared by ≥3 relations — a multi-way star — signals multiplicative fan-out). The asymmetry
+favours keeping (wrongly applying = a little overhead; wrongly skipping a fan-out query =
+catastrophic). With this gate, STATS-CEB skips drop **146→13** with **0** wins thrown away.
+*Limitation:* a structural signal — chain fan-out (degree-2 per level) is not captured; a full
+cardinality-based gate needs column NDV statistics (future work).
+
 ## Evaluation
 
 ### Correctness (primary evidence)
@@ -174,6 +214,11 @@ fan-out reduction, demonstrated by the curve above and the real-data results.
 - **DECIMAL/interval AVG, DISTINCT, percentile over outer joins.** Double-output AVG is supported
   (`sum`+`count` carry). DECIMAL/interval AVG falls back pending exact precision parity with Spark's
   `Average`; DISTINCT and percentile do not decompose across the union.
+- **Statistical aggregates** (Extension 4): VAR/STDDEV/COVAR/CORR (+ runtime-replaceable `regr_*`)
+  are supported for the DoubleType-output case. DECIMAL/interval moments, DISTINCT moments,
+  3rd/4th moments (skew/kurtosis), and the DeclarativeAggregate `regr_slope/intercept/r2/sxy` fall
+  back. A numerically-stable (vs power-sum) reconstruction is future work, though it is immaterial at
+  the value ranges tested.
 - **Cyclic is generality-only.** The bag uses binary joins. A genuine performance contribution on
   cyclic queries requires a worst-case-optimal join *that aggregates*. Concretely: because the bag
   is **counted** and never enumerated, the relevant cost is `N^fhtw` and, on irreducible chordless

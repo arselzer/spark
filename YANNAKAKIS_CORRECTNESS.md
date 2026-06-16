@@ -82,6 +82,17 @@ the definitions of the aggregates evaluated on the annotated `π_{U_ρ}J`, which
 `J` because projecting onto a superset of `G ∪ refs(𝒜)` is loss-free for these aggregates. (4) needs
 only `supp`, preserved by Lemma 2. (5) is the quotient. ∎
 
+**Corollary 1.1 (second moments).** `VAR_POP/VAR_SAMP/STDDEV_*`, `COVAR_*`, and `CORR` are likewise
+computable from count-weighted power sums over `π_{U_ρ}J`. Writing `n = Σ count` (over non-null
+inputs), `Sx = SUM(x·count)`, `Sxx = SUM(x²·count)` (and `Sy,Syy,Sxy` two-column), the second central
+moment `m2 = Sxx − Sx²/n` equals `Σ_t (x(t) − x̄)² · count_ρ(t)` — the moment over `J` — by Theorem 1
+applied to the derived expressions `x²` and `x` (both functions of the carried `x`). The variances /
+covariances / correlation are the standard rational/√ functions of `(n, m2)` resp. `(n, ck, xMk,
+yMk)`; the rewrite emits exactly Spark's `evaluateExpression` (same `n=0`/`n=1` guards), so it agrees
+with vanilla in exact arithmetic. (Spark computes `m2` by Welford rather than power sums; the two are
+equal over ℝ but differ in finite precision — immaterial at the tested ranges, a numerically-stable
+variant is future work.) These are fan-out-SENSITIVE, hence the counting path (next paragraph). ∎
+
 **Duplicate-insensitive ("0MA") path.** When all aggregates are duplicate-insensitive
 (`MIN`,`MAX`,`COUNT(DISTINCT)`,`SUM(DISTINCT)`,…), fan-out is irrelevant: only `supp(π J)` matters. The
 rewrite then uses a pure `LeftSemi` semijoin reduction (no count column), correct by Lemma 1. The
