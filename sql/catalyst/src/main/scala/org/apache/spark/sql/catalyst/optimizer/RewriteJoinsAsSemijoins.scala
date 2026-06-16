@@ -832,6 +832,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             if (!aggregateExpressions.forall(ae => ae.aggregateFunction match {
               case _: Count | _: Percentile | _: Average | _: Sum => true
               case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp => true
+              case _: CovPopulation | _: CovSample | _: Corr => true
               case _ => false
             })) {
               debugLog("guarded: unsupported aggregate function present - keeping original plan")
@@ -975,6 +976,49 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                       case _ => nullD // unreachable: outer match restricts to the four above
                     }
                     Cast(res, aggExpr.dataType)
+
+                  case _: CovPopulation | _: CovSample | _: Corr =>
+                    // Two-column 2nd moment over a fan-out join, COUNT-WEIGHTED. A row contributes
+                    // only when BOTH x and y are non-null (matching Spark). From count-weighted
+                    // power sums n, Sx, Sy, Sxx, Syy, Sxy form ck = Sxy - Sx*Sy/n (= n*covar_pop),
+                    // xMk = Sxx - Sx^2/n, yMk = Syy - Sy^2/n, then reproduce Spark's
+                    // Covariance/Corr evaluateExpression EXACTLY (n==0 / n==1 guards).
+                    val (cx, cy, nodz) = aggFn match {
+                      case c: CovPopulation => (c.left, c.right, c.nullOnDivideByZero)
+                      case c: CovSample => (c.left, c.right, c.nullOnDivideByZero)
+                      case c: Corr => (c.x, c.y, c.nullOnDivideByZero)
+                      case _ => (aggFn.children.head, aggFn.children(1), true)
+                    }
+                    val xD = Cast(cx, DoubleType)
+                    val yD = Cast(cy, DoubleType)
+                    val cD = Cast(countingAttribute, DoubleType)
+                    val nullPair = Or(IsNull(cx), IsNull(cy))
+                    def gsum2(e: Expression): Expression =
+                      Sum(If(nullPair, Literal(0.0, DoubleType), e)).toAggregateExpression()
+                    val nAgg2: Expression = Cast(Sum(If(nullPair, Literal(0L, LongType),
+                      countingAttribute)).toAggregateExpression(), DoubleType)
+                    val sX = gsum2(Multiply(xD, cD))
+                    val sY = gsum2(Multiply(yD, cD))
+                    val sXX = gsum2(Multiply(Multiply(xD, xD), cD))
+                    val sYY = gsum2(Multiply(Multiply(yD, yD), cD))
+                    val sXY = gsum2(Multiply(Multiply(xD, yD), cD))
+                    val ck = Subtract(sXY, Divide(Multiply(sX, sY), nAgg2))
+                    val xMk = Subtract(sXX, Divide(Multiply(sX, sX), nAgg2))
+                    val yMk = Subtract(sYY, Divide(Multiply(sY, sY), nAgg2))
+                    val zero2 = Literal(0.0, DoubleType)
+                    val one2 = Literal(1.0, DoubleType)
+                    val nullD2 = Literal.create(null, DoubleType)
+                    val dz2: Expression =
+                      if (nodz) nullD2 else Literal(Double.NaN, DoubleType)
+                    val res2 = aggFn match {
+                      case _: CovPopulation => If(EqualTo(nAgg2, zero2), nullD2, Divide(ck, nAgg2))
+                      case _: CovSample => If(EqualTo(nAgg2, zero2), nullD2,
+                        If(EqualTo(nAgg2, one2), dz2, Divide(ck, Subtract(nAgg2, one2))))
+                      case _: Corr => If(EqualTo(nAgg2, zero2), nullD2,
+                        If(EqualTo(nAgg2, one2), dz2, Divide(ck, Sqrt(Multiply(xMk, yMk)))))
+                      case _ => nullD2 // unreachable
+                    }
+                    Cast(res2, aggExpr.dataType)
                 }
               case other => other.mapChildren(rewriteGuardedAggregate)
             }
@@ -1553,6 +1597,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       case Subtract(l, r, _) => isMoment(l) || isMoment(r)
       case AggregateExpression(aggFn, _, isDistinct, _, _) => aggFn match {
         case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp => !isDistinct
+        case _: CovPopulation | _: CovSample | _: Corr => !isDistinct
         case _ => false
       }
       case _ => false

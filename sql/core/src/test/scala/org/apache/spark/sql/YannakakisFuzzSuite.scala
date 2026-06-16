@@ -148,7 +148,7 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     val numCols = Seq("f.fm1", "f.fm2", "f.fm3") ++ usedDims.map(i => s"d$i.d${i}v")
     val allCols = numCols ++ usedDims.map(i => s"d$i.d${i}g") ++ Seq("f.k1")
 
-    def agg(rng: Random): String = rng.nextInt(12) match {
+    def agg(rng: Random): String = rng.nextInt(15) match {
       case 0 => "count(*)"
       case 1 => s"count(${pick(rng, allCols)})"
       case 2 => s"count(distinct ${pick(rng, allCols)})"
@@ -161,7 +161,11 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
       case 8 => s"var_samp(${pick(rng, numCols)})"
       case 9 => s"var_pop(${pick(rng, numCols)})"
       case 10 => s"stddev_samp(${pick(rng, numCols)})"
-      case _ => s"stddev_pop(${pick(rng, numCols)})"
+      case 11 => s"stddev_pop(${pick(rng, numCols)})"
+      // two-column 2nd moments.
+      case 12 => s"covar_pop(${pick(rng, numCols)}, ${pick(rng, numCols)})"
+      case 13 => s"covar_samp(${pick(rng, numCols)}, ${pick(rng, numCols)})"
+      case _ => s"corr(${pick(rng, numCols)}, ${pick(rng, numCols)})"
     }
     val nAgg = 1 + rng.nextInt(3)
     val aggSelect = (0 until nAgg).map(j => s"${agg(rng)} as a$j")
@@ -199,39 +203,67 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     val iters = sys.env.getOrElse("FUZZ_ITERS", "250").toInt
     val failures = ArrayBuffer[String]()
     var checked = 0
+    var skipped = 0
     (1 to iters).foreach { seed =>
       val rng = new Random(seed.toLong)
       registerTables(rng)
       val query = genQuery(rng)
-      try {
-        var vSchema: StructType = null
-        var vRows: Seq[Row] = null
-        withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
-          val df = sql(query); vSchema = df.schema; vRows = df.collect().toSeq
-        }
-        withSQLConf(yannakakisOn: _*) {
-          val df = sql(query)
-          val rSchema = df.schema
-          if (!schemaMatch(rSchema, vSchema)) {
-            failures += s"seed=$seed SCHEMA ${rSchema.catalogString} != " +
-              s"${vSchema.catalogString}\n$query"
-          } else {
-            val rRows = df.collect().toSeq
-            if (!rowsMatch(rRows, vRows)) {
-              failures += s"seed=$seed VALUES (${rRows.size} vs ${vRows.size} rows)\n$query"
+      // Run vanilla FIRST. If the query itself throws under ANSI (e.g. a degenerate cross-relation
+      // corr that Spark divide-by-zeros on), it is not a valid rewrite-correctness test - the
+      // rewrite faithfully reproduces vanilla (often by falling back) including the throw - so skip
+      // it. Only compare when vanilla succeeds; then an exception/diff is genuinely the rewrite's.
+      val vanilla: Option[(StructType, Seq[Row])] =
+        try withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+          val df = sql(query); Some((df.schema, df.collect().toSeq))
+        } catch { case _: Throwable => None }
+      vanilla match {
+        case None => skipped += 1
+        case Some((vSchema, vRows)) =>
+          try withSQLConf(yannakakisOn: _*) {
+            val df = sql(query)
+            val rSchema = df.schema
+            if (!schemaMatch(rSchema, vSchema)) {
+              failures += s"seed=$seed SCHEMA ${rSchema.catalogString} != " +
+                s"${vSchema.catalogString}\n$query"
+            } else {
+              val rRows = df.collect().toSeq
+              if (!rowsMatch(rRows, vRows)) {
+                failures += s"seed=$seed VALUES (${rRows.size} vs ${vRows.size} rows)\n$query"
+              }
             }
+            checked += 1
+          } catch {
+            case e: Throwable =>
+              failures += s"seed=$seed REWRITE-ONLY EXCEPTION ${e.getClass.getSimpleName}: " +
+                s"${Option(e.getMessage).getOrElse("")}\n$query"
           }
-        }
-        checked += 1
-      } catch {
-        case e: Throwable => failures += s"seed=$seed EXCEPTION ${e.getClass.getSimpleName}: " +
-          s"${Option(e.getMessage).getOrElse("")}\n$query"
       }
     }
-    info(s"fuzz: checked $checked/$iters queries, ${failures.size} failures")
+    info(s"fuzz: checked $checked/$iters queries ($skipped skipped: vanilla threw), " +
+      s"${failures.size} failures")
     assert(failures.isEmpty,
       s"${failures.size}/$iters fuzz failures (showing up to 12):\n" +
         failures.take(12).mkString("\n----\n"))
+  }
+
+  // DIAGNOSTIC (ignore()d): reproduce specific acyclic seeds, running vanilla and rewrite apart
+  // to tell whether an EXCEPTION is the fuzzer emitting an ANSI-invalid query (vanilla throws too)
+  // or a rewrite bug (only rewrite throws). Flip to test() and -z to use.
+  ignore("DIAGNOSTIC acyclic repro of specific seeds") {
+    val seeds = sys.env.getOrElse("REPRO_SEEDS", "126,133,160,167,194,258").split(",").map(_.toInt)
+    // scalastyle:off println
+    seeds.foreach { seed =>
+      val rng = new Random(seed.toLong)
+      registerTables(rng)
+      val q = genQuery(rng)
+      def run(conf: Seq[(String, String)]): String =
+        try { withSQLConf(conf: _*) { sql(q).collect() }; "ok" }
+        catch { case e: Throwable => e.getClass.getSimpleName }
+      val v = run(Seq(SQLConf.YANNAKAKIS_ENABLED.key -> "false"))
+      val r = run(yannakakisOn)
+      println(s"REPRO seed=$seed vanilla=$v rewrite=$r\n  $q")
+    }
+    // scalastyle:on println
   }
 
   private val cyclicBagsOn =

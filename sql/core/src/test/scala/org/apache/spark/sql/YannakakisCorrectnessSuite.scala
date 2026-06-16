@@ -125,6 +125,28 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "variance/stddev over a fan-out join")
   }
 
+  test("COVAR/CORR over a fan-out join match vanilla and accelerate") {
+    Seq((1, 10.0, 1.0), (1, 20.0, 4.0), (2, 30.0, 9.0))
+      .toDF("k", "x", "y").createOrReplaceTempView("mc_fact")
+    Seq(1, 1, 1, 2).toDF("k").createOrReplaceTempView("mc_dim") // k=1 fan-out 3
+    assertMomentAccelerated(
+      """select covar_pop(x, y) as cp, covar_samp(x, y) as cs, corr(x, y) as cr
+         from mc_fact f join mc_dim d on f.k = d.k""",
+      "covar_pop/covar_samp/corr over a fan-out join")
+  }
+
+  test("regr_* (runtime-replaceable) over a fan-out join match vanilla") {
+    Seq((1, 10.0, 1.0), (1, 20.0, 4.0), (2, 30.0, 9.0))
+      .toDF("k", "x", "y").createOrReplaceTempView("mr_fact")
+    Seq(1, 1, 1, 2).toDF("k").createOrReplaceTempView("mr_dim")
+    // regr_count/avgx/avgy/sxx/syy are RuntimeReplaceableAggregate -> Count/Average/var, which the
+    // count-join already handles. Just assert correctness (these expand before the rule sees them).
+    assertSameResults(
+      """select regr_count(y, x) as rc, regr_avgx(y, x) as rax, regr_avgy(y, x) as ray
+         from mr_fact f join mr_dim d on f.k = d.k""",
+      "regr_count/avgx/avgy over a fan-out join")
+  }
+
   test("VARIANCE grouped, integer measure, with count(*) matches vanilla") {
     Seq((1, "A", 5), (1, "A", 15), (2, "B", 30), (3, "B", 30))
       .toDF("k", "g", "v").createOrReplaceTempView("mv2_fact")
