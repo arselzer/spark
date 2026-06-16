@@ -832,7 +832,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             if (!aggregateExpressions.forall(ae => ae.aggregateFunction match {
               case _: Count | _: Percentile | _: Average | _: Sum => true
               case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp => true
+              case _: Skewness | _: Kurtosis => true
               case _: CovPopulation | _: CovSample | _: Corr => true
+              case _: RegrSlope | _: RegrIntercept | _: RegrR2 | _: RegrSXY => true
               case _ => false
             })) {
               debugLog("guarded: unsupported aggregate function present - keeping original plan")
@@ -941,14 +943,16 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                     // DECIMAL(38,6)); cast back so the rewritten output schema matches vanilla.
                     Cast(widenedSum, aggExpr.dataType)
 
-                  case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp =>
-                    // A 2nd central moment over a fan-out join: each reduced row carries value x
-                    // with multiplicity `count`, so this is a COUNT-WEIGHTED moment. Compute it
-                    // from count-weighted, null-x-guarded power sums n=SUM(c), Sx=SUM(x*c),
-                    // Sxx=SUM(x^2*c) (over the count-join output), form m2 = Sxx - Sx^2/n (=Welford
-                    // exact arithmetic), then reproduce Spark's CentralMomentAgg.evaluateExpression
-                    // EXACTLY - same n==0 / n==1 guards and divide-by-zero result - so values and
-                    // schema match. NULL x is excluded, matching Spark.
+                  case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp
+                     | _: Skewness | _: Kurtosis =>
+                    // A central moment over a fan-out join: each reduced row carries value x with
+                    // multiplicity `count`, so this is a COUNT-WEIGHTED moment. Compute it from
+                    // count-weighted, null-x-guarded power sums n=SUM(c), Sx=SUM(x*c),
+                    // Sxx=SUM(x^2*c) (+ Sxxx/Sxxxx for 3rd/4th), form the central sums m2/m3/m4 (=
+                    // Welford's in exact arithmetic), then reproduce Spark's CentralMomentAgg
+                    // evaluateExpression EXACTLY - same n==0 / n==1 / m2==0 guards and the
+                    // divide-by-zero result. NULL x excluded. (Sxxx/Sxxxx are referenced only by
+                    // skew/kurtosis, so var/stddev plans are unchanged.)
                     val x = aggFn.asInstanceOf[CentralMomentAgg].child
                     val xD = Cast(x, DoubleType)
                     val cD = Cast(countingAttribute, DoubleType)
@@ -961,9 +965,21 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                     val m2 = Subtract(sxx, Divide(Multiply(sx, sx), nAgg))
                     val zero = Literal(0.0, DoubleType)
                     val one = Literal(1.0, DoubleType)
+                    val three = Literal(3.0, DoubleType)
                     val nullD = Literal.create(null, DoubleType)
                     def dz(nodz: Boolean): Expression =
                       if (nodz) nullD else Literal(Double.NaN, DoubleType)
+                    // central sums m3/m4 from raw power sums (used only by skew/kurtosis)
+                    lazy val mean = Divide(sx, nAgg)
+                    lazy val sxxx = gsum(Multiply(Multiply(Multiply(xD, xD), xD), cD))
+                    lazy val sxxxx =
+                      gsum(Multiply(Multiply(Multiply(Multiply(xD, xD), xD), xD), cD))
+                    lazy val m3 = Subtract(Add(sxxx, Multiply(Literal(2.0, DoubleType),
+                      Multiply(Multiply(mean, mean), sx))), Multiply(three, Multiply(mean, sxx)))
+                    lazy val m4 = Add(Subtract(Subtract(sxxxx,
+                      Multiply(Literal(4.0, DoubleType), Multiply(mean, sxxx))),
+                      Multiply(three, Multiply(Multiply(mean, mean), Multiply(mean, sx)))),
+                      Multiply(Literal(6.0, DoubleType), Multiply(Multiply(mean, mean), sxx)))
                     val res = aggFn match {
                       case _: VariancePop => If(EqualTo(nAgg, zero), nullD, Divide(m2, nAgg))
                       case _: StddevPop => If(EqualTo(nAgg, zero), nullD, Sqrt(Divide(m2, nAgg)))
@@ -973,20 +989,33 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                       case s: StddevSamp => If(EqualTo(nAgg, zero), nullD,
                         If(EqualTo(nAgg, one), dz(s.nullOnDivideByZero),
                           Sqrt(Divide(m2, Subtract(nAgg, one)))))
-                      case _ => nullD // unreachable: outer match restricts to the four above
+                      case sk: Skewness => If(EqualTo(nAgg, zero), nullD,
+                        If(EqualTo(m2, zero), dz(sk.nullOnDivideByZero),
+                          Divide(Multiply(Sqrt(nAgg), m3), Sqrt(Multiply(Multiply(m2, m2), m2)))))
+                      case k: Kurtosis => If(EqualTo(nAgg, zero), nullD,
+                        If(EqualTo(m2, zero), dz(k.nullOnDivideByZero),
+                          Subtract(Divide(Multiply(nAgg, m4), Multiply(m2, m2)), three)))
+                      case _ => nullD // unreachable: outer match restricts to the six above
                     }
                     Cast(res, aggExpr.dataType)
 
-                  case _: CovPopulation | _: CovSample | _: Corr =>
+                  case _: CovPopulation | _: CovSample | _: Corr
+                     | _: RegrSlope | _: RegrIntercept | _: RegrR2 | _: RegrSXY =>
                     // Two-column 2nd moment over a fan-out join, COUNT-WEIGHTED. A row contributes
                     // only when BOTH x and y are non-null (matching Spark). From count-weighted
                     // power sums n, Sx, Sy, Sxx, Syy, Sxy form ck = Sxy - Sx*Sy/n (= n*covar_pop),
                     // xMk = Sxx - Sx^2/n, yMk = Syy - Sy^2/n, then reproduce Spark's
-                    // Covariance/Corr evaluateExpression EXACTLY (n==0 / n==1 guards).
+                    // Covariance/Corr/regression evaluateExpression EXACTLY. For the regr_* family
+                    // cx is the INDEPENDENT variable (so xMk = var of the regressor) and cy the
+                    // dependent one; regr children are (y, x) = (dependent, independent).
                     val (cx, cy, nodz) = aggFn match {
                       case c: CovPopulation => (c.left, c.right, c.nullOnDivideByZero)
                       case c: CovSample => (c.left, c.right, c.nullOnDivideByZero)
                       case c: Corr => (c.x, c.y, c.nullOnDivideByZero)
+                      case r: RegrSlope => (r.right, r.left, true)
+                      case r: RegrIntercept => (r.right, r.left, true)
+                      case r: RegrR2 => (r.x, r.y, true)
+                      case r: RegrSXY => (r.x, r.y, true)
                       case _ => (aggFn.children.head, aggFn.children(1), true)
                     }
                     val xD = Cast(cx, DoubleType)
@@ -1010,12 +1039,24 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                     val nullD2 = Literal.create(null, DoubleType)
                     val dz2: Expression =
                       if (nodz) nullD2 else Literal(Double.NaN, DoubleType)
+                    // regr_* use xMk = var(independent), yMk = var(dependent); slope = ck/xMk,
+                    // intercept = yAvg - slope*xAvg, r2 = ck^2/(xMk*yMk), sxy = ck. The n==0 guard
+                    // also covers the m2-buffer-is-0 case Spark returns null/1.0 on.
                     val res2 = aggFn match {
                       case _: CovPopulation => If(EqualTo(nAgg2, zero2), nullD2, Divide(ck, nAgg2))
                       case _: CovSample => If(EqualTo(nAgg2, zero2), nullD2,
                         If(EqualTo(nAgg2, one2), dz2, Divide(ck, Subtract(nAgg2, one2))))
                       case _: Corr => If(EqualTo(nAgg2, zero2), nullD2,
                         If(EqualTo(nAgg2, one2), dz2, Divide(ck, Sqrt(Multiply(xMk, yMk)))))
+                      case _: RegrSlope => If(EqualTo(nAgg2, zero2), nullD2,
+                        If(EqualTo(xMk, zero2), nullD2, Divide(ck, xMk)))
+                      case _: RegrIntercept => If(EqualTo(nAgg2, zero2), nullD2,
+                        If(EqualTo(xMk, zero2), nullD2, Subtract(Divide(sY, nAgg2),
+                          Multiply(Divide(ck, xMk), Divide(sX, nAgg2)))))
+                      case _: RegrR2 => If(EqualTo(nAgg2, zero2), nullD2,
+                        If(EqualTo(xMk, zero2), nullD2, If(EqualTo(yMk, zero2), one2,
+                          Divide(Multiply(ck, ck), Multiply(xMk, yMk)))))
+                      case _: RegrSXY => If(EqualTo(nAgg2, zero2), nullD2, ck)
                       case _ => nullD2 // unreachable
                     }
                     Cast(res2, aggExpr.dataType)
@@ -1597,7 +1638,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       case Subtract(l, r, _) => isMoment(l) || isMoment(r)
       case AggregateExpression(aggFn, _, isDistinct, _, _) => aggFn match {
         case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp => !isDistinct
+        case _: Skewness | _: Kurtosis => !isDistinct
         case _: CovPopulation | _: CovSample | _: Corr => !isDistinct
+        case _: RegrSlope | _: RegrIntercept | _: RegrR2 | _: RegrSXY => !isDistinct
         case _ => false
       }
       case _ => false

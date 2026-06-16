@@ -148,7 +148,7 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     val numCols = Seq("f.fm1", "f.fm2", "f.fm3") ++ usedDims.map(i => s"d$i.d${i}v")
     val allCols = numCols ++ usedDims.map(i => s"d$i.d${i}g") ++ Seq("f.k1")
 
-    def agg(rng: Random): String = rng.nextInt(15) match {
+    def agg(rng: Random): String = rng.nextInt(21) match {
       case 0 => "count(*)"
       case 1 => s"count(${pick(rng, allCols)})"
       case 2 => s"count(distinct ${pick(rng, allCols)})"
@@ -165,7 +165,14 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
       // two-column 2nd moments.
       case 12 => s"covar_pop(${pick(rng, numCols)}, ${pick(rng, numCols)})"
       case 13 => s"covar_samp(${pick(rng, numCols)}, ${pick(rng, numCols)})"
-      case _ => s"corr(${pick(rng, numCols)}, ${pick(rng, numCols)})"
+      case 14 => s"corr(${pick(rng, numCols)}, ${pick(rng, numCols)})"
+      // 3rd/4th moments + linear regression (the rest of the statistical-aggregate class).
+      case 15 => s"skewness(${pick(rng, numCols)})"
+      case 16 => s"kurtosis(${pick(rng, numCols)})"
+      case 17 => s"regr_slope(${pick(rng, numCols)}, ${pick(rng, numCols)})"
+      case 18 => s"regr_intercept(${pick(rng, numCols)}, ${pick(rng, numCols)})"
+      case 19 => s"regr_r2(${pick(rng, numCols)}, ${pick(rng, numCols)})"
+      case _ => s"regr_sxy(${pick(rng, numCols)}, ${pick(rng, numCols)})"
     }
     val nAgg = 1 + rng.nextInt(3)
     val aggSelect = (0 until nAgg).map(j => s"${agg(rng)} as a$j")

@@ -135,6 +135,26 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "covar_pop/covar_samp/corr over a fan-out join")
   }
 
+  test("SKEWNESS/KURTOSIS over a fan-out join match vanilla and accelerate") {
+    Seq((1, 10.0), (1, 20.0), (1, 35.0), (2, 30.0))
+      .toDF("k", "v").createOrReplaceTempView("mk_fact")
+    Seq(1, 1, 2).toDF("k").createOrReplaceTempView("mk_dim") // k=1 fan-out 2
+    assertMomentAccelerated(
+      "select skewness(v) as sk, kurtosis(v) as ku from mk_fact f join mk_dim d on f.k = d.k",
+      "skewness/kurtosis over a fan-out join")
+  }
+
+  test("REGR_SLOPE/INTERCEPT/R2/SXY over a fan-out join match vanilla and accelerate") {
+    Seq((1, 10.0, 1.0), (1, 20.0, 4.0), (2, 30.0, 9.0))
+      .toDF("k", "x", "y").createOrReplaceTempView("mg_fact")
+    Seq(1, 1, 1, 2).toDF("k").createOrReplaceTempView("mg_dim") // k=1 fan-out 3
+    assertMomentAccelerated(
+      """select regr_slope(y, x) as sl, regr_intercept(y, x) as ic,
+                regr_r2(y, x) as r2, regr_sxy(y, x) as sxy
+         from mg_fact f join mg_dim d on f.k = d.k""",
+      "regr_slope/intercept/r2/sxy over a fan-out join")
+  }
+
   test("regr_* (runtime-replaceable) over a fan-out join match vanilla") {
     Seq((1, 10.0, 1.0), (1, 20.0, 4.0), (2, 30.0, 9.0))
       .toDF("k", "x", "y").createOrReplaceTempView("mr_fact")
