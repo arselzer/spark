@@ -122,11 +122,21 @@ join topologies (triangles, k-cycles, and acyclic-with-a-cyclic-island) via GHD 
 
 ### Performance
 
-**Core (real data, established).** On TPC-H sf1 the count-join codegen is 1.03–2.69× over
-interpreted across all 22 queries (15 rewrite, 7 fall back; all 22 results match vanilla). On the
-Join-Order Benchmark (real IMDB) the rewrite is faster on 7/8 sampled queries, up to ~2.6× (e.g.
-17a 34s→13s, 16a 60s→28s); grouped-path codegen is ~1.7–1.9× over interpreted and ~3.5× over vanilla
-on JOB 1a.
+**Core (real data — full pass 2026-06-16, cost gate off to force the rewrite).** The speedup tracks
+the join's fan-out: dramatic where intermediates blow up, modest where they don't, always correct.
+
+- **STATS-CEB** (146 COUNT(*) join queries over the Stack-Exchange dataset): the rewrite fires on
+  **146/146**, **0 mismatches**, and **finishes all 146 while vanilla Spark does-not-finish 7 within
+  15 s** — those 7 are fan-out stars (e.g. a 5-way join on `UserId`) whose intermediates are
+  intractable to materialize but cheap to count (rewrite 0.25–2.8 s, i.e. **>5×…>60×**). Geomean
+  **1.21×** over the 139 both-finished (mostly tiny joins where the count-join's overhead shows —
+  the production cost gate skips those). This is the count-join's signature regime.
+- **Join-Order Benchmark** (real IMDB): all 8 sampled queries apply and match; speedup **up to
+  3.42×** (16a 60 s→17 s, 33a 23 s→7 s, 17a 2.88×), with count-join whole-stage codegen beating both
+  interpreted and vanilla (1a **4.3×** off→codegen).
+- **TPC-H sf1 & sf3**: all 22 match vanilla at both scales (15 apply, 7 fall back); codegen beats
+  interpreted on every query, and beats vanilla on the grouping-heavy count-join queries, growing
+  with scale (sf3 q7 **1.64×**, q10 **1.53×**), near-parity elsewhere (cost-gate territory).
 
 **Where the win is: the core fan-out reduction (synthetic scaling sweep, single machine, median of
 K runs).** The count-join's speedup comes from *not materializing fan-out*. On `SUM(f.fm)` over a
