@@ -369,13 +369,17 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     val countingAggregates = resultExpressions.filter(agg => isCounting(agg))
     val sumAggregates = resultExpressions.filter(agg => isSum(agg))
     val averageAggregates = resultExpressions.filter(agg => isAverage(agg))
+    // VAR/STDDEV are fan-out-sensitive (like sum/avg): a count-weighted moment. Handled on the
+    // guarded counting path via count-weighted power sums (see rewriteGuardedAggregate).
+    val momentAggregates = resultExpressions.filter(agg => isMoment(agg))
 
     if (zeroMAAggregates.isEmpty
       && percentileAggregates.isEmpty
       && countingAggregates.isEmpty
       && sumAggregates.isEmpty
-      && averageAggregates.isEmpty) {
-      debugLog("query is not applicable (0MA, counting, percentile, sum)")
+      && averageAggregates.isEmpty
+      && momentAggregates.isEmpty) {
+      debugLog("query is not applicable (0MA, counting, percentile, sum, moment)")
       agg
     }
     else {
@@ -769,9 +773,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
           if (countingAggregates.isEmpty
             && percentileAggregates.isEmpty
             && sumAggregates.isEmpty
-            && averageAggregates.isEmpty) {
+            && averageAggregates.isEmpty
+            && momentAggregates.isEmpty) {
             // 0MA query: all aggregates are duplicate-insensitive (min/max and DISTINCT
-            // count/sum/avg), so a bottom-up semijoin reduction suffices.
+            // count/sum/avg), so a bottom-up semijoin reduction suffices. (VAR/STDDEV are
+            // fan-out-SENSITIVE, so a moment-only query must take the counting path below.)
             val newAgg = if (hg.crossRelationFilters.nonEmpty) {
               // buildBottomUpJoins (pure LeftSemi reduction) cannot apply a non-equi predicate
               // spanning relations. Instead carry the filter's referenced attributes to the top
@@ -812,6 +818,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             // has no case and would MatchError mid-optimization. Fall back instead of crashing.
             if (!aggregateExpressions.forall(ae => ae.aggregateFunction match {
               case _: Count | _: Percentile | _: Average | _: Sum => true
+              case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp => true
               case _ => false
             })) {
               debugLog("guarded: unsupported aggregate function present - keeping original plan")
@@ -919,6 +926,42 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                     // The wide multiply can change the static type (a high-scale decimal clamps to
                     // DECIMAL(38,6)); cast back so the rewritten output schema matches vanilla.
                     Cast(widenedSum, aggExpr.dataType)
+
+                  case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp =>
+                    // A 2nd central moment over a fan-out join: each reduced row carries value x
+                    // with multiplicity `count`, so this is a COUNT-WEIGHTED moment. Compute it
+                    // from count-weighted, null-x-guarded power sums n=SUM(c), Sx=SUM(x*c),
+                    // Sxx=SUM(x^2*c) (over the count-join output), form m2 = Sxx - Sx^2/n (=Welford
+                    // exact arithmetic), then reproduce Spark's CentralMomentAgg.evaluateExpression
+                    // EXACTLY - same n==0 / n==1 guards and divide-by-zero result - so values and
+                    // schema match. NULL x is excluded, matching Spark.
+                    val x = aggFn.asInstanceOf[CentralMomentAgg].child
+                    val xD = Cast(x, DoubleType)
+                    val cD = Cast(countingAttribute, DoubleType)
+                    def gsum(e: Expression): Expression =
+                      Sum(If(IsNull(x), Literal(0.0, DoubleType), e)).toAggregateExpression()
+                    val nAgg: Expression = Cast(Sum(If(IsNull(x), Literal(0L, LongType),
+                      countingAttribute)).toAggregateExpression(), DoubleType)
+                    val sx = gsum(Multiply(xD, cD))
+                    val sxx = gsum(Multiply(Multiply(xD, xD), cD))
+                    val m2 = Subtract(sxx, Divide(Multiply(sx, sx), nAgg))
+                    val zero = Literal(0.0, DoubleType)
+                    val one = Literal(1.0, DoubleType)
+                    val nullD = Literal.create(null, DoubleType)
+                    def dz(nodz: Boolean): Expression =
+                      if (nodz) nullD else Literal(Double.NaN, DoubleType)
+                    val res = aggFn match {
+                      case _: VariancePop => If(EqualTo(nAgg, zero), nullD, Divide(m2, nAgg))
+                      case _: StddevPop => If(EqualTo(nAgg, zero), nullD, Sqrt(Divide(m2, nAgg)))
+                      case v: VarianceSamp => If(EqualTo(nAgg, zero), nullD,
+                        If(EqualTo(nAgg, one), dz(v.nullOnDivideByZero),
+                          Divide(m2, Subtract(nAgg, one))))
+                      case s: StddevSamp => If(EqualTo(nAgg, zero), nullD,
+                        If(EqualTo(nAgg, one), dz(s.nullOnDivideByZero),
+                          Sqrt(Divide(m2, Subtract(nAgg, one)))))
+                      case _ => nullD // unreachable: outer match restricts to the four above
+                    }
+                    Cast(res, aggExpr.dataType)
                 }
               case other => other.mapChildren(rewriteGuardedAggregate)
             }
@@ -1478,6 +1521,25 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       case Subtract(l, r, _) => isAverage(l) || isAverage(r)
       case AggregateExpression(aggFn, mode, isDistinct, filter, resultId) => aggFn match {
         case Average(_, _) => !isDistinct
+        case _ => false
+      }
+      case _ => false
+    }
+  }
+
+  // VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP - 2nd central moments, fan-out-sensitive, handled via
+  // count-weighted power sums (see rewriteGuardedAggregate). Higher moments (skew/kurtosis) and
+  // covariance/corr/regression are not (yet) handled and fall back.
+  def isMoment(expr: Expression): Boolean = {
+    expr match {
+      case Alias(child, _) => isMoment(child)
+      case ToPrettyString(child, _) => isMoment(child)
+      case Multiply(l, r, _) => isMoment(l) || isMoment(r)
+      case Divide(l, r, _) => isMoment(l) || isMoment(r)
+      case Add(l, r, _) => isMoment(l) || isMoment(r)
+      case Subtract(l, r, _) => isMoment(l) || isMoment(r)
+      case AggregateExpression(aggFn, _, isDistinct, _, _) => aggFn match {
+        case _: VariancePop | _: VarianceSamp | _: StddevPop | _: StddevSamp => !isDistinct
         case _ => false
       }
       case _ => false

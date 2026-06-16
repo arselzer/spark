@@ -79,6 +79,35 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  /** Higher-moment aggregate over a fan-out join: matches vanilla AND the count-join fired. */
+  private def assertMomentAccelerated(query: String, hint: String): Unit = {
+    assertSameResults(query, hint)
+    withSQLConf(yannakakisOn: _*) {
+      assert(sql(query).queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        s"$hint: expected the count-join to fire for the moment aggregate")
+    }
+  }
+
+  test("VARIANCE/STDDEV over a fan-out join match vanilla and accelerate") {
+    Seq((1, 10.0), (1, 20.0), (2, 30.0)).toDF("k", "v").createOrReplaceTempView("mv_fact")
+    Seq(1, 1, 1, 2).toDF("k").createOrReplaceTempView("mv_dim") // k=1 fan-out 3, k=2 fan-out 1
+    assertMomentAccelerated(
+      """select var_samp(f.v) as vs, var_pop(f.v) as vp,
+                stddev_samp(f.v) as ss, stddev_pop(f.v) as sp
+         from mv_fact f join mv_dim d on f.k = d.k""",
+      "variance/stddev over a fan-out join")
+  }
+
+  test("VARIANCE grouped, integer measure, with count(*) matches vanilla") {
+    Seq((1, "A", 5), (1, "A", 15), (2, "B", 30), (3, "B", 30))
+      .toDF("k", "g", "v").createOrReplaceTempView("mv2_fact")
+    Seq(1, 1, 2, 3, 3).toDF("k").createOrReplaceTempView("mv2_dim")
+    assertMomentAccelerated(
+      "select g, var_samp(v) as vs, stddev_pop(v) as sp, count(*) as c " +
+        "from mv2_fact f join mv2_dim d on f.k = d.k group by g",
+      "grouped variance with an integer measure")
+  }
+
   /**
    * With the rewrite on, asserts the count-join is whole-stage-codegen'd and that running the
    * query with whole-stage codegen ON produces identical rows to running it with codegen OFF

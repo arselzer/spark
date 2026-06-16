@@ -148,7 +148,7 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
     val numCols = Seq("f.fm1", "f.fm2", "f.fm3") ++ usedDims.map(i => s"d$i.d${i}v")
     val allCols = numCols ++ usedDims.map(i => s"d$i.d${i}g") ++ Seq("f.k1")
 
-    def agg(rng: Random): String = rng.nextInt(8) match {
+    def agg(rng: Random): String = rng.nextInt(12) match {
       case 0 => "count(*)"
       case 1 => s"count(${pick(rng, allCols)})"
       case 2 => s"count(distinct ${pick(rng, allCols)})"
@@ -156,7 +156,12 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
       case 4 => s"sum(distinct ${pick(rng, numCols)})"
       case 5 => s"avg(${pick(rng, numCols)})"
       case 6 => s"min(${pick(rng, allCols)})"
-      case _ => s"max(${pick(rng, allCols)})"
+      case 7 => s"max(${pick(rng, allCols)})"
+      // 2nd central moments: fan-out-sensitive, count-weighted-power-sum reconstruction.
+      case 8 => s"var_samp(${pick(rng, numCols)})"
+      case 9 => s"var_pop(${pick(rng, numCols)})"
+      case 10 => s"stddev_samp(${pick(rng, numCols)})"
+      case _ => s"stddev_pop(${pick(rng, numCols)})"
     }
     val nAgg = 1 + rng.nextInt(3)
     val aggSelect = (0 until nAgg).map(j => s"${agg(rng)} as a$j")
