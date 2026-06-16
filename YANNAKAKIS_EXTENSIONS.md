@@ -128,21 +128,36 @@ Join-Order Benchmark (real IMDB) the rewrite is faster on 7/8 sampled queries, u
 17a 34s→13s, 16a 60s→28s); grouped-path codegen is ~1.7–1.9× over interpreted and ~3.5× over vanilla
 on JOB 1a.
 
-**Extensions (synthetic micro-benchmark, `YannakakisExtensionsBenchmarkSuite`, indicative).**
-Small-scale, single-machine medians; the rewrite matches vanilla in every case:
+**Where the win is: the core fan-out reduction (synthetic scaling sweep, single machine, median of
+K runs).** The count-join's speedup comes from *not materializing fan-out*. On `SUM(f.fm)` over a
+fan-out star `F ⋈ d₁ ⋈ d₂` (no spanning predicate), the rewrite computes `SUM(fm·cnt₁·cnt₂)` over the
+reduced dims while vanilla materializes the `~n³/card²` blow-up. The rewrite stays flat as fan-out
+grows; vanilla does not, so the speedup grows with fan-out:
 
-| Scenario | vanilla | rewrite | speedup |
-| --- | --- | --- | --- |
-| cross-relation predicate over a fan-out chain | 207 ms | 157 ms | **1.32×** |
-| LEFT OUTER with fan-out + grouped aggregate | 296 ms | 283 ms | 1.05× |
-| FULL OUTER (three-branch split) | 664 ms | 661 ms | 1.00× |
-| cyclic triangle `count(*)` | 80 ms | 84 ms | 0.95× |
+| fan-out | intermediate ≈ | vanilla | rewrite | speedup |
+| --- | --- | --- | --- | --- |
+| 10 | 1 M  | 193 ms |  187 ms | 1.03× |
+| 25 | 16 M | 158 ms |  123 ms | 1.28× |
+| 45 | 91 M | 345 ms |  127 ms | 2.72× |
+| 70 | 343 M | 1279 ms | 166 ms | **7.70×** |
 
-These confirm the expected shape: the predicate path inherits the base reduction win (it grows with
-the chain's intermediate size); outer joins are perf-neutral generality wins; the cyclic bag is
-vanilla's join, so it is parity (a few percent of count-machinery overhead, no meaningful
-regression). The extensions' value is generality + correctness, not new speedups — consistent with
-the fact that TPC-H and JOB are acyclic inner-join workloads on which the extensions are inert.
+This is the same mechanism behind the real-data numbers above (TPC-H/JOB), shown cleanly in isolation.
+
+**The extensions are generality wins at parity, not perf wins.** Scaling sweeps (same harness) over
+the cross-relation predicate, LEFT/FULL outer, and cyclic cases hold at **parity within run-to-run
+variance** as scale grows, with the rewrite matching vanilla at every point:
+
+- *Cross-relation predicate* — the predicate `d₁.x + d₂.y > c` spans the two dims, so evaluating it
+  needs the `(x,y)` pairs, i.e. exactly the cross-product the count-join would otherwise avoid. Hence
+  parity, not reduction. (An earlier single-shot reading suggested ~1.3×; the scaling sweep shows
+  that was noise.)
+- *LEFT/FULL outer* — the matched half is reduced, but the anti half(s) add work; net parity.
+- *Cyclic* — the bag *is* vanilla's inner join, so parity by construction (a few percent of
+  count-machinery overhead, no meaningful regression).
+
+So the extensions' value is **generality + correctness**, consistent with TPC-H/JOB being acyclic
+inner-join workloads on which they are inert; the count-join's *performance* contribution is the core
+fan-out reduction, demonstrated by the curve above and the real-data results.
 
 ## Limitations and future work
 
