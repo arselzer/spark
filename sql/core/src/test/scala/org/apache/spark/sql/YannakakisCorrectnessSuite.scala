@@ -1095,6 +1095,29 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertCountJoinCodegenMatches(query, "pure-count 3-relation chain count(*)")
   }
 
+  test("codegen: non-grouped count-only count-join avoids aggregate buffers") {
+    // The logical CountJoin still carries a count(1) aggregate result, but the parent only consumes
+    // the fan-out count. Codegen should skip the dead aggregate buffer work.
+    Seq(1, 1, 2, 2, 2).toDF("k").createOrReplaceTempView("cng_a")
+    Seq(1, 2, 3).toDF("k").createOrReplaceTempView("cng_b")
+    val query = "select count(*) as c from cng_a a join cng_b b on a.k = b.k"
+    withSQLConf((yannakakisOn ++ Seq(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
+      val plan = sql(query).queryExecution.executedPlan
+      val countJoins = plan.collect {
+        case cj: HashCountJoin if cj.groupRight.isEmpty => cj
+      }
+      assert(countJoins.nonEmpty, s"expected a non-grouped count-join in:\n$plan")
+      val code = org.apache.spark.sql.execution.debug.codegenString(plan)
+      assert(!code.contains("cjBuf"),
+        s"non-grouped count-only codegen should not allocate aggregate buffers:\n$code")
+    }
+    assertCountJoinCodegenMatches(query, "non-grouped count-only",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
+  }
+
   // Forces the shuffled grouping count-join, asserts it is codegen-able, and that whole-stage
   // codegen ON produces the same rows as OFF (interpreted) and as vanilla. The gate for the
   // grouped-codegen buffer-update inlining.
@@ -1131,6 +1154,36 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "select g1, g2, sum(v) as s, count(*) as c from dg_a a, dg_f f, dg_b b, dg_d d " +
         "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2",
       "grouping decimal sum")
+  }
+
+  test("codegen: GROUPING count-only count-join avoids aggregate buffers") {
+    // g1 and g2 live on different dimensions, so the rewrite pushes grouping into a CountJoin.
+    // With only count(*), the grouped path should carry group counts without aggregate buffers.
+    Seq((1, "p"), (2, "q")).toDF("ak", "g1").createOrReplaceTempView("cog_a")
+    Seq((1, 10), (1, 11), (2, 10), (2, 11)).toDF("ak", "bk")
+      .createOrReplaceTempView("cog_f")
+    Seq((10, "x"), (11, "y")).toDF("bk", "g2").createOrReplaceTempView("cog_b")
+    Seq(1, 1, 2).toDF("ak").createOrReplaceTempView("cog_d")
+    val query = "select g1, g2, count(*) as c from cog_a a, cog_f f, cog_b b, cog_d d " +
+      "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2"
+    withSQLConf((yannakakisOn ++ Seq(
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
+      val plan = sql(query).queryExecution.executedPlan
+      val groupingCjs = plan.collect {
+        case cj: HashCountJoin if cj.groupRight.nonEmpty => cj
+      }
+      assert(groupingCjs.nonEmpty, s"expected a grouped count-join in:\n$plan")
+      assert(groupingCjs.forall(_.supportCodegen),
+        s"grouped count-only count-join should support whole-stage codegen:\n$plan")
+      val code = org.apache.spark.sql.execution.debug.codegenString(plan)
+      assert(code.contains("cjCountMap"),
+        s"grouped count-only codegen should use the count-map fast path:\n$code")
+      assert(!code.contains(".newBuffer()"),
+        s"grouped count-only codegen should not allocate aggregate buffers:\n$code")
+    }
+    assertGroupingCodegenMatches(query, "grouped count-only")
   }
 
   test("codegen: GROUPING count-join with multiple aggregates matches interpreted") {

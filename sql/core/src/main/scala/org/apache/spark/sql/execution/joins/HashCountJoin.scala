@@ -759,6 +759,9 @@ trait HashCountJoin extends JoinCodegenSupport {
     if (groupRight.nonEmpty) {
       return codegenCountGroupedInner(ctx, input)
     }
+    if (aggregateResultsUnusedByParent) {
+      return codegenCountOnlyInner(ctx, input)
+    }
     assert(buildSide == BuildRight, "count join must build the right side")
     val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
     if (isEmptyHashedRelation) {
@@ -878,13 +881,86 @@ trait HashCountJoin extends JoinCodegenSupport {
   }
 
   /**
+   * Inner count-join codegen when carried aggregate result columns are not consumed by the parent.
+   * It emits the fan-out count and null placeholders for the dead aggregate outputs.
+   */
+  protected def codegenCountOnlyInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+    assert(buildSide == BuildRight, "count join must build the right side")
+    assert(groupRight.isEmpty, "non-grouped count-only codegen cannot carry grouping keys")
+    assert(aggregateResultsUnusedByParent,
+      "count-only codegen cannot carry parent-visible aggregate results")
+    val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
+    if (isEmptyHashedRelation) {
+      return "// empty HashedRelation: count inner join returns nothing"
+    }
+    val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
+    val (matched, checkCondition, _) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
+    val numOutput = metricTerm(ctx, "numOutputRows")
+
+    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
+      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
+      .map(c => buildOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+
+    val rightCountSum = ctx.freshName("rightCountSum")
+    val leftCount = ctx.freshName("leftCount")
+    val countOut = ctx.freshName("countOut")
+
+    val leftCountSetup = if (leftCountOrdinal != -1) {
+      val eval = evaluateRequiredVariables(
+        streamedPlan.output, input, AttributeSet(countLeft.get.references))
+      s"$eval\nlong $leftCount = ${input(leftCountOrdinal).value};"
+    } else {
+      s"long $leftCount = 1L;"
+    }
+
+    val rightCountExpr =
+      if (rightCountOrdinal != -1) s"$matched.getLong($rightCountOrdinal)" else "1L"
+    val matchBody = s"$rightCountSum += $rightCountExpr;"
+    val matchLoop = countMatchLoop(
+      ctx, relationTerm, keyEv, anyNull, matched, checkCondition, keyIsUnique, matchBody)
+
+    val unusedAggVars = aggregatesRight.map { aggregate =>
+      val attr = aggregate.resultAttribute
+      ExprCode(EmptyBlock, TrueLiteral, JavaCode.defaultLiteral(attr.dataType))
+    }
+    val countEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(countOut, LongType))
+    val resultVars = input ++ Seq(countEv) ++ unusedAggVars
+
+    s"""
+       |${keyEv.code}
+       |long $rightCountSum = 0L;
+       |$leftCountSetup
+       |$matchLoop
+       |if ($rightCountSum != 0L) {
+       |  long $countOut = $rightCountSum * $leftCount;
+       |  $numOutput.add(1);
+       |  ${consume(ctx, resultVars)}
+       |}
+     """.stripMargin
+  }
+
+  /**
    * Inner-join codegen for the GROUPING path: per stream row, group the passing build matches by
    * groupRight into per-row maps (group key -> aggregate buffer, and -> summed count), then emit
    * one row per group (left cols ++ count-multiplied sum ++ aggregate results ++ group key). The
    * aggregate buffer math is delegated to a per-task GroupedCountAggregator; this code owns the
    * match loop, the residual condition, the maps, the count multiplication and the emission.
    */
+  private def aggregateResultsUnusedByParent: Boolean = {
+    aggregatesRight.isEmpty || (parent != null && {
+      val parentOutput = AttributeSet(parent.output)
+      aggregatesRight.forall { aggregate =>
+        val attr = aggregate.resultAttribute
+        !parent.references.contains(attr) && !parentOutput.contains(attr)
+      }
+    })
+  }
+
   protected def codegenCountGroupedInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+    if (aggregateResultsUnusedByParent) {
+      return codegenCountOnlyGroupedInner(ctx, input)
+    }
     assert(buildSide == BuildRight, "count join must build the right side")
     val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
     if (isEmptyHashedRelation) {
@@ -1073,6 +1149,160 @@ trait HashCountJoin extends JoinCodegenSupport {
          |    long $cnt = $rightCount * $leftCount;
          |    $rowCls $aggResRow = $aggTerm.eval($buf);
          |    ${aggReads.map(_._1).mkString("\n")}
+         |    ${groupReads.map(_._1).mkString("\n")}
+         |    $numOutput.add(1);
+         |    ${consume(ctx, resultVars)}
+         |  }
+         |}
+       """.stripMargin
+
+    val groupedPath = if (buildKeyIsUniqueKnownStatically) {
+      if (keyIsUnique) uniquePath else nonUniquePath
+    } else {
+      val kiu = ctx.addMutableState("boolean", "cjGroupedKeyIsUnique",
+        v => s"$v = $relationTerm.keyIsUnique();", forceInline = true)
+      s"""
+         |if ($kiu) {
+         |  $uniquePath
+         |} else {
+         |  $nonUniquePath
+         |}
+       """.stripMargin
+    }
+
+    s"""
+       |${keyEv.code}
+       |$leftCountSetup
+       |$groupedPath
+     """.stripMargin
+  }
+
+  /**
+   * GROUPING count-join codegen when carried aggregate result columns are not consumed by the
+   * parent. This avoids aggregate-buffer allocation/init/eval work and keeps only per-group counts.
+   */
+  protected def codegenCountOnlyGroupedInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+    assert(buildSide == BuildRight, "count join must build the right side")
+    assert(aggregateResultsUnusedByParent,
+      "count-only grouped codegen cannot carry parent-visible aggregate results")
+    val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
+    if (isEmptyHashedRelation) {
+      return "// empty HashedRelation: count inner join returns nothing"
+    }
+    val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
+    val (matched, checkCondition, _) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
+    val numOutput = metricTerm(ctx, "numOutputRows")
+
+    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
+      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
+      .map(c => buildOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+
+    val leftCount = ctx.freshName("leftCount")
+    val leftCountSetup = if (leftCountOrdinal != -1) {
+      val eval = evaluateRequiredVariables(
+        streamedPlan.output, input, AttributeSet(countLeft.get.references))
+      s"$eval\nlong $leftCount = ${input(leftCountOrdinal).value};"
+    } else {
+      s"long $leftCount = 1L;"
+    }
+
+    // Reuse the grouped helper only for its code-generated group-key projection.
+    val thisPlan = ctx.addReferenceObj("plan", this)
+    val aggClass = classOf[GroupedCountAggregator].getName
+    val aggTerm = ctx.addMutableState(aggClass, "groupedAgg",
+      v => s"$v = $thisPlan.createGroupedAggregator();", forceInline = true)
+
+    val mapCls = "java.util.LinkedHashMap"
+    val countMap = ctx.addMutableState(s"$mapCls<UnsafeRow, long[]>", "cjCountMap",
+      v => s"$v = new $mapCls<UnsafeRow, long[]>();", forceInline = true)
+    val rightCount = ctx.freshName("rightCount")
+    val countHolder = ctx.freshName("countHolder")
+    val gkey = ctx.freshName("gkey")
+    val cnt = ctx.freshName("cnt")
+    val gkeyOut = ctx.freshName("gkeyOut")
+    val rightCountExpr =
+      if (rightCountOrdinal != -1) s"$matched.getLong($rightCountOrdinal)" else "1L"
+
+    def readField(row: String, attr: Attribute, i: Int): (String, ExprCode) = {
+      val v = ctx.freshName("fval")
+      val isNull = ctx.freshName("fIsNull")
+      val jt = CodeGenerator.javaType(attr.dataType)
+      val getter = CodeGenerator.getValue(row, attr.dataType, i.toString)
+      val stmt =
+        s"""boolean $isNull = $row.isNullAt($i);
+           |$jt $v = $isNull ? ${CodeGenerator.defaultValue(attr.dataType)} : $getter;"""
+          .stripMargin
+      (stmt, ExprCode(EmptyBlock, JavaCode.isNullVariable(isNull),
+        JavaCode.variable(v, attr.dataType)))
+    }
+
+    val unusedAggVars = aggregatesRight.map { aggregate =>
+      val attr = aggregate.resultAttribute
+      ExprCode(EmptyBlock, TrueLiteral, JavaCode.defaultLiteral(attr.dataType))
+    }
+    val groupAttributes = groupRight.map(_.toAttribute)
+    val groupReads = groupAttributes.zipWithIndex.map { case (a, i) => readField(gkeyOut, a, i) }
+    val countEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(cnt, LongType))
+    val resultVars = input ++ Seq(countEv) ++ unusedAggVars ++ groupReads.map(_._2)
+    val inputEval = evaluateVariables(input)
+    val iter = ctx.freshName("groupIter")
+    val entry = ctx.freshName("groupEntry")
+
+    val nonUniqueMatchBody =
+      s"""
+         |long $rightCount = $rightCountExpr;
+         |UnsafeRow $gkey = $aggTerm.groupKey($matched);
+         |long[] $countHolder = (long[]) $countMap.get($gkey);
+         |if ($countHolder == null) {
+         |  $countHolder = new long[1];
+         |  $countMap.put($gkey.copy(), $countHolder);
+         |}
+         |$countHolder[0] += $rightCount;
+       """.stripMargin
+
+    val matches = ctx.freshName("matches")
+    val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+    val nonUniqueMatchLoop =
+      s"""
+         |$iteratorCls $matches = $anyNull ? null :
+         |  ($iteratorCls)$relationTerm.get(${keyEv.value});
+         |if ($matches != null) {
+         |  while ($matches.hasNext()) {
+         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |    $checkCondition {
+         |      $nonUniqueMatchBody
+         |    }
+         |  }
+         |}
+       """.stripMargin
+
+    val nonUniquePath =
+      s"""
+         |$countMap.clear();
+         |$nonUniqueMatchLoop
+         |$inputEval
+         |java.util.Iterator $iter = $countMap.entrySet().iterator();
+         |while ($iter.hasNext()) {
+         |  java.util.Map.Entry $entry = (java.util.Map.Entry) $iter.next();
+         |  UnsafeRow $gkeyOut = (UnsafeRow) $entry.getKey();
+         |  long $cnt = ((long[]) $entry.getValue())[0] * $leftCount;
+         |  ${groupReads.map(_._1).mkString("\n")}
+         |  $numOutput.add(1);
+         |  ${consume(ctx, resultVars)}
+         |}
+       """.stripMargin
+
+    val uniquePath =
+      s"""
+         |UnsafeRow $matched = $anyNull ? null :
+         |  (UnsafeRow)$relationTerm.getValue(${keyEv.value});
+         |if ($matched != null) {
+         |  $checkCondition {
+         |    long $rightCount = $rightCountExpr;
+         |    UnsafeRow $gkeyOut = $aggTerm.groupKey($matched);
+         |    $inputEval
+         |    long $cnt = $rightCount * $leftCount;
          |    ${groupReads.map(_._1).mkString("\n")}
          |    $numOutput.add(1);
          |    ${consume(ctx, resultVars)}
