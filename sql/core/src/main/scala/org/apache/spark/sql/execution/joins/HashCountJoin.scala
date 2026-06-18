@@ -827,14 +827,27 @@ trait HashCountJoin extends JoinCodegenSupport {
     }
     // Per-match update: read-before-write into the buffer.
     ctx.currentVars = flatBufVars ++ buildVars
-    val bufferEvals = updateExprs.map(u =>
-      bindReferences(u, bufferSchema ++ buildPlan.output).map(_.genCode(ctx)))
-    val updateCode = bufferEvals.zipWithIndex.map { case (evalsForFn, i) =>
+    val boundUpdateExprs = updateExprs.map(u => bindReferences(u, bufferSchema ++ buildPlan.output))
+    val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExprs.flatten)
+    val effectiveCodes = ctx.evaluateSubExprEliminationState(subExprs.states.values)
+    val bufferEvals = boundUpdateExprs.map { exprsForFn =>
+      ctx.withSubExprEliminationExprs(subExprs.states) {
+        exprsForFn.map(_.genCode(ctx))
+      }
+    }
+    val functionUpdateCode = bufferEvals.zipWithIndex.map { case (evalsForFn, i) =>
       val writes = evalsForFn.zip(bufVars(i)).map { case (ev, bv) =>
         s"${bv.isNull} = ${ev.isNull};\n${bv.value} = ${ev.value};"
       }
       s"${evaluateVariables(evalsForFn)}\n${writes.mkString("\n")}"
     }.mkString("\n")
+    val updateCode =
+      s"""
+         |// common sub-expressions
+         |$effectiveCodes
+         |// evaluate aggregate functions and update aggregation buffers
+         |$functionUpdateCode
+       """.stripMargin
 
     val matchBody = s"$buildEval\n$rightCountAccum\n$updateCode"
     val matchLoop = countMatchLoop(
@@ -940,10 +953,16 @@ trait HashCountJoin extends JoinCodegenSupport {
     // (which reference the OLD buffer values) before writing any of them back.
     ctx.INPUT_ROW = buf
     ctx.currentVars = (Array.fill[ExprCode](bufferSchema.length)(null) ++ buildVars).toSeq
-    val bufferEvals = updateExprs.map(u =>
-      bindReferences(u, bufferSchema ++ buildPlan.output).map(_.genCode(ctx)))
+    val boundUpdateExprs = updateExprs.map(u => bindReferences(u, bufferSchema ++ buildPlan.output))
+    val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExprs.flatten)
+    val effectiveCodes = ctx.evaluateSubExprEliminationState(subExprs.states.values)
+    val bufferEvals = boundUpdateExprs.map { exprs =>
+      ctx.withSubExprEliminationExprs(subExprs.states) {
+        exprs.map(_.genCode(ctx))
+      }
+    }
     ctx.INPUT_ROW = null
-    val updateCode = bufferEvals.zipWithIndex.map { case (evals, i) =>
+    val functionUpdateCode = bufferEvals.zipWithIndex.map { case (evals, i) =>
       val base = bufferStartOffsets(i)
       val writes = evals.zipWithIndex.map { case (ev, j) =>
         val attr = aggFns(i).aggBufferAttributes(j)
@@ -951,6 +970,13 @@ trait HashCountJoin extends JoinCodegenSupport {
       }
       s"${evaluateVariables(evals)}\n${writes.mkString("\n")}"
     }.mkString("\n")
+    val updateCode =
+      s"""
+         |// common sub-expressions
+         |$effectiveCodes
+         |// evaluate aggregate functions and update aggregation buffers
+         |$functionUpdateCode
+       """.stripMargin
 
     // Per-group emit: read the aggregate-result and group-key fields into locals, then consume.
     val aggResultAttributes = aggregatesRight.map(_.resultAttribute)
