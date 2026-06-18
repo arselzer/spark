@@ -1857,8 +1857,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
     // Only group counts in leaves if it is explicitly enabled and there are no known
     // primary keys in the leaf
+    val groupingRefs = AttributeSet(groupingExpressions.flatMap(_.references))
     val outputAttributes = scanPlan.output.filter(att => (nodeAttributes contains att)
-      || (aggregateAttributes contains att) || (groupingExpressions contains att))
+      || (aggregateAttributes contains att) || (groupingRefs contains att))
     var prevPlan: LogicalPlan = if (groupHere) {
       Aggregate(outputAttributes, Seq(prevCountExpr) ++
         outputAttributes, scanPlan)

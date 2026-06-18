@@ -327,6 +327,31 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "cross-relation filter eliminating a group (spurious sum)")
   }
 
+  test("countGroupInLeaves preserves grouping expression references") {
+    Seq((1, "a"), (2, "b")).toDF("c_sk", "c_id")
+      .createOrReplaceTempView("lg_customer")
+    Seq((1, 10, 5), (1, 20, 7), (2, 10, 11)).toDF("c_sk", "d_sk", "v")
+      .createOrReplaceTempView("lg_sales")
+    Seq((10, 2001), (20, 2002)).toDF("d_sk", "yr")
+      .createOrReplaceTempView("lg_date")
+
+    val query =
+      "select c_id, yr + 0 as gy, sum(v) as s " +
+        "from lg_customer c, lg_sales s, lg_date d " +
+        "where c.c_sk = s.c_sk and s.d_sk = d.d_sk " +
+        "group by c_id, yr + 0"
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+    withSQLConf((yannakakisOn :+ (SQLConf.YANNAKAKIS_COUNT_GROUP_LEAVES.key -> "true")): _*) {
+      val df = sql(query)
+      checkAnswer(df, expected)
+      assert(df.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        s"expected CountJoin with leaf grouping enabled:\n${df.queryExecution.optimizedPlan}")
+    }
+  }
+
   test("count(*) over a fan-out join is correct via the count-join codegen path") {
     Seq((1, "x"), (2, "y"), (3, "z")).toDF("k", "v").createOrReplaceTempView("cc1")
     // fan-out + a dangling probe key (4) with no match on cc1
