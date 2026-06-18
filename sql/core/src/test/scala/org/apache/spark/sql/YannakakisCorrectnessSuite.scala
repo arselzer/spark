@@ -1182,6 +1182,8 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
         s"grouped count-only codegen should use the count-map fast path:\n$code")
       assert(!code.contains(".newBuffer()"),
         s"grouped count-only codegen should not allocate aggregate buffers:\n$code")
+      assert(!code.contains("new long[1]"),
+        s"grouped count-only codegen should not allocate per-group long arrays:\n$code")
     }
     assertGroupingCodegenMatches(query, "grouped count-only")
   }

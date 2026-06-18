@@ -1213,9 +1213,10 @@ trait HashCountJoin extends JoinCodegenSupport {
     val aggTerm = ctx.addMutableState(aggClass, "groupedAgg",
       v => s"$v = $thisPlan.createGroupedAggregator();", forceInline = true)
 
-    val mapCls = "java.util.LinkedHashMap"
-    val countMap = ctx.addMutableState(s"$mapCls<UnsafeRow, long[]>", "cjCountMap",
-      v => s"$v = new $mapCls<UnsafeRow, long[]>();", forceInline = true)
+    val mapCls = "java.util.HashMap"
+    val countHolderCls = classOf[MutableLong].getName
+    val countMap = ctx.addMutableState(s"$mapCls<UnsafeRow, $countHolderCls>", "cjCountMap",
+      v => s"$v = new $mapCls<UnsafeRow, $countHolderCls>();", forceInline = true)
     val rightCount = ctx.freshName("rightCount")
     val countHolder = ctx.freshName("countHolder")
     val gkey = ctx.freshName("gkey")
@@ -1253,12 +1254,12 @@ trait HashCountJoin extends JoinCodegenSupport {
       s"""
          |long $rightCount = $rightCountExpr;
          |UnsafeRow $gkey = $aggTerm.groupKey($matched);
-         |long[] $countHolder = (long[]) $countMap.get($gkey);
+         |$countHolderCls $countHolder = ($countHolderCls) $countMap.get($gkey);
          |if ($countHolder == null) {
-         |  $countHolder = new long[1];
+         |  $countHolder = new $countHolderCls();
          |  $countMap.put($gkey.copy(), $countHolder);
          |}
-         |$countHolder[0] += $rightCount;
+         |$countHolder.value_$$eq($countHolder.value() + $rightCount);
        """.stripMargin
 
     val matches = ctx.freshName("matches")
@@ -1286,7 +1287,7 @@ trait HashCountJoin extends JoinCodegenSupport {
          |while ($iter.hasNext()) {
          |  java.util.Map.Entry $entry = (java.util.Map.Entry) $iter.next();
          |  UnsafeRow $gkeyOut = (UnsafeRow) $entry.getKey();
-         |  long $cnt = ((long[]) $entry.getValue())[0] * $leftCount;
+         |  long $cnt = (($countHolderCls) $entry.getValue()).value() * $leftCount;
          |  ${groupReads.map(_._1).mkString("\n")}
          |  $numOutput.add(1);
          |  ${consume(ctx, resultVars)}
