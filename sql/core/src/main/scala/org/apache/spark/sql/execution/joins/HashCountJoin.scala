@@ -468,117 +468,169 @@ trait HashCountJoin extends JoinCodegenSupport {
       streamIter.flatMap { srow =>
         joinedRow.withLeft(srow)
         val joinKey = joinKeys(srow)
-        val matches = hashedRelation.get(joinKey)
-
-        // Only the grouping path uses these per-group maps; skip the allocation otherwise
-        // (the non-grouped count/SUM path - the common case - never touches them).
-        val sumMap = if (doGrouping) new mutable.LinkedHashMap[UnsafeRow, Long] else null
-        val bufferMap =
-          if (doGrouping) new mutable.LinkedHashMap[UnsafeRow, InternalRow] else null
         var buffer: InternalRow = null
+        val leftCount = if (leftCountOrdinal != -1) {
+          srow.getLong(leftCountOrdinal)
+        }
+        else {
+          1
+        }
 
-        if (matches != null) {
-          val leftCount = if (leftCountOrdinal != -1) {
-            srow.getLong(leftCountOrdinal)
-          }
-          else {
-            1
-          }
-          if (!doGrouping) {
-            // In case we do not group, create one buffer and use it for all right matches
-            buffer = newBuffer()
-            expressionAggInitialProjection.target(buffer)(EmptyRow)
-          }
-          var matchCount = 0
-          val rightCountSum = matches.map(joinedRow.withRight)
-            .filter(boundCondition)
-            .map(row => {
-              // If the count attribute is not found in the child
-              // plan (as is the case in the leaves),
-              // assume count 1
-              val rightCount = if (rightCountOrdinal != -1) {
-                row.getRight.getLong(rightCountOrdinal)
-              }
-              else {
-                1
-              }
-
-              matchCount += 1
-
-              if (doAggregation || doGrouping) {
-                if (doGrouping) {
-                  val groupingKey = groupingProjection(row.getRight).copy()
-                  var sum: Long = 0
-                  if (bufferMap.contains(groupingKey)) {
-                    buffer = bufferMap(groupingKey)
-                    sum = sumMap(groupingKey)
-                    sum += rightCount
-                    sumMap.put(groupingKey, sum)
-                  }
-                  else {
-                    buffer = newBuffer()
-                    expressionAggInitialProjection.target(buffer)(EmptyRow)
-                    bufferMap.put(groupingKey, buffer)
-                    sum = rightCount
-                    sumMap.put(groupingKey, sum)
-                  }
-                }
-
-                aggRow(buffer, row.getRight)
-                updateProjection.target(buffer)(aggRow)
-              }
-              // Return right count
-              rightCount
-            }
-          ).sum
-
-          dbg(s"  leftCount=$leftCount, rightCountSum=$rightCountSum, matchCount=$matchCount, " +
-            s"product=${rightCountSum * leftCount}")
-//          logWarning("buffermap after: " + bufferMap)
-          if (doGrouping) {
-            (bufferMap map {
-            case (groupingKey: UnsafeRow, buf: InternalRow) =>
-              val sumRow = new SpecificInternalRow(sumRowSchema)
-              sumRow.setLong(0, sumMap(groupingKey) * leftCount)
-              expressionAggEvalProjection(buf)
-
-              val aggResult = aggProjection(joinedRow3(aggregateResult, groupingKey))
-              joinedRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggResult)))
-              // CRITICAL: UnsafeProjection reuses its output row, so we must copy
-              // when producing multiple rows for the same left input
-              resultProjection(joinedRow).copy()
-            }).toSeq
-          }
-          else if (rightCountSum == 0) {
-            // Every key-matching build row failed the residual (non-equi) condition, so this
-            // stream row has no real match: emit nothing rather than a phantom count-0 row.
-            // Carried counts start at 1 and only sum upward, so rightCountSum == 0 can only mean
-            // "all matches filtered out", never a genuine zero-count group. This IS reachable:
-            // the rewrite folds cross-relation filters into the CountJoin condition, so a row
-            // whose every match fails the filter lands here. (HashCountJoin codegen and the SMJ
-            // evaluator guard the same case.)
-            Seq.empty
-          }
-          else {
-            val sumRow = new SpecificInternalRow(sumRowSchema)
-            sumRow.setLong(0, rightCountSum * leftCount)
-            // withRight replaces the right part - now we have the left row + count
-            if (doAggregation) {
-              expressionAggEvalProjection(buffer)
-              joinedRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggregateResult)))
-              dbg(s"  Output (with agg): count=${rightCountSum * leftCount}, " +
-                s"aggResult=${aggregateResult}")
+        if (hashedRelation.keyIsUnique) {
+          val matched = hashedRelation.getValue(joinKey)
+          if (matched != null && boundCondition(joinedRow.withRight(matched))) {
+            val rightCount = if (rightCountOrdinal != -1) {
+              matched.getLong(rightCountOrdinal)
             }
             else {
-              joinedRow.withRight(sumRow)
-              dbg(s"  Output (no agg): count=${rightCountSum * leftCount}")
+              1
             }
-            val result = resultProjection(joinedRow)
-            dbg(s"  Final result row: $result")
-            Seq(result)
+
+            if (doGrouping) {
+              buffer = newBuffer()
+              expressionAggInitialProjection.target(buffer)(EmptyRow)
+              if (doAggregation) {
+                aggRow(buffer, matched)
+                updateProjection.target(buffer)(aggRow)
+              }
+              val sumRow = new SpecificInternalRow(sumRowSchema)
+              sumRow.setLong(0, rightCount * leftCount)
+              expressionAggEvalProjection(buffer)
+
+              val groupingKey = groupingProjection(matched)
+              val aggResult = aggProjection(joinedRow3(aggregateResult, groupingKey))
+              joinedRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggResult)))
+              Seq(resultProjection(joinedRow))
+            }
+            else {
+              if (doAggregation) {
+                buffer = newBuffer()
+                expressionAggInitialProjection.target(buffer)(EmptyRow)
+                aggRow(buffer, matched)
+                updateProjection.target(buffer)(aggRow)
+                expressionAggEvalProjection(buffer)
+              }
+              val sumRow = new SpecificInternalRow(sumRowSchema)
+              sumRow.setLong(0, rightCount * leftCount)
+              if (doAggregation) {
+                joinedRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggregateResult)))
+              }
+              else {
+                joinedRow.withRight(sumRow)
+              }
+              Seq(resultProjection(joinedRow))
+            }
           }
-        } else {
-          Seq.empty
+          else {
+            Seq.empty
+          }
+        }
+        else {
+          val matches = hashedRelation.get(joinKey)
+
+          // Only the grouping path uses these per-group maps; skip the allocation otherwise
+          // (the non-grouped count/SUM path - the common case - never touches them).
+          val sumMap = if (doGrouping) new mutable.LinkedHashMap[UnsafeRow, Long] else null
+          val bufferMap =
+            if (doGrouping) new mutable.LinkedHashMap[UnsafeRow, InternalRow] else null
+
+          if (matches != null) {
+            if (!doGrouping) {
+              // In case we do not group, create one buffer and use it for all right matches
+              buffer = newBuffer()
+              expressionAggInitialProjection.target(buffer)(EmptyRow)
+            }
+            var matchCount = 0
+            val rightCountSum = matches.map(joinedRow.withRight)
+              .filter(boundCondition)
+              .map(row => {
+                // If the count attribute is not found in the child
+                // plan (as is the case in the leaves),
+                // assume count 1
+                val rightCount = if (rightCountOrdinal != -1) {
+                  row.getRight.getLong(rightCountOrdinal)
+                }
+                else {
+                  1
+                }
+
+                matchCount += 1
+
+                if (doAggregation || doGrouping) {
+                  if (doGrouping) {
+                    val groupingKey = groupingProjection(row.getRight).copy()
+                    var sum: Long = 0
+                    if (bufferMap.contains(groupingKey)) {
+                      buffer = bufferMap(groupingKey)
+                      sum = sumMap(groupingKey)
+                      sum += rightCount
+                      sumMap.put(groupingKey, sum)
+                    }
+                    else {
+                      buffer = newBuffer()
+                      expressionAggInitialProjection.target(buffer)(EmptyRow)
+                      bufferMap.put(groupingKey, buffer)
+                      sum = rightCount
+                      sumMap.put(groupingKey, sum)
+                    }
+                  }
+
+                  aggRow(buffer, row.getRight)
+                  updateProjection.target(buffer)(aggRow)
+                }
+                // Return right count
+                rightCount
+              }
+            ).sum
+
+            dbg(s"  leftCount=$leftCount, rightCountSum=$rightCountSum, matchCount=$matchCount, " +
+              s"product=${rightCountSum * leftCount}")
+//          logWarning("buffermap after: " + bufferMap)
+            if (doGrouping) {
+              (bufferMap map {
+              case (groupingKey: UnsafeRow, buf: InternalRow) =>
+                val sumRow = new SpecificInternalRow(sumRowSchema)
+                sumRow.setLong(0, sumMap(groupingKey) * leftCount)
+                expressionAggEvalProjection(buf)
+
+                val aggResult = aggProjection(joinedRow3(aggregateResult, groupingKey))
+                joinedRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggResult)))
+                // CRITICAL: UnsafeProjection reuses its output row, so we must copy
+                // when producing multiple rows for the same left input
+                resultProjection(joinedRow).copy()
+              }).toSeq
+            }
+            else if (rightCountSum == 0) {
+              // Every key-matching build row failed the residual (non-equi) condition, so this
+              // stream row has no real match: emit nothing rather than a phantom count-0 row.
+              // Carried counts start at 1 and only sum upward, so rightCountSum == 0 can only mean
+              // "all matches filtered out", never a genuine zero-count group. This IS reachable:
+              // the rewrite folds cross-relation filters into the CountJoin condition, so a row
+              // whose every match fails the filter lands here. (HashCountJoin codegen and the SMJ
+              // evaluator guard the same case.)
+              Seq.empty
+            }
+            else {
+              val sumRow = new SpecificInternalRow(sumRowSchema)
+              sumRow.setLong(0, rightCountSum * leftCount)
+              // withRight replaces the right part - now we have the left row + count
+              if (doAggregation) {
+                expressionAggEvalProjection(buffer)
+                joinedRow.withRight(countAggGroupProjection(joinedRow2(sumRow, aggregateResult)))
+                dbg(s"  Output (with agg): count=${rightCountSum * leftCount}, " +
+                  s"aggResult=${aggregateResult}")
+              }
+              else {
+                joinedRow.withRight(sumRow)
+                dbg(s"  Output (no agg): count=${rightCountSum * leftCount}")
+              }
+              val result = resultProjection(joinedRow)
+              dbg(s"  Final result row: $result")
+              Seq(result)
+            }
+          } else {
+            Seq.empty
+          }
         }
       }
     }
@@ -900,23 +952,6 @@ trait HashCountJoin extends JoinCodegenSupport {
       s"${evaluateVariables(evals)}\n${writes.mkString("\n")}"
     }.mkString("\n")
 
-    val matchBody =
-      s"""
-         |long $rightCount = $rightCountExpr;
-         |UnsafeRow $gkey = $aggTerm.groupKey($matched);
-         |$rowCls $buf = ($rowCls) $bufMap.get($gkey);
-         |if ($buf == null) {
-         |  $buf = $aggTerm.newBuffer();
-         |  $bufMap.put($gkey.copy(), $buf);
-         |}
-         |$buf.setLong($countOrd, $buf.getLong($countOrd) + $rightCount);
-         |$buildUpdateEval
-         |$updateCode
-       """.stripMargin
-
-    val matchLoop = countMatchLoop(
-      ctx, relationTerm, keyEv, anyNull, matched, checkCondition, keyIsUnique, matchBody)
-
     // Per-group emit: read the aggregate-result and group-key fields into locals, then consume.
     val aggResultAttributes = aggregatesRight.map(_.resultAttribute)
     val groupAttributes = groupRight.map(_.toAttribute)
@@ -947,24 +982,96 @@ trait HashCountJoin extends JoinCodegenSupport {
     val iter = ctx.freshName("groupIter")
     val entry = ctx.freshName("groupEntry")
 
+    val nonUniqueMatchBody =
+      s"""
+         |long $rightCount = $rightCountExpr;
+         |UnsafeRow $gkey = $aggTerm.groupKey($matched);
+         |$rowCls $buf = ($rowCls) $bufMap.get($gkey);
+         |if ($buf == null) {
+         |  $buf = $aggTerm.newBuffer();
+         |  $bufMap.put($gkey.copy(), $buf);
+         |}
+         |$buf.setLong($countOrd, $buf.getLong($countOrd) + $rightCount);
+         |$buildUpdateEval
+         |$updateCode
+       """.stripMargin
+
+    val matches = ctx.freshName("matches")
+    val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+    val nonUniqueMatchLoop =
+      s"""
+         |$iteratorCls $matches = $anyNull ? null :
+         |  ($iteratorCls)$relationTerm.get(${keyEv.value});
+         |if ($matches != null) {
+         |  while ($matches.hasNext()) {
+         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |    $checkCondition {
+         |      $nonUniqueMatchBody
+         |    }
+         |  }
+         |}
+       """.stripMargin
+
+    val nonUniquePath =
+      s"""
+         |$bufMap.clear();
+         |$nonUniqueMatchLoop
+         |$inputEval
+         |java.util.Iterator $iter = $bufMap.entrySet().iterator();
+         |while ($iter.hasNext()) {
+         |  java.util.Map.Entry $entry = (java.util.Map.Entry) $iter.next();
+         |  UnsafeRow $gkeyOut = (UnsafeRow) $entry.getKey();
+         |  $rowCls $bufOut = ($rowCls) $entry.getValue();
+         |  long $cnt = $bufOut.getLong($countOrd) * $leftCount;
+         |  $rowCls $aggResRow = $aggTerm.eval($bufOut);
+         |  ${aggReads.map(_._1).mkString("\n")}
+         |  ${groupReads.map(_._1).mkString("\n")}
+         |  $numOutput.add(1);
+         |  ${consume(ctx, resultVars)}
+         |}
+       """.stripMargin
+
+    val uniquePath =
+      s"""
+         |UnsafeRow $matched = $anyNull ? null :
+         |  (UnsafeRow)$relationTerm.getValue(${keyEv.value});
+         |if ($matched != null) {
+         |  $checkCondition {
+         |    long $rightCount = $rightCountExpr;
+         |    UnsafeRow $gkeyOut = $aggTerm.groupKey($matched);
+         |    $rowCls $buf = $aggTerm.newBuffer();
+         |    $buf.setLong($countOrd, $rightCount);
+         |    $buildUpdateEval
+         |    $updateCode
+         |    $inputEval
+         |    long $cnt = $rightCount * $leftCount;
+         |    $rowCls $aggResRow = $aggTerm.eval($buf);
+         |    ${aggReads.map(_._1).mkString("\n")}
+         |    ${groupReads.map(_._1).mkString("\n")}
+         |    $numOutput.add(1);
+         |    ${consume(ctx, resultVars)}
+         |  }
+         |}
+       """.stripMargin
+
+    val groupedPath = if (buildKeyIsUniqueKnownStatically) {
+      if (keyIsUnique) uniquePath else nonUniquePath
+    } else {
+      val kiu = ctx.addMutableState("boolean", "cjGroupedKeyIsUnique",
+        v => s"$v = $relationTerm.keyIsUnique();", forceInline = true)
+      s"""
+         |if ($kiu) {
+         |  $uniquePath
+         |} else {
+         |  $nonUniquePath
+         |}
+       """.stripMargin
+    }
+
     s"""
        |${keyEv.code}
        |$leftCountSetup
-       |$bufMap.clear();
-       |$matchLoop
-       |$inputEval
-       |java.util.Iterator $iter = $bufMap.entrySet().iterator();
-       |while ($iter.hasNext()) {
-       |  java.util.Map.Entry $entry = (java.util.Map.Entry) $iter.next();
-       |  UnsafeRow $gkeyOut = (UnsafeRow) $entry.getKey();
-       |  $rowCls $bufOut = ($rowCls) $entry.getValue();
-       |  long $cnt = $bufOut.getLong($countOrd) * $leftCount;
-       |  $rowCls $aggResRow = $aggTerm.eval($bufOut);
-       |  ${aggReads.map(_._1).mkString("\n")}
-       |  ${groupReads.map(_._1).mkString("\n")}
-       |  $numOutput.add(1);
-       |  ${consume(ctx, resultVars)}
-       |}
+       |$groupedPath
      """.stripMargin
   }
 

@@ -43,8 +43,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
 
   private val yannakakisOn = Seq(
     SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-    SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-    SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true")
+    SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true")
 
   private val cyclicBagsOn =
     yannakakisOn :+ (SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED.key -> "true")
@@ -359,7 +358,6 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     // gate ON + tiny (broadcast-eligible) relations -> rewrite suppressed, still correct
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true") {
       val df = sql(q)
       checkAnswer(df, expected)
@@ -369,7 +367,6 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     // gate ON but broadcast disabled -> nothing broadcast-eligible -> rewrite fires
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
       val df = sql(q)
@@ -542,8 +539,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "false",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true") {
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "false") {
       val df = sql(query)
       val applied = df.queryExecution.executedPlan.toString.contains("CountJoin")
       assert(applied, "expected pwg classification to rewrite the plan " +
@@ -599,7 +595,6 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
       SQLConf.PREFER_SORTMERGEJOIN.key -> "true") {
       val df = sql(query)
@@ -954,10 +949,9 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
         and ps_partkey = l_partkey and p_partkey = l_partkey
         and o_orderkey = l_orderkey and s_nationkey = n_nationkey and p_name like '%green%'
       group by n_name, extract(year from o_orderdate)"""
-    // Enable yannakakis + the physical count join, but do NOT set unguardedEnabled explicitly:
+    // Enable yannakakis, but do NOT set unguardedEnabled explicitly:
     // the unguarded count-join rewrite should fire because it now defaults to true.
-    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-                SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true") {
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "true") {
       val plan = sql(query).queryExecution.executedPlan.toString
       assert(plan.contains("CountJoin"),
         s"an unguarded query should rewrite by default (unguardedEnabled):\n$plan")
@@ -1499,6 +1493,27 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertSameResults(
       "select sum(x) as s from dec_fact f join dec_dim d on f.k = d.k",
       "decimal sum over fan-out")
+  }
+
+  test("physical count-join specs survive decimal aggregate optimization") {
+    Seq((1, "A"), (2, "A")).toDF("k", "g").createOrReplaceTempView("cjd_a")
+    Seq((1, 10), (2, 20)).toDF("k", "j").createOrReplaceTempView("cjd_b")
+    Seq((10, BigDecimal("10.25")), (20, BigDecimal("20.50")), (20, BigDecimal("1.00")))
+      .toDF("j", "x0")
+      .selectExpr("j", "cast(x0 as decimal(18,2)) as x")
+      .createOrReplaceTempView("cjd_c")
+
+    val query =
+      "select g, sum(x) as s from cjd_a a, cjd_b b, cjd_c c " +
+        "where a.k = b.k and b.j = c.j group by g"
+
+    withSQLConf(yannakakisOn: _*) {
+      val df = sql(query)
+      assert(df.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        "expected decimal carried aggregate query to use CountJoin:\n" +
+          df.queryExecution.optimizedPlan)
+    }
+    assertSameResults(query, "decimal aggregate carried through physical count-join")
   }
 
   test("empty join result: ungrouped count(*)=0 and sum=NULL match vanilla") {

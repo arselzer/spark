@@ -47,8 +47,7 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
 
   private val yannakakisOn = Seq(
     SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-    SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-    SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true")
+    SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true")
 
   private def loadTpch(): Unit = {
     Seq("region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem")
@@ -157,7 +156,6 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
     val rewriteOn = Seq(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
     val report = new StringBuilder
     val failures = scala.collection.mutable.ListBuffer[String]()
@@ -209,7 +207,6 @@ class TPCHBenchmarkSuite extends QueryTest with SharedSparkSession {
     val rewriteOn = aqeOff ++ Seq(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
     val vanilla = aqeOff ++ Seq(
       SQLConf.YANNAKAKIS_ENABLED.key -> "false",

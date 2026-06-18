@@ -639,7 +639,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
               pendingProductAccountedAttrs, pendingProductOriginalAttrs,
               keyRefs, uniqueConstraints,
               conf.yannakakisCountGroupInLeavesEnabled,
-              usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
               crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
               conflictingProductAttrs = conflictingProductAttrs)
 
@@ -866,7 +865,6 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                 pendingProductSumSet, pendingProductAccountedAttrs, pendingProductOriginalAttrs,
                 keyRefs, uniqueConstraints,
                 conf.yannakakisCountGroupInLeavesEnabled,
-                usePhysicalCountJoin = conf.yannakakisPhysicalCountEnabled,
                 crossRelationFilters = mutable.Set(hg.crossRelationFilters: _*),
                 conflictingProductAttrs = guardedConflictingAttrs)
 
@@ -1827,7 +1825,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                                    AttributeSet],
                                  keyRefs: Seq[Seq[Expression]],
                                  uniqueConstraints: Seq[Seq[Expression]], groupInLeaves: Boolean,
-                                 usePhysicalCountJoin: Boolean = false,
                                  crossRelationFilters: mutable.Set[Expression] =
                                    mutable.Set.empty,
                                  conflictingProductAttrs: Set[Attribute] = Set.empty):
@@ -1877,74 +1874,27 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       scanPlan
     }
     var isLeafNode = true
-    var prevSemijoined = false
 
-    var prevChildEdge: HGEdge = edge
     for (c <- orderedChildren) {
       val childEdge = c.edges.head
       val childVertices = childEdge.vertices
       val overlappingVertices = vertices intersect childVertices
-      val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, childWasSemijoined) =
+      val (bottomUpJoins, childCountExpr, rightPlanIsLeaf, _) =
         c.buildBottomUpJoinsCounting(aggregateAttributes,
           groupingExpressions, aggExpressions, lastAggMap, lastSumMap,
           nextMultiplicationMap, pendingProductSumSet, pendingProductAccountedAttrs,
           pendingProductOriginalAttrs, keyRefs, uniqueConstraints,
-          groupInLeaves, usePhysicalCountJoin = usePhysicalCountJoin,
+          groupInLeaves,
           crossRelationFilters = crossRelationFilters,
           conflictingProductAttrs = conflictingProductAttrs)
-
-      val countExpressionLeft = Alias(Sum(prevCountExpr.toAttribute).toAggregateExpression(), "c")()
-      val countExpressionRight = Alias(
-        Sum(childCountExpr.toAttribute).toAggregateExpression(), "c")()
-
-      val countGroupLeft = vertices.map(v => edge.vertexToAttribute(v)).toSeq
-      val countGroupRight = overlappingVertices.map(v => childEdge.vertexToAttribute(v)).toSeq
 
       // Grouping directly after each leaf node results in bad performance.
       // Possible solution: make use of primary keys to determine if grouping is necessary
       // Construct the left subplan
-      val (leftPlan, leftCountAttribute) = if (isLeafNode) {
-        (prevPlan, prevCountExpr.toAttribute)
-      }
-      else {
-        dbg("prevPlan: " + prevPlan)
-        dbg("output: " + prevPlan.output)
-        val outputAggregateAttributes = prevPlan.outputSet intersect aggregateAttributes
-        val groupAttributes = countGroupLeft ++ outputAggregateAttributes
-        val prevChildAttributes = AttributeSet(
-          prevChildEdge.vertices.map(v => prevChildEdge.vertexToAttribute(v)))
-        // Check if the grouping attributes contain a primary key.
-        // In this case, grouping would not remove any tuples, hence do not aggregate.
-
-        // Don't perform aggregation afterwards if a countjoin was performed
-        if (usePhysicalCountJoin
-          || (prevSemijoined && primaryKeys.exists(att => nodeAttributes contains att))
-          || uniqueSets.exists(uniqueSet => AttributeSet(groupAttributes) subsetOf uniqueSet )) {
-          (prevPlan, prevCountExpr.toAttribute)
-        }
-        else {
-          (Aggregate(groupAttributes,
-            Seq(countExpressionLeft) ++ groupAttributes, prevPlan),
-            countExpressionLeft.toAttribute)
-        }
-      }
+      val (leftPlan, leftCountAttribute) = (prevPlan, prevCountExpr.toAttribute)
 
       // Construct the right subplan
-      val (rightPlan, rightCountAttribute) = if (rightPlanIsLeaf) {
-        (bottomUpJoins, childCountExpr.toAttribute)
-      }
-      else {
-        if (usePhysicalCountJoin
-          || countGroupRight.forall(att => primaryKeys contains att)
-          || uniqueSets.exists(uniqueSet => AttributeSet(countGroupRight) subsetOf uniqueSet )) {
-          (bottomUpJoins, childCountExpr.toAttribute)
-        }
-        else {
-          (Aggregate(countGroupRight,
-            Seq(countExpressionRight) ++ countGroupRight, bottomUpJoins),
-            countExpressionRight.toAttribute)
-        }
-      }
+      val (rightPlan, rightCountAttribute) = (bottomUpJoins, childCountExpr.toAttribute)
 
       val equalityConditions = overlappingVertices
         .map(vertex => (edge.vertexToAttribute(vertex), childEdge.vertexToAttribute(vertex)))
@@ -2067,7 +2017,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       // products/filters. Byte-identical to the value the single mutable var accumulated before.
       val applicableGroupAttributes = realGroupKeys ++ carriedAttributes
 
-      val join = if (usePhysicalCountJoin) {
+      val join = {
         var applicableAggExpressions = Seq.empty[AggregateExpression]
         var multiplySumExpressions = Seq.empty[NamedExpression]
 
@@ -2562,26 +2512,16 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         else {
           Project(countJoin.output ++ multiplySumExpressions, countJoin)
         }
-      } else {
-        Join(leftPlan, rightPlan,
-          Inner, Option(joinConditions), joinHint)
       }
 //      logWarning("join output: " + join.output)
-      val finalCountExpr = if (usePhysicalCountJoin) {
-          // The summed-up and multiplied result is already in the right count attribute
-          if (rightPlanIsLeaf) {
-            newRightCount
-          }
-          else {
-            rightCountAttribute
-          }
+      val finalCountExpr = {
+        // The summed-up and multiplied result is already in the right count attribute.
+        if (rightPlanIsLeaf) {
+          newRightCount
+        } else {
+          rightCountAttribute
         }
-        else {
-          // Multiply the left count with the right count
-          Alias(Multiply(
-            Cast(leftCountAttribute, rightCountAttribute.dataType),
-            rightCountAttribute), "c")()
-        }
+      }
       dbg("finalCountExpr: " + finalCountExpr)
 //      logWarning("join output: " + join.output)
       val finalProjection = join
@@ -2589,10 +2529,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
       prevPlan = finalProjection
       prevCountExpr = finalCountExpr
       isLeafNode = false
-      prevChildEdge = childEdge
-      prevSemijoined = false
     }
-    (prevPlan, prevCountExpr.toAttribute, isLeafNode, prevSemijoined)
+    (prevPlan, prevCountExpr.toAttribute, isLeafNode, false)
   }
   def reroot: HTNode = {
     if (parent == null) {

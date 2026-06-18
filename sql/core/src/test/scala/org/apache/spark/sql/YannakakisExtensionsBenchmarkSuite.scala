@@ -48,7 +48,6 @@ class YannakakisExtensionsBenchmarkSuite extends QueryTest with SharedSparkSessi
   private val rewriteOn = aqeOff ++ Seq(
     SQLConf.YANNAKAKIS_ENABLED.key -> "true",
     SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-    SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
     SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
   private val cyclicOn = rewriteOn :+ (SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED.key -> "true")
 

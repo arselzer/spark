@@ -60,8 +60,7 @@ class IMDBFlakySuite extends QueryTest with SharedSparkSession {
       // scalastyle:off println
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6c: DUPLICATE ROWS - COUNT ACCURACY ===")
@@ -179,8 +178,7 @@ class IMDBFlakySuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df2 = sql(query)
         val yannakakis = df2.collect()

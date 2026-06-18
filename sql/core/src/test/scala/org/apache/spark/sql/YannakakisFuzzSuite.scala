@@ -41,8 +41,7 @@ class YannakakisFuzzSuite extends QueryTest with SharedSparkSession {
 
   private val yannakakisOn = Seq(
     SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-    SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-    SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true")
+    SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true")
 
   private def cellsMatch(a: Any, b: Any): Boolean = (a, b) match {
     case (null, null) => true

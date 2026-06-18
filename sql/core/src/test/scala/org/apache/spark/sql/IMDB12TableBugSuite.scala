@@ -180,8 +180,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
     // Test Yannakakis
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== YANNAKAKIS ===")
@@ -228,8 +227,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== NON-CONFLICTING PRODUCTS ===")
@@ -270,8 +268,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== SINGLE PRODUCT GROUP ===")
@@ -314,8 +311,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== TWO CONFLICTING GROUPS ===")
@@ -365,8 +361,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== TWO CONFLICTING GROUPS WITH FAN-OUT ===")
@@ -427,8 +422,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== MIXED PRODUCTS (INDEPENDENT + CONFLICTING) ===")
@@ -502,8 +496,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CHAIN OF CONFLICTS WITH MULTIPLE FAN-OUTS ===")
@@ -563,8 +556,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== THREE-WAY PRODUCT WITH FAN-OUT ===")
@@ -622,8 +614,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== ASYMMETRIC FAN-OUT STRESS TEST ===")
@@ -699,8 +690,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== COMPLEX CONFLICT WEB ===")
@@ -770,8 +760,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== HIERARCHICAL CHAIN ({a} < {a,b} < {a,b,c}) ===")
@@ -840,8 +829,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== HIERARCHICAL TREE ({a,b} and {c,d} < {a,b,c,d}) ===")
@@ -919,8 +907,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== HIERARCHICAL DIAMOND ({b} < {a,b},{b,c} < {a,b,c}) ===")
@@ -988,8 +975,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== HIERARCHICAL DEEP NESTING ({a} < {a,b} < {a,b,c} < {a,b,c,d}) ===")
@@ -1060,8 +1046,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== MIXED CONTAINMENT AND CONFLICT ===")
@@ -1133,8 +1118,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== ALL PRODUCTS CONTAINED IN ONE SUPERSET ===")
@@ -1186,8 +1170,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
     }
 
     withSQLConf(
-      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CROSS-RELATION FILTER ONLY (optimized) ===")
@@ -1236,8 +1219,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CROSS-RELATION FILTER (2-table) ===")
@@ -1290,8 +1272,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CROSS-RELATION FILTER (3-table chain) ===")
@@ -1337,8 +1318,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CROSS-RELATION FILTER + PRODUCT ===")
@@ -1404,8 +1384,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== MULTIPLE CROSS-RELATION FILTERS ===")
@@ -1453,8 +1432,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CROSS-RELATION INEQUALITY FILTER ===")
@@ -1510,8 +1488,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== HIERARCHICAL PRODUCTS + CROSS-RELATION FILTER ===")
@@ -1563,8 +1540,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== 4-TABLE FILTER SUPERSET OF PRODUCT ===")
@@ -1610,8 +1586,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== MULTIPLE PRODUCTS ALL CONTAINED IN FILTER ===")
@@ -1659,8 +1634,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
     }
 
     withSQLConf(
-      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== OR FILTER ACROSS RELATIONS ===")
@@ -1708,8 +1682,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== ABS FUNCTION FILTER ACROSS RELATIONS ===")
@@ -1763,8 +1736,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 1: INDEPENDENT PRODUCTS (no shared attrs) ===")
@@ -1814,8 +1786,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 2: CONTAINMENT HIERARCHY ({a} < {a,b} < {a,b,c}) ===")
@@ -1864,8 +1835,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 3: UNIVERSAL SUPERSET WITH CONFLICTS ===")
@@ -1920,8 +1890,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 4: MULTIPLE INDEPENDENT COMPONENTS ===")
@@ -1977,8 +1946,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 5: STAR PATTERN - WORST CASE ===")
@@ -2029,8 +1997,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 5b: SINGLE ATTRIBUTE PRODUCTS (independent) ===")
@@ -2089,8 +2056,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 6: PARTIAL CONTAINMENT ===")
@@ -2139,8 +2105,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== LARGE FAN-OUT STRESS TEST ===")
@@ -2182,8 +2147,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
 
@@ -2223,8 +2187,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
 
@@ -2257,8 +2220,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       val planStr = df.queryExecution.optimizedPlan.toString()
@@ -2304,8 +2266,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       // 2 a's * 2 b's * 1 c * 1 d = 4 rows
@@ -2344,8 +2305,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       // a=10, b=20, c=30, d=40, e=50
@@ -2381,8 +2341,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       // Star products: a*b=200, a*c=300
@@ -2413,8 +2372,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       // Group A: a=10, b=100, c=1000 => a*b=1000, a*c=10000
@@ -2442,8 +2400,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       // a*b + a*c = 10*20 + 10*30 = 200 + 300 = 500
@@ -2512,8 +2469,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== 6-TABLE CHAIN WITH 3 INDEPENDENT PRODUCTS ===")
@@ -2572,8 +2528,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== INDEPENDENT PRODUCTS WITH LARGE FAN-OUT ===")
@@ -2643,8 +2598,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== MIXED SINGLE AND MULTI-ATTR INDEPENDENT PRODUCTS ===")
@@ -2703,8 +2657,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== INDEPENDENT PRODUCTS WITH CROSS-RELATION FILTER ===")
@@ -2763,8 +2716,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== INDEPENDENT 3-ATTR PRODUCTS ===")
@@ -2831,8 +2783,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 4b: THREE INDEPENDENT COMPONENTS ===")
@@ -2900,8 +2851,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("=== CASE 4c: STAR WITH INDEPENDENT PRODUCT ===")
@@ -2954,8 +2904,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       // scalastyle:off println
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6: SYNTHETIC SUPERSET (disabled) ===")
@@ -2967,8 +2916,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       // Test with join-tree-aware analysis (replaces synthetic superset)
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6: JOIN-TREE-AWARE ANALYSIS ===")
@@ -3013,8 +2961,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       // scalastyle:off println
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6b: SYNTHETIC TOO LARGE ===")
@@ -3055,8 +3002,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       // scalastyle:off println
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6c: DUPLICATE ROWS - COUNT ACCURACY ===")
@@ -3092,8 +3038,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       // scalastyle:off println
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println("=== CASE 6d: NO COMMON CENTER ===")
@@ -3150,8 +3095,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3202,8 +3146,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3251,8 +3194,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3297,8 +3239,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3370,8 +3311,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       // Test with Yannakakis enabled
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3381,8 +3321,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
       // Also test with synthetic superset enabled
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Synthetic result: ${df.collect().map(_.toString).mkString}")
@@ -3443,8 +3382,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3495,8 +3433,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3553,8 +3490,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3621,8 +3557,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3674,8 +3609,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3722,8 +3656,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3776,8 +3709,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3837,8 +3769,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3898,8 +3829,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -3957,8 +3887,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -4019,8 +3948,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -4117,8 +4045,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -4186,8 +4113,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -4270,8 +4196,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df = sql(query)
         println(s"Yannakakis result: ${df.collect().map(_.toString).mkString}")
@@ -4379,8 +4304,7 @@ class IMDB12TableBugSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
       ) {
         val df2 = sql(query)
         val yannakakis = df2.collect()

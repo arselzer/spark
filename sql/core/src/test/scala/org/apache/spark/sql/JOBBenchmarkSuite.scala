@@ -41,8 +41,7 @@ class JOBBenchmarkSuite extends QueryTest with SharedSparkSession {
   private val jobDir = "/home/as/git/Spark-Y/data/job"
 
   private val yannakakisOn = Seq(
-    SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-    SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true")
+    SQLConf.YANNAKAKIS_ENABLED.key -> "true")
 
   private def loadImdb(): Unit = {
     new File(imdbDir).listFiles().filter(_.isDirectory).foreach { d =>

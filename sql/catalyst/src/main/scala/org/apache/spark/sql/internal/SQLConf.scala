@@ -3613,13 +3613,6 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
-  val YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED =
-    buildConf("spark.sql.yannakakis.physicalCountJoinEnabled")
-      .doc("Apply a physical operator combining the join and aggregation steps")
-      .version("3.5.0")
-      .booleanConf
-      .createWithDefault(false)
-
   val YANNAKAKIS_UNGUARDED_ENABLED =
     buildConf("spark.sql.yannakakis.unguardedEnabled")
       .doc("Optimize unguarded queries (only takes effect when spark.sql.yannakakis.enabled)")
@@ -7451,9 +7444,6 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def yannakakisEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_ENABLED)
 
   def yannakakisCountGroupInLeavesEnabled: Boolean = getConf(SQLConf.YANNAKAKIS_COUNT_GROUP_LEAVES)
-
-  def yannakakisPhysicalCountEnabled: Boolean =
-    getConf(SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED)
 
   def yannakakisUnguardedEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_UNGUARDED_ENABLED)

@@ -263,7 +263,6 @@ class TPCHMiniReproSuite extends QueryTest with SharedSparkSession {
     val rewriteOn = Seq(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
     for ((name, query) <- queries) {
       // Count-join operators and how many group (groupRight non-empty -> grouped codegen path).
@@ -313,8 +312,7 @@ class TPCHMiniReproSuite extends QueryTest with SharedSparkSession {
       try {
         withSQLConf(
           SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-          SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-          SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true") {
+          SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true") {
           val df = sql(query)
           val rows = df.collect().toSeq
           val applied = df.queryExecution.executedPlan.toString.contains("CountJoin")

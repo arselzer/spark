@@ -157,7 +157,6 @@ class STATSBenchmarkSuite extends QueryTest with SharedSparkSession {
       SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
     val onConf = aqeOff ++ Seq(SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true",
       SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")
     val offTimeout = sys.env.getOrElse("STATS_OFF_TIMEOUT", "15").toInt
     val onTimeout = sys.env.getOrElse("STATS_ON_TIMEOUT", "60").toInt

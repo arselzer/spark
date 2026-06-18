@@ -100,8 +100,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     // With Yannakakis enabled
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -109,8 +108,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     // With Yannakakis enabled (second run for coverage)
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -148,8 +146,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     // With Yannakakis enabled
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -157,8 +154,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     // With Yannakakis enabled (second run for coverage)
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -194,8 +190,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     // With Yannakakis
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -231,8 +226,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -310,8 +304,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     // With Yannakakis enabled
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation) - GROUP BY test ===")
@@ -328,8 +321,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
     // as the GROUP BY attribute. This test verifies that the query at least runs correctly.
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation (second run)) - GROUP BY test ===")
@@ -397,8 +389,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation) - Multiple products test ===")
@@ -409,8 +400,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (second run) - Multiple products test ===")
@@ -483,8 +473,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation) - Two products ===")
@@ -496,8 +485,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation (second run)) - Two products ===")
@@ -576,8 +564,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation) - Fan-out ===")
@@ -589,8 +576,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation (second run)) - Fan-out ===")
@@ -700,8 +686,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
         ) {
         val df = sql(query)
         if (i == 1) {
@@ -741,8 +726,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
       withSQLConf(
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-        SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
         ) {
         val df = sql(query)
         if (i == 1) {
@@ -875,8 +859,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation) - Star schema ===")
@@ -887,8 +870,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (early product computation (second run)) - Star schema ===")
@@ -1016,16 +998,14 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResults)
     }
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResults)
     }
@@ -1103,8 +1083,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy OFF) - GROUP BY with products ===")
@@ -1113,8 +1092,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy ON) - GROUP BY with products ===")
@@ -1165,8 +1143,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy OFF) - High fan-out ===")
@@ -1175,8 +1152,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS (lazy ON) - High fan-out ===")
@@ -1253,8 +1229,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy OFF) - 5-way linear join ===")
       val df = sql(query)
@@ -1264,8 +1239,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy ON) - 5-way linear join ===")
       val df = sql(query)
@@ -1345,8 +1319,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy OFF) - star schema join ===")
       val df = sql(query)
@@ -1356,8 +1329,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy ON) - star schema join ===")
       val df = sql(query)
@@ -1441,8 +1413,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy OFF) - cascading fan-out ===")
       val df = sql(query)
@@ -1452,8 +1423,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       println("\n=== YANNAKAKIS (lazy ON) - cascading fan-out ===")
       val df = sql(query)
@@ -1588,8 +1558,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       checkAnswer(sql(query), expectedResult)
     }
@@ -1765,8 +1734,7 @@ class LazyReductionSuite extends QueryTest with SharedSparkSession {
 
     withSQLConf(
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true"
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true"
     ) {
       val df = sql(query)
       println("\n=== YANNAKAKIS - 12-table real cardinalities ===")

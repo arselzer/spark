@@ -164,8 +164,7 @@ class TPCHApplicabilitySuite extends QueryTest with SharedSparkSession {
         withLogAppender(appender) {
           withSQLConf(
             SQLConf.YANNAKAKIS_ENABLED.key -> "true",
-            SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
-            SQLConf.YANNAKAKIS_PHYSICAL_COUNTJOIN_ENABLED.key -> "true") {
+            SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true") {
             runQuery(stmts) // warmup (also produces the classification logs)
             rewritten = runQuery(stmts)
           }

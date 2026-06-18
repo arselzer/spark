@@ -25,7 +25,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, TypedImperativeAggregate}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, ShufflePartitionIdPassThrough, SinglePartition}
-import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.catalyst.trees.{CurrentOrigin, TreeNodeTag}
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
@@ -785,6 +785,66 @@ case class CountJoin(
                  groupRight: Seq[NamedExpression],
                  hint: JoinHint)
   extends BinaryNode with PredicateHelper {
+
+  // CountJoin carries aggregate/count/group specs in fields that later rules still see as
+  // expressions. Preserve those promised wrapper types while allowing valid rewrites, such
+  // as AttributeReference remapping; DecimalAggregates and constant folding can otherwise
+  // replace them with plain Expressions and break CountJoin.output or physical planning.
+  override def mapExpressions(f: Expression => Expression): this.type = {
+    var changed = false
+
+    def applyRule(expr: Expression): Expression = {
+      CurrentOrigin.withOrigin(expr.origin) {
+        f(expr)
+      }
+    }
+
+    def acceptExpression(expr: Expression, newExpr: Expression): Expression = {
+      if (!newExpr.fastEquals(expr)) {
+        changed = true
+      }
+      newExpr
+    }
+
+    def preserveNamedExpression(expr: NamedExpression): NamedExpression = {
+      applyRule(expr) match {
+        case named: NamedExpression =>
+          acceptExpression(expr, named).asInstanceOf[NamedExpression]
+        case _ =>
+          expr
+      }
+    }
+
+    def preserveAggregateExpression(expr: AggregateExpression): AggregateExpression = {
+      applyRule(expr) match {
+        case aggregate: AggregateExpression =>
+          acceptExpression(expr, aggregate).asInstanceOf[AggregateExpression]
+        case _ =>
+          expr
+      }
+    }
+
+    val newCondition = condition.map { expr =>
+      acceptExpression(expr, applyRule(expr))
+    }
+    val newCountLeft = countLeft.map { expr =>
+      acceptExpression(expr, applyRule(expr))
+    }
+    val newCountRight = countRight.map(preserveNamedExpression)
+    val newAggregatesRight = aggregatesRight.map(preserveAggregateExpression)
+    val newGroupRight = groupRight.map(preserveNamedExpression)
+
+    if (changed) {
+      copy(
+        condition = newCondition,
+        countLeft = newCountLeft,
+        countRight = newCountRight,
+        aggregatesRight = newAggregatesRight,
+        groupRight = newGroupRight).asInstanceOf[this.type]
+    } else {
+      this
+    }
+  }
 
   override def maxRows: Option[Long] = {
     joinType match {
