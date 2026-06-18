@@ -401,6 +401,43 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("cost gate skips non-expanding joins with a column-stat unique side") {
+    withTable("cg_unique_fact", "cg_unique_dim") {
+      sql("CREATE TABLE cg_unique_fact (k INT, v DOUBLE) USING parquet")
+      sql("CREATE TABLE cg_unique_dim (k INT) USING parquet")
+      sql("INSERT INTO cg_unique_fact VALUES (1, 10.0), (2, 20.0), (3, 30.0)")
+      sql("INSERT INTO cg_unique_dim VALUES (1), (2), (3)")
+
+      val q = "select sum(f.v) as s from cg_unique_fact f join cg_unique_dim d on f.k = d.k"
+      var expected: Seq[Row] = null
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        expected = sql(q).collect().toSeq
+      }
+
+      val gateOnNoBroadcast = Seq(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true",
+        SQLConf.CBO_ENABLED.key -> "true",
+        SQLConf.PLAN_STATS_ENABLED.key -> "true",
+        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
+      withSQLConf(gateOnNoBroadcast: _*) {
+        val withoutColStats = sql(q)
+        checkAnswer(withoutColStats, expected)
+        assert(withoutColStats.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+          "without column stats, broadcast-disabled cost gate should keep the rewrite")
+      }
+
+      sql("ANALYZE TABLE cg_unique_dim COMPUTE STATISTICS FOR COLUMNS k")
+      withSQLConf(gateOnNoBroadcast: _*) {
+        val withUniqueSideStats = sql(q)
+        checkAnswer(withUniqueSideStats, expected)
+        assert(!withUniqueSideStats.queryExecution.optimizedPlan.toString.contains("CountJoin"),
+          "cost gate should skip a non-expanding join with a unique column-stat side")
+      }
+    }
+  }
+
   test("non-guarded collect_set rides the distinct-reduced path and is correct") {
     Seq((1, 10), (2, 20)).toDF("g", "k").createOrReplaceTempView("cs_r1")
     Seq((10, 100), (10, 200), (20, 300)).toDF("k", "m").createOrReplaceTempView("cs_r2")

@@ -3637,9 +3637,9 @@ object SQLConf {
 
   val YANNAKAKIS_COST_GATE_ENABLED =
     buildConf("spark.sql.yannakakis.costGateEnabled")
-      .doc("Skip the count-join rewrite when vanilla Spark would broadcast every base " +
-        "relation except the largest (a broadcast-friendly star schema), where the " +
-        "interpreted count-join only adds cost with no reduction benefit")
+      .doc("Skip the count-join rewrite when vanilla Spark is already near-optimal: " +
+        "broadcast-friendly low-fanout joins, or stats-backed non-expanding joins where " +
+        "CountJoin only adds count propagation work with little reduction benefit")
       .version("3.5.0")
       .internal()
       .booleanConf

@@ -17,12 +17,14 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
+import scala.annotation.tailrec
 import scala.collection.mutable
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.dsl.expressions.DslExpression
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
+import org.apache.spark.sql.catalyst.planning.NodeWithOnlyDeterministicProjectAndFilter
 import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.{FullOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
@@ -43,10 +45,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
 
   /**
    * Cost gate for the count-join rewrite. Returns true when vanilla Spark would broadcast
-   * every base relation except the single largest - a broadcast-friendly star schema where
-   * the baseline is already near-optimal and the (interpreted, codegen-disabled) count-join
-   * only adds per-row cost with no reduction benefit. In that regime the rewrite should not
-   * fire. Conservative: with no usable size stats, sizeInBytes defaults are large so the
+   * every base relation except the single largest: a broadcast-friendly shape where the baseline
+   * is already near-optimal and CountJoin adds count propagation work with little reduction
+   * benefit. Conservative: with no usable size stats, sizeInBytes defaults are large so the
    * gate does not trigger and the rewrite proceeds as before.
    */
   private def baselineBroadcastsAllButLargest(items: Seq[LogicalPlan]): Boolean = {
@@ -60,6 +61,76 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     }
   }
 
+  @tailrec
+  private def findLeafNodeCol(column: Attribute, plan: LogicalPlan): Option[Attribute] = {
+    plan match {
+      case pl @ NodeWithOnlyDeterministicProjectAndFilter(_: LeafNode) =>
+        pl match {
+          case t: LeafNode if t.outputSet.contains(column) =>
+            Some(column)
+          case p: Project if p.outputSet.exists(_.semanticEquals(column)) =>
+            val col = p.outputSet.find(_.semanticEquals(column)).get
+            findLeafNodeCol(col, p.child)
+          case f: Filter =>
+            findLeafNodeCol(column, f.child)
+          case _ =>
+            None
+        }
+      case _ =>
+        None
+    }
+  }
+
+  private def hasUniqueKeyStats(column: Attribute, plan: LogicalPlan): Boolean = {
+    plan match {
+      case NodeWithOnlyDeterministicProjectAndFilter(t: LeafNode) =>
+        findLeafNodeCol(column, plan).exists { leafCol =>
+          t.outputSet.contains(leafCol) && t.stats.rowCount.exists(_ > 0) &&
+            t.stats.attributeStats.get(leafCol).exists { colStats =>
+              colStats.hasCountStats && colStats.nullCount.get == 0 && {
+                val rowCount = t.stats.rowCount.get
+                val distinctCount = colStats.distinctCount.get
+                val relDiff = math.abs((distinctCount.toDouble / rowCount.toDouble) - 1.0d)
+                relDiff <= conf.ndvMaxError * 2
+              }
+            }
+        }
+      case _ =>
+        false
+    }
+  }
+
+  /**
+   * True when column stats strongly indicate that every equi-join condition has a non-null unique
+   * side. This is the row-preserving FK/dimension regime: there is little join fan-out for
+   * CountJoin to collapse, so the rewrite tends to carry the same rows as vanilla while adding
+   * count propagation work. This deliberately requires usable column stats; without them the
+   * existing fan-out-biased gate wins.
+   */
+  private def allEquiJoinsHaveUniqueSide(
+      items: Seq[LogicalPlan],
+      conditions: ExpressionSet): Boolean = {
+    val equalities = conditions.collect {
+      case EqualTo(lhs: Attribute, rhs: Attribute) => (lhs, rhs)
+      case EqualTo(Cast(lhs: Attribute, _, _, _), rhs: Attribute) => (lhs, rhs)
+      case EqualTo(lhs: Attribute, Cast(rhs: Attribute, _, _, _)) => (lhs, rhs)
+    }.toSeq
+    equalities.nonEmpty && equalities.forall { case (lhs, rhs) =>
+      val leftPlans = items.filter(_.outputSet.contains(lhs))
+      val rightPlans = items.filter(_.outputSet.contains(rhs))
+      leftPlans.exists(hasUniqueKeyStats(lhs, _)) || rightPlans.exists(hasUniqueKeyStats(rhs, _))
+    }
+  }
+
+  private def dominatedByOneLargeInput(items: Seq[LogicalPlan], hg: Hypergraph): Boolean = {
+    if (items.size <= 1 || hg.maxKeyDegree >= 3) {
+      false
+    } else {
+      val sizes = items.map(_.stats.sizeInBytes).sorted
+      sizes.dropRight(1).lastOption.exists(secondLargest => secondLargest * 20 <= sizes.last)
+    }
+  }
+
   /**
    * Cost-gate decision: skip the rewrite (keep vanilla) only when vanilla is already near-optimal.
    * The broadcast-size signal ALONE is wrong for fan-out blow-ups: relations can be small (all
@@ -70,8 +141,15 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
    * asymmetry favours keeping: wrongly applying the count-join costs a little overhead, wrongly
    * skipping a fan-out query can be catastrophic.
    */
-  private def costGateSkips(items: Seq[LogicalPlan], hg: Hypergraph): Boolean =
-    baselineBroadcastsAllButLargest(items) && hg.maxKeyDegree < 3
+  private def costGateSkips(
+      items: Seq[LogicalPlan],
+      conditions: ExpressionSet,
+      hg: Hypergraph,
+      skipNonExpanding: Boolean = false): Boolean =
+    (baselineBroadcastsAllButLargest(items) && hg.maxKeyDegree < 3) ||
+      (skipNonExpanding && conf.yannakakisCostGateEnabled &&
+        (allEquiJoinsHaveUniqueSide(items, conditions) ||
+          dominatedByOneLargeInput(items, hg)))
 
   // A "product aggregate" is a SUM over 2+ non-count attributes from different relations (e.g.
   // SUM(a*b)); a "cross-relation filter" is a non-equi predicate spanning relations. Both are
@@ -745,8 +823,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
                 hg.getAttributeToVertex.get(out.exprId).contains(v))
                 .map(out => Alias(out, att.name)(exprId = att.exprId))))
 
-          if (costGateSkips(items, hg)) {
-            debugLog("cost gate: vanilla near-optimal (broadcast star, low fan-out) - " +
+          val nonExpandingJoins =
+            allEquiJoinsHaveUniqueSide(items, conditions) || dominatedByOneLargeInput(items, hg)
+          val nonReducingPiecewise =
+            piecewiseGuarded && conf.yannakakisCostGateEnabled && nonExpandingJoins
+          if (costGateSkips(items, conditions, hg, skipNonExpanding = !piecewiseGuarded) ||
+              nonReducingPiecewise) {
+            debugLog("cost gate: vanilla near-optimal or non-expanding FK join - " +
               "keeping original plan (count-join would only add cost)")
             return agg
           }
@@ -1064,8 +1147,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
             val rewrittenResultExpressions = resultExpressions.map(e =>
               rewriteGuardedAggregate(e).asInstanceOf[NamedExpression])
 
-            if (costGateSkips(items, hg)) {
-              debugLog("cost gate: vanilla near-optimal (broadcast star, low fan-out) - " +
+            if (costGateSkips(items, conditions, hg, skipNonExpanding = true)) {
+              debugLog("cost gate: vanilla near-optimal or non-expanding FK join - " +
                 "keeping original plan (count-join would only add cost)")
               return agg
             }
@@ -1165,6 +1248,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       aggExpressions: Seq[NamedExpression],
       projectList: Seq[NamedExpression],
       join: Join): Option[LogicalPlan] = {
+    if (conf.yannakakisCostGateEnabled) {
+      return None
+    }
     val aggs = aggExpressions.flatMap(_.collect { case ae: AggregateExpression => ae })
     val (dupInsensitive, counting) = aggs.partition(isDuplicateInsensitive)
     if (dupInsensitive.isEmpty || counting.isEmpty) return None  // not mixed
@@ -1270,7 +1356,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       aggExpressions: Seq[NamedExpression],
       projectList: Seq[NamedExpression],
       join: Join): Option[LogicalPlan] = {
-    if (!conf.yannakakisEnabled) return None
+    if (!conf.yannakakisEnabled || conf.yannakakisCostGateEnabled) return None
     // Normalise RIGHT OUTER to LEFT OUTER by swapping the join sides (always sound). FULL OUTER is
     // kept as-is and handled with an extra (B-only) anti half below. A conditionless (cartesian)
     // outer join is not handled.
@@ -2484,8 +2570,7 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
         dbg("rightCountAttribute: " + rightCountAttribute)
         dbg(s"leftPlan.output: ${leftPlan.output.map(a => s"${a.name}#${a.exprId.id}")}")
         dbg(s"right.output: ${right.output.map(a => s"${a.name}#${a.exprId.id}")}")
-        val countJoin = // if (applicableGroupAttributes.isEmpty) {
-          // No grouping
+        val countJoin =
           CountJoin(leftPlan, right,
             Inner, Option(joinConditions),
             Option(if (isLeafNode) prevCountExpr else leftCountAttribute),
