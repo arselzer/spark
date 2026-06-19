@@ -1575,3 +1575,62 @@ Open leads recorded above, ranked for the optimization pass:
    gate, so q97 stays base in prod).
 
 Reproduce: `tpcds-countjoin-setup.sh` then `tpcds-countjoin-sweep.sh` (or the per-group commands).
+
+## 2026-06-19 OPTIMIZATION PASS: lower slowdowns + bigger speedups
+
+Goal (user): make the rewrite robust so its worst case is close to base (much lower slowdowns), and
+ideally capture more speedups. Working autonomously; committing each validated increment.
+
+Risk-ordered plan (from a multi-agent code-map + adversarial design pass over the rule):
+
+1. Mode A guards (forced-only, zero prod-win risk) - tryRewriteOuter + trySplitMixedDistinct.
+2. Mode B fan-out guard (count-join builder) behind a new opt-in flag.
+3. Gate relaxation for the confirmed missed wins q15/q69 (highest risk; do last, full re-sweep).
+
+Key diagnosis correction (from forced plan dumps, plans_diagnosis.log):
+
+- Mode A (work-DOUBLING, q72/q94/q95) is NOT in the count-join/semijoin reducer chains - those
+  correctly REPLACE (thread prevPlan, one join per edge like vanilla). It is the two
+  split-and-UNION/recombine pre-passes that BOTH re-join the same large subtree twice:
+  - tryRewriteOuter (:1562, q72): `A LEFT JOIN B == (A INNER JOIN B) UNION (A LEFT ANTI JOIN B)`,
+    where the inner and anti halves each re-join/re-sort the entire big `left` chain -> exact 2x
+    SMJ/Sort/smjOut/sortPeak.
+  - trySplitMixedDistinct (:1271, q94/q95): count(DISTINCT)+sum split into two halves over the SAME
+    base join, recombined by an Inner join -> exact 2x.
+  - BOTH early-return when the cost gate is ON (:1568, :1277), so they run only in forced mode -
+    which is exactly why prod has 0 regressions but forced doubles. Guarding them CANNOT regress any
+    prod win (those paths are prod-disabled and disjoint from the win paths q4/q11 pre-agg and the
+    CountJoin chains).
+
+- Mode B (stream EXPLOSION, q2/q3): the count-join replaces a SELECTIVE BROADCAST join (tiny
+  filtered date_dim/item broadcast to store_sales) with a SHUFFLE-based ShuffledHashCountJoin that
+  shuffles all ~14M store_sales rows. The count-join forces a shuffle where a broadcast was optimal,
+  with no offsetting group collapse.
+
+- q15 missed win (why the gate is wrong): base broadcasts everything then aggregates 7.7M rows
+  (aggMs 4412 - the bottleneck); the count-join pre-aggregates (carries counts through broadcast
+  count-joins) so the final aggregate sees far fewer rows (aggMs 431, ~10x less). costGateSkips keys
+  only on JOIN broadcast-friendliness (baselineBroadcastsAllButLargest && maxKeyDegree<3) and never
+  looks at the AGGREGATE, so it skips q15. The fix must make the gate reduction/aggregate-aware.
+
+Decision - Mode A fix (committed): guard each splitter with `canBroadcastBySize(<duplicated
+subtree>, conf)` - only split when re-joining the duplicated subtree (`left` for the outer split,
+`join` for the mixed-distinct split) is cheap. Rationale: the cost of these splits is the DUPLICATED
+JOIN COMPUTE, not the output size, so the design's first-draft rowCount-of-output check was rejected
+(q94 is a global aggregate with ~1-row output yet doubles a 7M-row self-join - the output check would
+let it through). The broadcast-size check is gate-independent, conservative on missing stats (skip),
+and since no measured win uses these paths, the worst case is "forced behaves like base" - exactly
+the robustness goal.
+
+Mode A RESULT (verified, SF5 warm-min, YannakakisCorrectnessSuite 118/118 pass):
+
+| query | forced before | forced after | base | note |
+|---|---:|---:|---:|---|
+| q72 | 87580 (-79%) | 46865 | 48010 | now +2% vs base (was ~1.8x slower) |
+| q95 | 31997 (-82%) | 16067 | 16681 | now +4% vs base |
+| q94 | 4695 (-68%) | 2972 | 3205 | now +7% vs base |
+
+smjOut and sortPeak now match base exactly (e.g. q94 smjOut 3597882 == base, sortPeak 822083456 ==
+base) - the duplicated join/sort branch is gone. The three worst split-doubling forced slowdowns are
+eliminated; the rewrite falls back to the base plan (or a non-doubling rewrite) when re-joining the
+duplicated subtree is not broadcast-cheap. Prod unchanged (these paths are prod-disabled).

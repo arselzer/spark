@@ -1319,6 +1319,14 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       // At least one half was not accelerated - do not double the join.
       return None
     }
+    // Robustness: both halves rewrite over the SAME base join, materializing it twice (q94/q95
+    // doubled the SMJ+sort over web_sales: smjOut/sortPeak ~2x, ~1.7-1.8x slower). The split only
+    // pays when re-joining that base is cheap, i.e. broadcast-eligible by size; otherwise keep the
+    // single-pass plan. Gate-independent (this path runs only when the cost gate is off) and
+    // conservative on missing stats (sizeInBytes defaults large -> skip the split).
+    if (!canBroadcastBySize(join, conf)) {
+      return None
+    }
 
     val joinCond = distinctJoinKeys.zip(additiveJoinKeys).map {
       case (l, r) => EqualNullSafe(l.toAttribute, r.toAttribute): Expression
@@ -1663,6 +1671,14 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     if (matchedRewritten eq matchedHalf) {
       // The inner half was not accelerated: do not replace one join with two (matched inner +
       // unmatched anti) for no benefit.
+      return None
+    }
+    // Robustness: the inner+anti decomposition re-joins `left` twice (q72 doubled the SMJ+sort over
+    // its 9-table chain: smjOut/sortPeak ~2x, ~1.8x slower). The split only pays when re-joining
+    // `left` is cheap, i.e. broadcast-eligible by size; otherwise keep the original outer join.
+    // Gate-independent (this path runs only when the cost gate is off) and conservative on missing
+    // stats (sizeInBytes defaults large -> keep the original).
+    if (!canBroadcastBySize(left, conf)) {
       return None
     }
 
