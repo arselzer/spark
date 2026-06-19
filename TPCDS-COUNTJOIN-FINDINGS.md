@@ -1074,6 +1074,12 @@ counts.
 TPC-DS diagnostic/proper suites use real data if present and create parquet cache directories when
 needed.
 
+Reproducible setup: on a fresh machine with no data/toolchain, run `./tpcds-countjoin-setup.sh`.
+It installs `flex`/`bison`/OpenJDK 17, clones and builds `databricks/tpcds-kit` dsdgen (patched for
+GCC 14+), and generates SF5 `.dat` data into `/tmp/tpcds-sf5`. Override `SCALE`, `TPCDS_DIAG_DATA`,
+`TPCDS_DIAG_PARQUET`, etc. via env vars. Then run the full sweep with `./tpcds-countjoin-sweep.sh`
+(see "Full TPC-DS production diagnostic sweep" below — the script encodes the same grouping).
+
 Defaults:
 
 - `TPCDS_DIAG_DATA=/tmp/tpcds-sf5`
@@ -1331,3 +1337,241 @@ On a new server, either put/symlink the data there or parameterize the suite bef
 No dedicated STATS benchmark harness was found in this checkout under
 `sql/core/src/test/scala/org/apache/spark/sql`; use the external STATS harness if it exists on the
 benchmark machine.
+
+## 2026-06-19 optimization lead: pre-aggregate through an IN-semijoin (q14a/q14b)
+
+Source: SF5 warm-min gate sweep (`base,forced,prod`, suite warmup=1/iters=2, report MIN ms).
+Classification uses plan shape + work counters, not raw ms.
+
+Opportunity: q14a/q14b's per-channel aggregate is structurally a q4/q11-style decorating-dimension
+pre-aggregate win, but the rewrite is currently blocked from firing by an `IN (...)` semijoin that
+wraps the inner join. Teaching `tryPushAggregatePastDecoratingDimension` to push the per-channel
+`sum`/`count` below the `item` join *through* that semijoin could convert q14a/q14b from
+gate-skip-correct into wins.
+
+Measured state (warm-min, SF5):
+
+| query | base ms | forced ms | prod ms | prod shape | gate decision |
+|---|---:|---:|---:|---|---|
+| q14a | 15691 | 23921 (-52%) | 15171 | unchanged (== base) | correctly skipped |
+| q14b | 13354 | 21084 (-58%) | 13067 | unchanged (== base) | correctly skipped |
+
+In `forced` (cost gate off) the rule takes the counting/semijoin path (CountJoin + LeftSemi
+reductions for the 3-way channel INTERSECT). That path is non-reducing here: `shuffleRecords` is
+unchanged (~31M / ~20M) while it adds sort-merge joins and sorts. Counter damage in forced vs base:
+`smjOut` 56.8K -> 23.6M (~400x), `sortPeak` 1.17G -> 4.56G (~4x), `aggMs` 7.1K -> 53.8K (~7.6x).
+The cost gate correctly rejects this and `prod` stays on the base plan. So the current prod behavior
+is right; this is about unlocking a *new* win, not fixing a regression.
+
+Why the per-channel block is pre-agg-eligible (same shape as q4/q11):
+
+```sql
+SELECT i_brand_id, i_class_id, i_category_id,
+       sum(ss_quantity * ss_list_price), count(*)   -- mergeable sum + count
+FROM store_sales, item, date_dim                     -- InnerLike, 3 items
+WHERE ss_item_sk IN (SELECT ... FROM cross_items)    -- LeftSemi wrapper (the blocker)
+  AND ss_item_sk = i_item_sk AND ss_sold_date_sk = d_date_sk
+  AND d_year = 2001 AND d_moy = 11
+GROUP BY i_brand_id, i_class_id, i_category_id        -- 3 grouping refs on wide dim `item`
+HAVING sum(...) > (SELECT average_sales FROM avg_sales)
+```
+
+The aggregate types, the >=3-item inner join, and the wide decorating dimension (`item` carrying
+brand/class/category) all match the pre-agg pre-reqs in `tryPushAggregatePastDecoratingDimension`
+(RewriteJoinsAsSemijoins.scala:1808-1924). The blocker is the `ss_item_sk IN (cross_items)`
+semijoin (and the scalar `HAVING`) between the aggregate and the inner join: it breaks the
+`Aggregate -> (Project) -> InnerLike Join of >=3 plain items` match, and `extractInnerJoins`
+(scala:1860) does not surface 3 clean items through the LeftSemi.
+
+Caveats / ranking:
+
+- The dominant cost of q14 is the three-way channel INTERSECT (existence / LeftSemi reduction),
+  which pre-agg does not touch. So even a successful pre-agg push is an incremental per-channel win,
+  not a fix for the whole query. Rank this BELOW q50 (delayed-existence/bucket fusion) and q64
+  (aggregate-carrying CountJoin fusion).
+- Confidence: HIGH that pre-agg is currently blocked (empirical: `forced` does not produce the
+  pre-agg shape, and `forced` runs pre-agg first with no gate guards). MEDIUM on exactly which
+  pre-req rejects it (semijoin wrapper vs `extractInnerJoins` item count). Confirming needs a
+  debug-logged plan trace of `tryPushAggregatePastDecoratingDimension` on q14a.
+- Validation if pursued: q14a/q14b should move from `unchanged`/gate-skip to a CHANGED pre-agg shape
+  with reduced `shuffleRecords` and `sortPeak`, without regressing the q4/q11/q24/q25/q29/q64 wins.
+
+## 2026-06-19 gate-tuning candidates: q15 / q58 possible missed opportunities (NEEDS VERIFICATION)
+
+Source: same SF5 warm-min gate sweep (q15 in group 8 light batch 1; q58 in group 7 semijoin
+mediums). Both flagged `gate-skip MISSED-OPP`: `forced` was faster than `base` while the cost gate
+kept the base plan (prod == base).
+
+| query | base ms | forced ms | prod ms | prod shape | flag | strength |
+|---|---:|---:|---:|---|---|---|
+| q15 | 1541 | 644 (+58%) | 1470 | unchanged (== base) | gate-skip MISSED-OPP? | clearer (2.4x, beyond noise floor) |
+| q69 | 1819 | 1232 (+32%) | 1863 | unchanged (== base) | gate-skip MISSED-OPP? | moderate (above ~22% floor) |
+| q58 | 1531 | 1130 (+26%) | 1431 | unchanged (== base) | gate-skip MISSED-OPP? | weak (near noise floor) |
+
+CAVEAT - both are small (~1.5s) queries, so verify before trusting:
+
+- The warm-min noise floor measured on same-shape q1 is ~22% at warmup=1/iters=2. q58's +26% is
+  barely above it; q15's +58% (2.4x) is clearly above it and is the stronger lead.
+- Work counters in the swept (prod==base) shape are tiny (q15 `shuffleRecords` ~485; q58 ~120.8K),
+  so there is not yet counter-level evidence of a structural win - the forced edge must be confirmed
+  with the forced-mode counters at higher iterations.
+
+Verification plan (run when the sweep frees the build; do NOT run concurrently with another sbt):
+
+```bash
+TPCDS_DIAG_DATA=/tmp/tpcds-sf5 TPCDS_DIAG_PARQUET=/tmp/tpcds-sf5-parquet \
+TPCDS_DIAG_QUERIES=q15,q69,q58 TPCDS_DIAG_MODES=base,forced,prod \
+TPCDS_DIAG_WARMUP=2 TPCDS_DIAG_ITERS=5 \
+  build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinDiagnosticsSuite'
+```
+
+Treat as a real missed opportunity ONLY if, at warmup=2/iters=5, `forced` stays clearly below `base`
+(beyond the ~20% floor) AND `forced` shows reduced `shuffleRecords` vs `base`. Otherwise close as
+warmup/order noise. If real, the lead is: relax the cost gate so the (semijoin-reduction) forced
+shape is allowed in prod for these queries.
+
+VERDICT (warmup=2/iters=5, 5 iterations each, distributions checked for overlap):
+
+| query | base min | forced min | speedup | distributions overlap? | shufRec base->forced | verdict |
+|---|---:|---:|---:|---|---|---|
+| q15 | 1607 | 677 | +58% | NO (forced 677-723 vs base 1607-1818) | 485 -> 483470 | CONFIRMED real |
+| q69 | 1911 | 1238 | +35% | NO (forced 1238-1309 vs base 1911-2058) | 981398 -> 984133 | CONFIRMED real |
+| q58 | 1440 | 1188 | +17% | NO but close (forced max 1316 < base min 1440) | 120775 -> 282086 | borderline (real, small) |
+
+q15 and q69 are CONFIRMED real missed opportunities: the per-iteration distributions do not overlap,
+so the speedup is not warmup/order noise - the cost gate is skipping a rewrite that is genuinely
+58% / 35% faster.
+
+IMPORTANT correction to the original criterion: the "forced must REDUCE shuffleRecords" filter was
+WRONG. q15 forced shuffles ~1000x MORE records (485 -> 483K) yet is robustly 58% faster, and q58
+shuffles ~2.3x more yet is faster. So the win does NOT come from shuffle reduction; the forced
+(semijoin-reduction) shape avoids some expensive operation in the base broadcast plan despite adding
+a shuffle. Use ms distribution non-overlap as the primary real/noise test for small queries, not the
+shuffle counter.
+
+Lead for the optimization pass: the cost gate is OVER-CONSERVATIVE for this semijoin-reduction shape
+on q15/q69 (and marginally q58) - the mirror image of the forced-slowdown robustness item. Next step
+is to capture the q15/q69 forced PLAN (TPCDS_DIAG_PRINT_PLAN=true) to see which base operation the
+rewrite avoids, then teach the gate to allow it. Rank q15 first (largest, cleanest signal).
+
+## 2026-06-19 robustness investigation (DEFERRED): make forced (ungated) slowdowns less bad
+
+Motivation: several `forced` (cost-gate OFF) runs are not just "rewrite not worth it" - they are
+catastrophic and look pathological (q3 ~9x, q2 ~4x, q72/q95 ~1.8x, q94 ~1.7x slower). Production is
+currently safe only because the cost gate vetoes them (all are correctly `gate-skip` in prod). We
+want defense in depth: make the rewrite's worst case closer to base so robustness does not rely
+solely on the gate's stats being right. If the gate ever mis-estimates, the downside should be mild,
+not a 2-9x regression.
+
+Evidence (SF5 warm-min, base vs forced):
+
+| query | SMJ b->f | Sort b->f | smjOut b->f | sortPeak b->f | cjOut (forced) | shufRec b->f | ms b->f |
+|---|---|---|---|---|---:|---|---|
+| q72 | 1->2 | 2->4 | 390.9M->781.8M | 5.64G->11.27G | 1.5K | 54.0M->54.0M | 48892->87580 |
+| q95 | 4->8 | 6->12 | 77.5M->154.9M | 3.72G->6.99G | 302K | 7.2M->10.8M | 17561->31997 |
+| q94 | 1->2 | 2->4 | 3.6M->7.2M | 822M->1.64G | 115K | 7.2M->10.8M | 2799->4695 |
+| q14a | 2->6 | 4->12 | 56.8K->23.6M | 1.17G->4.56G | 782.9K | 31.3M->31.2M | 15691->23921 |
+| q2 | 0->0 | 1->1 | 0->0 | 67M->67M | 10.76M | 3.9K->3.9K | 1688->6598 |
+| q3 | 0->0 | 0->0 | 0->0 | 0->0 | 1.70M | 1.5K->14.16M | 690->6056 |
+
+Two suspicious failure modes:
+
+- MODE A - exact work-DOUBLING (q72, q94, q95): forced precisely doubles SMJ count, Sort count,
+  `smjOut`, and `sortPeak`. The 2x is the tell: the reducer is added as a DUPLICATE branch that
+  re-sorts/re-joins the same large input the base plan already processes, instead of replacing or
+  shrinking it. A semijoin reduction should reduce the input before the join; here it appears purely
+  additive. (q14a is the same shape but the reduction itself expands -> `smjOut` 416x.)
+- MODE B - stream EXPLOSION (q2, q3): forced injects a CountJoin whose output balloons 1000-10000x
+  over a tiny base (q3: 1.5K -> 14.2M shuffle records; q2: cjOut 0 -> 10.8M) for queries whose final
+  result is only thousands of rows. The count-join fan-out is not reduced.
+
+Gate-independent robustness directions to investigate:
+
+1. Make the rewrite strictly REPLACE, not augment. If a semijoin reducer cannot actually shrink the
+   downstream join input (Mode A), do not materialize it as an extra sorted/joined branch - reuse the
+   existing scan/build, or skip the reducer. Worst case should then be ~= base, not 2x base.
+2. Bound CountJoin construction by estimated fan-out (Mode B): if the count-join's estimated output
+   (`cjOut`) vastly exceeds the final aggregate output / base shuffle, the count carry is not paying
+   for itself - build it only when the carried count is expected to reduce, not expand, the stream.
+   This is a structural guard inside the builder, distinct from the whole-plan cost gate.
+3. Avoid double-sorting: where the reducer and the main join both sort the same key, share one sort.
+
+Deferred deep-investigation method (run when the build is free; needs the forced PLAN, which the
+sweep did not capture):
+
+```bash
+TPCDS_DIAG_DATA=/tmp/tpcds-sf5 TPCDS_DIAG_PARQUET=/tmp/tpcds-sf5-parquet \
+TPCDS_DIAG_QUERIES=q3,q2,q72,q95,q94,q14a TPCDS_DIAG_MODES=base,forced \
+TPCDS_DIAG_PRINT_PLAN=true TPCDS_DIAG_WARMUP=1 TPCDS_DIAG_ITERS=1 \
+  build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinDiagnosticsSuite'
+```
+
+Then diff base vs forced `TPCDS-DIAG-PLAN` trees to confirm the duplicated-subtree (Mode A) and
+fan-out (Mode B) hypotheses, and locate the responsible construction in `buildBottomUpJoins` /
+`buildBottomUpJoinsCounting` (RewriteJoinsAsSemijoins.scala). This characterization fans out cleanly
+per query and is a good candidate for a Workflow when picked up.
+
+## 2026-06-19 FINAL: full post-guard SF5 sweep (warm-min, shape-classified)
+
+This is the definitive post-guard production measurement that the prior handoff said was still
+needed. It supersedes the pre-guard 103-variant counts as the current production picture.
+
+Methodology:
+
+- Data: real TPC-DS SF5 (dsdgen), generated via `tpcds-countjoin-setup.sh`.
+- Suite: `TPCDSCountJoinDiagnosticsSuite`, now with warmup+iteration support (warmup=1/iters=2 for
+  the sweep; warmup=2/iters=5 for verification). Reported `ms` is the warm MIN. A one-time global
+  JVM warmup runs before the measured loop. This was added because single-pass timing was badly
+  warmup-biased (same-shape q1 showed base 4191 vs prod 1191 ms; after warm-min, 1193 vs 932, and
+  classified neutral because shape/counters are identical).
+- Classification uses plan SHAPE + work counters (cjOut, smjOut, shuffleRecords, sortPeak, aggOut),
+  NOT raw ms - warm-min still has a ~20% noise floor on small same-shape queries.
+- Scope: the 72 structurally-firing queries (from the applicability report) + a 5-query non-firing
+  control. The 31 non-firing queries cannot be rewritten and were not executed (cannot regress).
+
+Result tally (72 firing + 5 control = 77 queries): WIN=7, neutral-shape=4, gate-skip=61,
+control-neutral=5, REGRESSIONS=0.
+
+Confirmed wins (prod vs base, warm-min, CHANGED shape, counter-corroborated):
+
+| query | base ms | prod ms | speedup | prod shape | key counter |
+|---|---:|---:|---:|---|---|
+| q25 | 20609 | 2446 | +88% | CountJoin | shuffleRecords x0.04 |
+| q29 | 19627 | 3931 | +80% | CountJoin | shuffleRecords x0.20 |
+| q11 | 14275 | 4338 | +70% | pre-agg | shuffleRecords x0.09, sortPeak->0 |
+| q64 | 25909 | 10067 | +61% | CountJoin | shuffleRecords x0.46 |
+| q4 | 26230 | 11714 | +55% | pre-agg | shuffleRecords x0.10, sortPeak->0 |
+| q24b | 11566 | 6165 | +47% | CountJoin | shuffleRecords x0.10 |
+| q24a | 11763 | 6441 | +45% | CountJoin | shuffleRecords x0.10 |
+
+Neutral rewrites (prod changes shape, no net gain): q50 (+14%, the 13.3M-row stream remains),
+q31 (~0%, pre-agg), q32 (~0%), q92 (-5%, the correlated-scalar case - still unsolved).
+
+Gate validation:
+
+- All six pre-guard regressions are now correctly gate-skipped in prod (prod == base): q3, q34, q47,
+  q57, q73, q89. Their `forced` (ungated) runs show the old blowups (-526% to -1270%).
+- 5/5 non-firing control queries: prod ~= base.
+- q24a/q24b prove the gate fires on REAL stats where the injected-stats applicability report said
+  cost-gate-SKIPS - so applicability cannot be used to exclude queries; only to find the firing set.
+
+Pre-aggregate census (answers "is pre-agg ever a win"): of the 33 pre-agg-eligible queries, prod
+actually executes the pre-agg shape for only THREE: q4 (+55% WIN), q11 (+70% WIN), q31 (neutral).
+For all others the gate reroutes to CountJoin (q24a/b, q25, q29, q50, q64 - wins) or to base
+(q3/q34/q47/q57/q73/q89 + ~17 more - where forced pre-agg explodes). Net: pre-agg-as-executed is
+2 wins, 1 neutral, 0 prod losses; the row-expansion guard (RewriteJoinsAsSemijoins.scala:2008)
+prevents the loss cases.
+
+Open leads recorded above, ranked for the optimization pass:
+
+1. q50 delayed-existence / bucket fusion (top target; 13.3M-row stream = shuffle).
+2. q64 aggregate-carrying CountJoin fusion (83.8M-row stream + residual sort).
+3. Gate over-conservative: q15 (+58%, CONFIRMED) and q69 (+35%, CONFIRMED) are real missed wins the
+   gate skips; q58 (+17%) borderline. Win is NOT from shuffle reduction - capture forced plan first.
+4. Forced-slowdown robustness (task #9): make worst-case rewrite ~= base (Mode A work-doubling
+   q72/q94/q95; Mode B stream explosion q2/q3) so robustness does not rely solely on the gate.
+5. q14 pre-agg through the IN-semijoin wrapper (incremental; below q50/q64).
+6. q92 correlated-scalar reuse; q97 dedicated full-outer physical path (outer path is off under the
+   gate, so q97 stays base in prod).
+
+Reproduce: `tpcds-countjoin-setup.sh` then `tpcds-countjoin-sweep.sh` (or the per-group commands).

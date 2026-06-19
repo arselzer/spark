@@ -53,6 +53,12 @@ class TPCDSCountJoinDiagnosticsSuite extends QueryTest with SharedSparkSession w
     .split(",").map(_.trim).filter(_.nonEmpty).toSet
   private val printPlan = propOrEnv("tpcds.diag.printPlan", "TPCDS_DIAG_PRINT_PLAN", "false")
     .toBoolean
+  // Warmup/iteration controls. The second run of a query is usually much faster than the first
+  // (JIT, page cache, codegen). Each (query, mode) is warmed `warmupRuns` times (discarded), then
+  // measured `measureRuns` times; reported `ms` is the MIN (warm steady-state). Each mode warming
+  // itself removes the base->forced->prod position bias of single-pass timing.
+  private val warmupRuns = propOrEnv("tpcds.diag.warmup", "TPCDS_DIAG_WARMUP", "1").toInt
+  private val measureRuns = propOrEnv("tpcds.diag.iters", "TPCDS_DIAG_ITERS", "2").toInt
 
   private case class Mode(name: String, confs: Seq[(String, String)])
   private case class RunResult(
@@ -203,6 +209,17 @@ class TPCDSCountJoinDiagnosticsSuite extends QueryTest with SharedSparkSession w
     assume(new File(dataDir).exists(), s"TPC-DS data dir $dataDir absent; skipping")
     loadTables()
 
+    // Global JIT/codegen warmup: the first query of a fresh JVM pays a one-time global compilation
+    // cost that would otherwise inflate its base timing (and overstate its apparent speedup). Run
+    // one throwaway execution before any measurement so all queries start from a warm JVM.
+    if (queryNames.nonEmpty && modes.nonEmpty) {
+      try {
+        val warm = resourceToString(s"tpcds/${queryNames.head}.sql",
+          classLoader = Thread.currentThread().getContextClassLoader)
+        run(warm, modes.head)
+      } catch { case _: Throwable => () }
+    }
+
     for (name <- queryNames) {
       val sqlText = resourceToString(s"tpcds/$name.sql",
         classLoader = Thread.currentThread().getContextClassLoader)
@@ -211,11 +228,18 @@ class TPCDSCountJoinDiagnosticsSuite extends QueryTest with SharedSparkSession w
       // scalastyle:on println
       modes.foreach { mode =>
         try {
-          val result = run(sqlText, mode)
+          (1 to warmupRuns).foreach(_ => run(sqlText, mode)) // warm JIT/cache/codegen; discard
+          val measured = (1 to measureRuns).map(_ => run(sqlText, mode))
+          val result = measured.last
+          val timings = measured.map(_.ms)
+          val minMs = timings.min
+          val medMs = timings.sorted.apply(timings.size / 2)
           val nodes = allNodes(result.physicalPlan)
           // scalastyle:off println
           println(s"TPCDS-DIAG: $name | ${mode.name} | rows=${result.rows} | " +
-            s"ms=${result.ms} | logicalCountJoins=${result.optimizedCountJoins} | " +
+            s"ms=${minMs} | msMin=${minMs} | msMed=${medMs} | " +
+            s"msAll=${timings.mkString("/")} | warmup=${warmupRuns} iters=${measureRuns} | " +
+            s"logicalCountJoins=${result.optimizedCountJoins} | " +
             s"operators=${operatorCounts(nodes)} | metrics=${metricSummary(nodes)}")
           if (printPlan) {
             println(s"TPCDS-DIAG-PLAN: $name | ${mode.name}")
