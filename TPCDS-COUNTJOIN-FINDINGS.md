@@ -844,3 +844,103 @@ Remaining gap:
 - Build-side pre-aggregation or aggregate-through-unique-dimension rewriting remains the deeper
   route for cases where the best root would otherwise place a large fact-derived subtree on the
   CountJoin build side.
+
+
+## 2026-06-19: decorating-dimension pre-aggregation
+
+Implemented a logical row-reduction rewrite for aggregate-over-inner-join shapes where one pure
+decorating dimension contributes grouping columns but no aggregate inputs. The rewrite computes a
+partial aggregate on the non-dimension side grouped by the dimension join key plus the other grouping
+keys, joins those compact partial rows to the dimension, then runs a final merge aggregate by the
+original grouping expressions.
+
+Important correctness detail:
+
+- The final aggregate is retained even if the dimension key is unique or looks unique. This preserves
+  SQL multiplicities when the decorating dimension contains duplicate rows: the post-aggregate join
+  duplicates the partial row the same way the original join duplicated every input row, and the final
+  merge folds those rows into the original groups.
+- The rewrite only handles mergeable `count`, `sum`, `min`, and `max` without DISTINCT/FILTER, only
+  for deterministic project/filter/leaf dimension inputs, and it respects
+  `spark.sql.yannakakis.unguardedEnabled`.
+- It is intentionally not disabled by the CountJoin cost gate: the direct pre-aggregation is the
+  production row-reduction mechanism for q4/q11-like shapes, and may leave zero logical CountJoins in
+  the optimized plan while still being a Yannakakis-family rewrite.
+
+Plan-shape effect from `TPCDSCountJoinPlanDumpSuite` with the rewrite forced:
+
+| query | old forced logical CountJoins | new forced logical CountJoins | interpretation |
+|---|---:|---:|---|
+| q4 | 36 | 6 | each sales-channel/year slice now aggregates sales/date by customer before joining customer attrs |
+| q11 | 16 | 4 | same customer-decoration reduction for the two-channel version |
+
+Focused correctness:
+
+```bash
+build/sbt 'sql/testOnly org.apache.spark.sql.YannakakisCorrectnessSuite -- -z "decorating dimension pre-aggregate"'
+```
+
+Result: passed. The test includes duplicate customer-dimension rows to cover the final merge
+semantics.
+
+Broader correctness:
+
+```bash
+build/sbt 'sql/testOnly org.apache.spark.sql.YannakakisCorrectnessSuite -- -z "count"'
+```
+
+Result: passed, 64 tests.
+
+Target/control diagnostics after the change, SF5 parquet, `shuffle.partitions=16`, AQE on:
+
+```bash
+TPCDS_DIAG_QUERIES=q4,q11,q25,q50,q64,q92,q72,q97 TPCDS_DIAG_MODES=base,forced,prod \
+  build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinDiagnosticsSuite'
+```
+
+| query | base ms | forced ms | prod ms | prod/base speedup | forced logical CJs | prod logical CJs | notes |
+|---|---:|---:|---:|---:|---:|---:|---|
+| q4 | 38418 | 19203 | 15043 | 2.55x | 6 | 0 | direct pre-agg removes SMJ/sorts and drops shuffle records from 25.7M to 2.7M |
+| q11 | 15895 | 8088 | 6379 | 2.49x | 4 | 0 | same shape; shuffle records drop from 18.1M to 1.6M |
+| q25 | 20519 | 3424 | 1953 | 10.51x | 5 | 5 | already-good product aggregate class improves further in this run |
+| q50 | 6745 | 5279 | 4651 | 1.45x | 3 | 3 | still positive, but not full bucket fusion; one date CountJoin remains very large |
+| q64 | 28501 | 16191 | 15367 | 1.85x | 28 | 28 | remains a strong win; fewer CJs than the earlier 36-CJ shape |
+| q92 | 1599 | 1890 | 1350 | 1.18x | 4 | 3 | forced remains noisy/slower; prod hybrid is still protected |
+| q72 | 57273 | 107232 | 51252 | 1.12x | 1 | 0 | forced remains a bad non-target; prod keeps baseline shape |
+| q97 | 9034 | 8643 | 5922 | 1.53x | 0 | 0 | prod remains baseline-shaped; direct q97 scalar rewrite still forced-only |
+
+Interpretation:
+
+- This is the first optimization that materially bridges the q4/q11 repeated-summary gap rather than
+  merely avoiding sort-merge joins. The win comes from row reduction before customer decoration.
+- `prod logical CJs = 0` on q4/q11 does not mean no rewrite happened. It means the direct
+  pre-aggregation shape won and the recursive reduced sales/date part did not keep CountJoin under
+  the cost gate.
+- q25 and q64 suggest the pattern generalizes to other hard TPC-DS summaries where a wide dimension
+  was being joined before aggregation.
+- q50 remains only partly solved. The conditional bucket counts are carried, but the plan still emits
+  a large date-expanded stream (`13.3M` CountJoin output rows in this diagnostic). A deeper bucketed
+  aggregate fusion would need to collapse those rows directly to store-level buckets. A focused plan
+  dump showed the underlying reason: the `store_sales` -> unfiltered `date_dim d1` CountJoin is a
+  pure existence/count join with no groups or aggregates, estimated at `250.9M` input rows. The
+  selective returned-date side (`d2` filtered to 31 rows) is in a sibling subtree, so the issue is
+  delayed pure-existence dimensions or hypertree root/decomposition choice, not CountJoin inner-loop
+  overhead.
+- q92 is still a correlated-threshold/reuse problem rather than a decorating-dimension problem.
+- q72 and q97 remain correctly protected by production gating. q72 is a plan-shape/applicability
+  non-target; q97 still wants a dedicated physical full-outer presence-count path.
+
+Updated next candidates after this change:
+
+1. q50 delayed-existence/bucket fusion: defer the pure `store_sales` -> unfiltered `date_dim d1`
+   existence join until after the selective returns/date branch, or choose a hypertree root that
+   reaches the selective branch first. Then push the return-lag bucket conditions to the point where
+   both sold/returned dates are known and emit per-store bucket counters directly, avoiding the
+   13M-row date-expanded stream.
+2. Physical full-outer presence-count path for q97: one physical algorithm over the two distinct key
+   sets should still be better than both vanilla full outer materialization and the scalar-branch
+   logical rewrite.
+3. Correlated scalar threshold reuse for q92: avoid scanning/aggregating the same web-sales/date
+   window separately for the scalar average and outer query.
+4. Broader validation: rerun the full applicable TPC-DS set once after any bucket/q97/q92 solution,
+   because the current target/control set is now strongly positive but not a full-suite measurement.

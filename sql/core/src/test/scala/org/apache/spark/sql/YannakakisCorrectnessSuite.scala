@@ -230,6 +230,24 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assert(fired, s"$hint: expected the non-guarded distinct-reduced path to fire")
   }
 
+  private def assertDecoratingDimensionPreAggAndCorrect(query: String, hint: String): Unit = {
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+
+    val appender = new LogAppender("decorating-dimension pre-aggregate rewrite")
+    withLogAppender(appender) {
+      withSQLConf(yannakakisOn: _*) {
+        checkAnswer(sql(query), expected)
+      }
+    }
+    val fired = appender.loggingEvents.exists(
+      _.getMessage.getFormattedMessage.contains(
+        "new aggregate (decorating-dimension pre-aggregate)"))
+    assert(fired, s"$hint: expected the decorating-dimension pre-aggregate rewrite to fire")
+  }
+
   private def assertNotRewrittenButCorrect(query: String, hint: String): Unit = {
     var expected: Seq[Row] = null
     withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
@@ -442,6 +460,27 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
           "cost gate should skip a non-expanding join with a unique column-stat side")
       }
     }
+  }
+
+  test("decorating dimension pre-aggregate preserves duplicate dimension rows") {
+    Seq((1, 10, 5L), (1, 20, 7L), (2, 10, 11L), (3, 10, 13L))
+      .toDF("c_sk", "d_sk", "v").createOrReplaceTempView("dd_sales")
+    Seq((10, 2001), (20, 2002)).toDF("d_sk", "yr").createOrReplaceTempView("dd_date")
+    Seq(
+      (1, "A", "N"),
+      (1, "A", "N"),
+      (2, "A", "S"),
+      (2, "B", "S"),
+      (4, "Z", "X")).toDF("c_sk", "seg", "region")
+      .createOrReplaceTempView("dd_customer")
+
+    assertDecoratingDimensionPreAggAndCorrect("""
+      select seg, region, yr, count(*) as cnt, sum(v) as total
+      from dd_sales s
+      join dd_customer c on s.c_sk = c.c_sk
+      join dd_date d on s.d_sk = d.d_sk
+      group by seg, region, yr""",
+      "decorating customer attributes should be joined after partial aggregation")
   }
 
   test("non-guarded collect_set rides the distinct-reduced path and is correct") {

@@ -1217,17 +1217,23 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       aggExpressions: Seq[NamedExpression],
       projectList: Seq[NamedExpression],
       join: Join): LogicalPlan = {
-    trySplitMixedDistinct(agg, groupingExpressions, aggExpressions, projectList, join).getOrElse {
-      try {
-        validateOrFallback(agg,
-          rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
-            join, keyRefs = Seq(), uniqueConstraints = Seq()))
-      } catch {
-        case scala.util.control.NonFatal(e) =>
-          logWarning("yannakakis rewrite failed; falling back to the original plan: " +
-            e.getMessage)
-          agg
-      }
+    try {
+      tryPushAggregatePastDecoratingDimension(
+        agg, groupingExpressions, aggExpressions, projectList, join)
+        .map(validateOrFallback(agg, _))
+        .getOrElse {
+          trySplitMixedDistinct(agg, groupingExpressions, aggExpressions, projectList, join)
+            .getOrElse {
+              validateOrFallback(agg,
+                rewritePlan(agg, groupingExpressions, aggExpressions, projectList,
+                  join, keyRefs = Seq(), uniqueConstraints = Seq()))
+            }
+        }
+    } catch {
+      case scala.util.control.NonFatal(e) =>
+        logWarning("yannakakis rewrite failed; falling back to the original plan: " +
+          e.getMessage)
+        agg
     }
   }
 
@@ -1760,6 +1766,256 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       }
     }
   }
+  private sealed trait DimPushMerge
+  private case object DimPushSum extends DimPushMerge
+  private case object DimPushMin extends DimPushMerge
+  private case object DimPushMax extends DimPushMerge
+
+  /**
+   * Partial aggregation through a pure decorating dimension.
+   *
+   * TPC-DS q4/q11-style summaries join a large fact/date stream to `customer` only to group by
+   * wide customer attributes. The normal aggregate therefore carries millions of rows through the
+   * customer join before collapsing them. For mergeable aggregates it is equivalent to:
+   *
+   *   1. aggregate the non-dimension side by the dimension join key plus the other grouping keys;
+   *   2. join the compact partial rows to the decorating dimension;
+   *   3. run a final merge aggregate by the original grouping expressions.
+   *
+   * The final aggregate is intentionally kept even when the dimension key is unique. It preserves
+   * SQL semantics for duplicate dimension rows: the post-aggregate join duplicates the partial row
+   * in exactly the same way the original join duplicated each input row, and the final merge folds
+   * those duplicates into the original groups.
+   */
+  private def tryPushAggregatePastDecoratingDimension(
+      agg: Aggregate,
+      grouping: Seq[Expression],
+      aggExpressions: Seq[NamedExpression],
+      projectList: Seq[NamedExpression],
+      join: Join): Option[LogicalPlan] = {
+    if (!conf.yannakakisEnabled || !conf.yannakakisUnguardedEnabled || grouping.isEmpty ||
+        !join.joinType.isInstanceOf[InnerLike]) {
+      return None
+    }
+
+    val containedAggregates = aggExpressions.flatMap(_.collect {
+      case ae: AggregateExpression => ae
+    })
+    if (containedAggregates.isEmpty) return None
+
+    val classified = aggExpressions.map { ne =>
+      val aggs = ne.collect { case ae: AggregateExpression => ae }
+      if (aggs.isEmpty) {
+        Some((ne, None: Option[(AggregateExpression, DimPushMerge)]))
+      } else {
+        ne match {
+          case Alias(ae: AggregateExpression, _) if aggs.size == 1 &&
+              !ae.isDistinct && ae.filter.isEmpty =>
+            ae.aggregateFunction match {
+              case _: Count => Some((ne, Some((ae, DimPushSum))))
+              case _: Sum => Some((ne, Some((ae, DimPushSum))))
+              case _: Min => Some((ne, Some((ae, DimPushMin))))
+              case _: Max => Some((ne, Some((ae, DimPushMax))))
+              case _ => None
+            }
+          case _ => None
+        }
+      }
+    }
+    if (classified.exists(_.isEmpty)) return None
+    if (!aggExpressions.forall(_.deterministic)) return None
+
+    val projectAliasMap = projectList.map(ne => ne.toAttribute.exprId -> ne).toMap
+    def stripProjectAliases[T <: Expression](e: T): T = e.transformUp {
+      case a: Attribute => projectAliasMap.get(a.exprId) match {
+        case Some(Alias(child, _)) => child
+        case Some(attr: Attribute) => attr
+        case _ => a
+      }
+    }.asInstanceOf[T]
+
+    val groupingBase = grouping.map(stripProjectAliases)
+    val groupRefs = AttributeSet(groupingBase.flatMap(_.references))
+    val aggregateInputRefs = AttributeSet(containedAggregates.map(stripProjectAliases)
+      .flatMap(_.aggregateFunction.references))
+
+    val (items, conditions) = extractInnerJoins(join)
+    if (items.size < 3) return None
+
+    def isPureProjectFilterOrLeaf(plan: LogicalPlan): Boolean = plan match {
+      case _: LeafNode => true
+      case Project(list, child) if list.forall(_.deterministic) =>
+        isPureProjectFilterOrLeaf(child)
+      case Filter(condition, child) if condition.deterministic =>
+        isPureProjectFilterOrLeaf(child)
+      case SubqueryAlias(_, child) =>
+        isPureProjectFilterOrLeaf(child)
+      case _ => false
+    }
+
+    def attrIn(attrs: AttributeSet)(e: Expression): Option[Attribute] = e match {
+      case a: Attribute if attrs.contains(a) => Some(a)
+      case Cast(a: Attribute, _, _, _) if attrs.contains(a) => Some(a)
+      case _ => None
+    }
+
+    def attrOutside(attrs: AttributeSet)(e: Expression): Option[Attribute] = e match {
+      case a: Attribute if !attrs.contains(a) => Some(a)
+      case Cast(a: Attribute, _, _, _) if !attrs.contains(a) => Some(a)
+      case _ => None
+    }
+
+    def equalityPairFor(attrs: AttributeSet, e: Expression): Option[(Attribute, Attribute)] =
+      e match {
+        case EqualTo(l, r) =>
+          attrIn(attrs)(l).flatMap(dim => attrOutside(attrs)(r).map(dim -> _))
+            .orElse(attrIn(attrs)(r).flatMap(dim => attrOutside(attrs)(l).map(dim -> _)))
+        case _ => None
+      }
+
+    case class Candidate(
+        item: LogicalPlan,
+        groupRefCount: Int,
+        joinPairs: Seq[(Attribute, Attribute)])
+
+    val candidates = items.flatMap { item =>
+      val itemOutput = item.outputSet
+      val groupRefsHere = groupRefs.filter(itemOutput.contains)
+      val aggRefsHere = aggregateInputRefs.filter(itemOutput.contains)
+      val conditionsHere = conditions.toSeq.filter(_.references.exists(itemOutput.contains))
+      val joinPairs = conditionsHere.flatMap(equalityPairFor(itemOutput, _))
+      val simpleJoinOnly = conditionsHere.nonEmpty && joinPairs.size == conditionsHere.size
+      if (groupRefsHere.size >= 2 && aggRefsHere.isEmpty && simpleJoinOnly &&
+          isPureProjectFilterOrLeaf(item)) {
+        Some(Candidate(item, groupRefsHere.size, joinPairs))
+      } else {
+        None
+      }
+    }
+
+    if (candidates.isEmpty) return None
+    val candidate = candidates.maxBy(c => (c.groupRefCount, c.item.stats.sizeInBytes))
+    val dim = candidate.item
+    val dimOutput = dim.outputSet
+
+    val reducedItems = items.filterNot(_ eq dim)
+    val reducedConditions = conditions.toSeq.filterNot(_.references.exists(dimOutput.contains))
+
+    def combine(exprs: Seq[Expression]): Option[Expression] =
+      exprs.reduceOption((l, r) => And(l, r))
+
+    def buildReducedJoin(): Option[LogicalPlan] = {
+      var current = reducedItems.head
+      var available = current.outputSet
+      var pending = reducedConditions
+      for (next <- reducedItems.tail) {
+        val nextOutput = next.outputSet
+        val joinedOutput = available ++ nextOutput
+        val (applicable, rest) = pending.partition { c =>
+          c.references.subsetOf(joinedOutput) &&
+            c.references.exists(available.contains) &&
+            c.references.exists(nextOutput.contains)
+        }
+        current = Join(current, next, Inner, combine(applicable), JoinHint.NONE)
+        available = joinedOutput
+        pending = rest
+      }
+      if (pending.nonEmpty) None else Some(current)
+    }
+
+    val reducedJoin = buildReducedJoin().getOrElse(return None)
+
+    def uniqueBySemantic(exprs: Seq[Expression]): Seq[Expression] =
+      exprs.foldLeft(Seq.empty[Expression]) { (acc, e) =>
+        if (acc.exists(_.semanticEquals(e))) acc else acc :+ e
+      }
+
+    val outsideJoinAttrs = candidate.joinPairs.map(_._2)
+    val nonDimGrouping = groupingBase.filterNot(_.references.exists(dimOutput.contains))
+    val preGrouping = uniqueBySemantic(nonDimGrouping ++ outsideJoinAttrs)
+    if (preGrouping.isEmpty) return None
+
+    val preGroupingNamed = preGrouping.map {
+      case ne: NamedExpression => ne
+      case other => Alias(other, "cjpush_g")()
+    }
+
+    val aggregateSlots = classified.flatten.collect {
+      case (ne, Some((ae, merge))) =>
+        val normalized = stripProjectAliases(ae).asInstanceOf[AggregateExpression]
+        val partial = Alias(normalized, "cjpush_agg")()
+        (ne, ae, merge, partial)
+    }
+    val preAgg = Aggregate(preGrouping, preGroupingNamed ++ aggregateSlots.map(_._4), reducedJoin)
+
+    val preAggPlan = reducedJoin match {
+      case j: Join =>
+        rewriteOrFallback(preAgg, preGrouping, preAgg.aggregateExpressions, reducedJoin.output, j)
+      case _ => preAgg
+    }
+
+    def outputFor(attr: Attribute, plan: LogicalPlan): Option[Attribute] =
+      plan.output.find(_.exprId == attr.exprId)
+        .orElse(plan.output.find(_.semanticEquals(attr)))
+
+    val postConditions = candidate.joinPairs.flatMap { case (dimAttr, outsideAttr) =>
+      outputFor(outsideAttr, preAggPlan).map { leftAttr =>
+        if (leftAttr.dataType == dimAttr.dataType) EqualTo(leftAttr, dimAttr)
+        else EqualTo(leftAttr, Cast(dimAttr, leftAttr.dataType))
+      }
+    }
+    if (postConditions.size != candidate.joinPairs.size) return None
+
+    val joined = Join(preAggPlan, dim, Inner, combine(postConditions), JoinHint.NONE)
+    val joinedOutput = joined.output
+
+    def remapAttr(attr: Attribute): Attribute =
+      joinedOutput.find(_.exprId == attr.exprId)
+        .orElse(joinedOutput.find(_.semanticEquals(attr)))
+        .getOrElse(attr)
+
+    def toJoinedExpression(e: Expression): Expression =
+      stripProjectAliases(e).transformUp {
+        case a: Attribute => remapAttr(a)
+      }
+
+    val partialByOriginal = aggregateSlots.map { case (ne, _, merge, partial) =>
+      val partialAttr = outputFor(partial.toAttribute, preAggPlan).getOrElse(partial.toAttribute)
+      ne.toAttribute.exprId -> (partialAttr, merge)
+    }.toMap
+
+    val finalGrouping = grouping.map(toJoinedExpression)
+    val finalAggExpressions = classified.flatten.map {
+      case (ne, None) =>
+        val out = ne.toAttribute
+        val child = ne match {
+          case Alias(aliasChild, _) => toJoinedExpression(aliasChild)
+          case other => toJoinedExpression(other)
+        }
+        child match {
+          case named: NamedExpression if named.exprId == out.exprId => named
+          case _ => Alias(child, out.name)(exprId = out.exprId)
+        }
+      case (ne, Some((_, merge))) =>
+        val out = ne.toAttribute
+        val (partialAttr, _) = partialByOriginal(out.exprId)
+        val merged: Expression = merge match {
+          case DimPushSum => Sum(partialAttr).toAggregateExpression()
+          case DimPushMin => Min(partialAttr).toAggregateExpression()
+          case DimPushMax => Max(partialAttr).toAggregateExpression()
+        }
+        Alias(Cast(merged, out.dataType), out.name)(exprId = out.exprId)
+    }
+
+    val rewritten = Aggregate(finalGrouping, finalAggExpressions, joined)
+    if (rewritten.collectFirst { case p if p.missingInput.nonEmpty => p }.nonEmpty) {
+      None
+    } else {
+      logInfo("new aggregate (decorating-dimension pre-aggregate)")
+      Some(rewritten)
+    }
+  }
+
   def is0MA(expr: Expression): Boolean = {
     expr match {
       case Alias(child, name) => is0MA(child)
