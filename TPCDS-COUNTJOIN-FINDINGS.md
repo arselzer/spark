@@ -1706,3 +1706,54 @@ Not pursued: a broad gate RELAXATION keyed on join/aggregate stats - the measure
 (q2 aggIn 10.8M > q15 7.7M; q2 collapse-ratio 5800 vs q15 8800) shows join-stat and
 aggregate-collapse signals do NOT separate the wins from the slowdowns; only the rewrite's
 build-side cost does, and that is stats-fragile (see q34).
+
+### q15/q69 aggregate-aware gate override: PROTOTYPED, validated, REVERTED (negative result)
+
+To capture the confirmed missed wins, I prototyped an aggregate-aware override behind a default-off
+flag `spark.sql.yannakakis.aggAwareGateEnabled`: at the rewritePlan cost gate, when the size-only
+gate would skip, KEEP the rewrite if every CountJoin's aggregated/build side (`right` child) is
+broadcast-cheap (`rewriteHasCheapBuildSides`). Tested via a `prodaa` diagnostics mode
+(prod + flag on). Correctness 118/118; row counts matched base/prod/prodaa for every query.
+
+Result (base -> prodaa, warm-min, SF5):
+
+| query | base | prodaa | effect | rewrote? |
+|---|---:|---:|---|---|
+| q15 | 1576 | 744 | +53% WIN captured | yes (lcj=3) |
+| q69 | 1963 | 1155 | +41% WIN captured | yes (lcj=2) |
+| q58 | 1599 | 1396 | +13% | yes (lcj=4) |
+| q2 | 1726 | 7059 | -309% SLOWDOWN re-admitted | yes (lcj=2) |
+| q89 | 1132 | 1622 | -43% slowdown | yes (lcj=3) |
+| q47 | 3982 | 5035 | -26% slowdown | yes (lcj=9) |
+| q14a | 16765 | 18650 | -11% slowdown | yes (lcj=2) |
+| q57 | 1986 | 2166 | -9% slowdown | yes (lcj=9) |
+| q3,q33,q56,q34,q16,q14b,q25 | - | - | neutral / win held | - |
+
+Verdict: net-negative when enabled - it captures q15/q69/q58 but re-admits q2 (-309%) and others, so
+it was REVERTED (a demonstrably net-negative heuristic should not ship, even default-off). Root cause:
+the build-side-cost signal is STATS-FRAGILE. q2 is decisive - its prodaa `shuffleRecords` stays 3938
+(no shuffle) yet it is 4x slower, because the count-join builds a ~10.8M-row in-memory hash relation
+whose planning-time size estimate is far below the 8x-broadcast-threshold cutoff. The cost that
+distinguishes win from slowdown is the rewrite's EXECUTION cost (build/shuffle materialization), which
+planning-time stats cannot predict reliably (same lesson as q34's 386x cardinality miss).
+
+Recommendation: the q15/q69 win is real but can only be captured SAFELY with RUNTIME/AQE adaptivity -
+decide to keep vs discard the count-join rewrite from ACTUAL materialized cardinalities (or add an AQE
+fallback that abandons a rewrite whose build/shuffle exceeds its estimate), not a static cost gate.
+This is a larger change than an autonomous session should ship unreviewed. The flag/mode scaffolding
+and this measured evidence are preserved here so the AQE approach can build on them.
+
+## OPTIMIZATION PASS - final summary (autonomous session)
+
+- SHIPPED (committed, validated, prod-safe): Mode A - guard the split-and-UNION rewrites
+  (tryRewriteOuter, trySplitMixedDistinct) against re-joining a non-broadcast subtree twice.
+  Eliminates the three worst split-doubling forced slowdowns (q72 -79%->+2%, q95 -82%->+4%,
+  q94 -68%->+7%); correctness 118/118; prod provably unchanged (prod-disabled paths).
+- TESTED and REVERTED (negative results, documented with data): (a) gate-independent pre-agg
+  anti-explosion guards (no-op: q34's expansion is invisible to stats); (b) aggregate-aware gate
+  override for q15/q69 (captures wins but re-admits q2 -309% due to stats-fragile build-cost).
+- DEFERRED to human review with precise mechanisms: count-join broadcast->shuffle (q2/q3) and
+  count-join-path slowdowns (q47/q57/q89) live in the prod win path (buildBottomUpJoinsCounting);
+  q34-class pre-agg expansion and the q15/q69 capture both need AQE/runtime adaptivity, not static
+  stats. Net: the one clean STRUCTURAL bug (Mode A) is fixed; the remaining slowdowns/speedups are
+  fundamentally cost-estimation problems that require runtime adaptivity, not more static gating.
