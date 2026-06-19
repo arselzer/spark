@@ -1634,3 +1634,75 @@ smjOut and sortPeak now match base exactly (e.g. q94 smjOut 3597882 == base, sor
 base) - the duplicated join/sort branch is gone. The three worst split-doubling forced slowdowns are
 eliminated; the rewrite falls back to the base plan (or a non-doubling rewrite) when re-joining the
 duplicated subtree is not broadcast-cheap. Prod unchanged (these paths are prod-disabled).
+
+### NEGATIVE result (reverted): gate-independent pre-agg anti-explosion guards do NOT help q34 etc.
+
+Hypothesis tested: make the decorating-pre-aggregate NDV-expansion (:1950) and row/size-expansion
+(:2024) guards gate-INDEPENDENT, expecting it to tame the largest forced slowdowns
+(q34/q47/q57/q73/q89, -526% to -1270%). Correctness passed (118/118) and the q4/q11 pre-agg wins held
+(prod +54%/+71%), but it was a NO-OP on the target slowdowns, so it was REVERTED.
+
+Measured (forced, after the change): q34 15815 (~base 1314 x12), q47 40068, q57 19000, q73 9236,
+q89 6935 - essentially unchanged. Why:
+
+- q34 forced stays the pre-aggregate shape (logicalCountJoins=0) yet is slow - so its pre-agg does
+  NOT trip the >48x row/NDV expansion guards. Its cost is elsewhere (intrinsic pre-agg work or the
+  recursive inner join), not a group blow-up.
+- q47/q57/q89 forced take the COUNT-JOIN path (logicalCountJoins=3/3/1), not the pre-agg path at all,
+  so the pre-agg guards are irrelevant to them.
+
+Conclusion: the large pre-agg-classed forced slowdowns are NOT a decorating-pre-agg group expansion.
+They live in the count-join builder (buildBottomUpJoinsCounting) or the intrinsic pre-agg/inner-join
+cost. Those paths RUN IN PROD (they are the q24/q25/q29/q50/q64 and q4/q11 win paths), so a guard
+there is NOT zero-risk - it must be validated against every win. Deferred to a reviewed change, not
+an autonomous one.
+
+### Scope conclusion for safe autonomous robustness
+
+Only the prod-DISABLED paths (tryRewriteOuter, trySplitMixedDistinct) can be guarded with zero risk
+to the production wins; that is Mode A, now committed. The remaining forced slowdowns (pre-agg q34;
+count-join q2/q3/q47/q57/q89; semijoin-non-reducing q14a/q14b) originate in paths shared with the
+production wins or in physical broadcast-vs-shuffle choices, so reducing them safely needs careful
+human-reviewed validation against the full win set, not an unattended change.
+
+### q34 mechanism (the worst pre-agg forced slowdown) - a STATS limitation
+
+q34 forced (plan-dump q34_plan.log): the decorating pre-aggregate DOES explode - aggOut jumps from
+34,686 (base) to 13,400,766 (forced), ~386x more rows, with sortPeak 67MB -> 2.08GB and
+shuffleRecords 12,685 -> 19.9M. So it is a genuine group expansion. But the row-expansion guard
+(:2024, `preAgg.stats.rowCount > original * 48`) does NOT fire on it, because Catalyst's planning-time
+stats UNDERESTIMATE the post-pre-agg cardinality: the estimated `preAgg.stats.rowCount` stays under
+48x while the runtime cardinality is 386x. This is why making that guard gate-independent was a no-op
+for q34.
+
+Implication: this class of forced slowdown is a cardinality-ESTIMATION limitation, not a guard-logic
+gap. It cannot be fixed by a smarter static threshold (a lower threshold that caught q34 would also
+block the beneficial q4/q11 pre-agg, which also expands but pays off). It needs either better group
+NDV estimation for the pre-agg key, or a runtime/AQE adaptive fallback that abandons the pre-agg when
+its actual cardinality exceeds the estimate. Same caveat applies to a stats-based gate RELAXATION for
+q15/q69: the build-side-size signal that separates q15 (13MB count-join build) from q3 (805MB) /
+q2 (10.8M-row build) is the right idea, but it depends on the same planning-time size estimates that
+q34 just showed can be far off, so it must be prototyped behind a default-off flag and validated on
+the full firing set before trusting it.
+
+### OPTIMIZATION PASS outcome (autonomous session)
+
+Shipped (committed, validated): Mode A - guard the two split-and-UNION rewrites so they do not
+re-join a non-broadcast subtree twice. Eliminates the three worst split-doubling forced slowdowns
+(q72 -79%->+2%, q95 -82%->+4%, q94 -68%->+7%); correctness 118/118; prod provably unchanged (these
+paths are prod-disabled). This is the one clean STRUCTURAL bug (always-dumb duplicated work) in the
+slowdown set.
+
+Investigated and deferred to human review (with precise mechanisms above):
+1. q15/q69 gate relaxation (the only available PROD speedup, +58%/+35%): needs a build-side-cost
+   discriminator at the rewritePlan cost gate (:850, where the built `yannakakisJoins` is available),
+   prototyped behind a default-off flag. Stats-dependent; validate on the full set.
+2. Mode B count-join broadcast->shuffle (q2/q3) and the count-join-path slowdowns (q47/q57/q89): in
+   buildBottomUpJoinsCounting, which is a PROD win path - correctness-sensitive, needs full-win-set
+   validation.
+3. q34-class pre-agg expansion: a cardinality-estimation problem (needs better NDV or AQE fallback).
+
+Not pursued: a broad gate RELAXATION keyed on join/aggregate stats - the measured data
+(q2 aggIn 10.8M > q15 7.7M; q2 collapse-ratio 5800 vs q15 8800) shows join-stat and
+aggregate-collapse signals do NOT separate the wins from the slowdowns; only the rewrite's
+build-side cost does, and that is stats-fragile (see q34).
