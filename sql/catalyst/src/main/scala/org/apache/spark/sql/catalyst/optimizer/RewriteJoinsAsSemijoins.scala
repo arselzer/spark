@@ -2002,12 +2002,14 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
     else EqualTo(left, Cast(right, left.dataType))
 
   // HTNode and HGEdge use identity hashCodes, so Set iteration order varies between JVM
-  // runs, which makes join order (and thus plans and results) nondeterministic. Always
-  // iterate children in a stable order based on the edge names (E1, E2, ...).
+  // runs, which makes join order (and thus plans and results) nondeterministic. Prefer smaller
+  // children first so selective dimensions reduce the running subtree before wider joins; keep
+  // edge names as a stable tie-breaker.
   private def orderedChildren: Seq[HTNode] = {
     children.toSeq.sortBy(c => {
       val name = c.edges.map(_.name).min
-      (name.length, name)
+      val size = c.edges.toSeq.map(_.planReference.stats.sizeInBytes).sum
+      (size, name.length, name)
     })
   }
 

@@ -811,3 +811,36 @@ Planning follow-up:
 - The next serious implementation should recognize/fuse per-channel two-year summaries so each
   sales channel is scanned and aggregated once, producing compact first-year/second-year columns
   per customer before the final channel comparison joins.
+
+
+## 2026-06-19: stats-aware CountJoin child ordering
+
+Implemented a small plan-shape optimization in the hypertree executor: child subtrees are now
+processed in ascending `stats.sizeInBytes`, with the original edge name as deterministic tie-breaker.
+The previous edge-name-only order could join a wide dimension before a highly selective filtered
+dimension. In q4/q11 this meant customer was often joined before the date slice, so the later
+aggregate still carried many more rows than necessary.
+
+Focused diagnostics after the change, SF5, `shuffle.partitions=16`, AQE on:
+
+| query | mode | base ms | rewritten/prod ms | speedup | logical CJs | CountJoin output | shuffle bytes | notes |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| q4 | forced | 34475 | 22226 | 1.55x | 36 | 19.3M | 319.7 MB | forced output down from the old ~58M level |
+| q4 | prod | 38937 | 20388 | 1.91x | 12 | 19.3M | 319.7 MB | cost gate keeps the useful subset |
+| q11 | forced | 22586 | 12460 | 1.81x | 16 | 13.6M | 143.2 MB | forced output down from the old ~40.8M level |
+| q11 | prod | 15833 | 9656 | 1.64x | 8 | 13.6M | 143.2 MB | cost gate keeps the useful subset |
+| q64 | forced | 28528 | 15609 | 1.83x | 36 | 83.8M | 151.0 MB | remains a strong win |
+| q64 | prod | 29106 | 17137 | 1.70x | 36 | 83.8M | 137.4 MB | no regression on already-good hard query |
+
+Decision: keep. This is the first broad structural improvement for the repeated-summary TPC-DS
+class. It does not implement full aggregate fusion, but it narrows the gap by making existing
+CountJoin reductions happen earlier in the tree.
+
+Remaining gap:
+
+- q4/q11 still build and aggregate each year/channel slice independently.
+- A larger multi-slice summary factorization could still scan each sales channel once and emit
+  first-year/second-year measures together.
+- Build-side pre-aggregation or aggregate-through-unique-dimension rewriting remains the deeper
+  route for cases where the best root would otherwise place a large fact-derived subtree on the
+  CountJoin build side.
