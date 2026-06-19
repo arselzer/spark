@@ -944,3 +944,390 @@ Updated next candidates after this change:
    window separately for the scalar average and outer query.
 4. Broader validation: rerun the full applicable TPC-DS set once after any bucket/q97/q92 solution,
    because the current target/control set is now strongly positive but not a full-suite measurement.
+
+
+
+## 2026-06-19 handoff: current state, next work, and benchmark commands
+
+This section is meant to make the work movable to another machine without relying on session
+history.
+
+Current local state at handoff:
+
+- The latest local optimizer diff adds conservative production guards around the
+  decorating-dimension pre-aggregate path in
+  `sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/RewriteJoinsAsSemijoins.scala`.
+- The guard is active only when `spark.sql.yannakakis.costGateEnabled=true`; forced mode still
+  exposes the old shapes for diagnosis.
+- Focused correctness passed:
+
+```bash
+build/sbt 'sql/testOnly org.apache.spark.sql.YannakakisCorrectnessSuite -- -z "decorating"'
+```
+
+Why the latest guard was added:
+
+- The full pre-guard sweep found many real wins, but also several direct pre-aggregate production
+  slowdowns and q24a/q24b timeout-level regressions.
+- q4/q11 are the healthy direct-pre-aggregate class: wide customer decoration, large SMJ/sort
+  removal, and much lower shuffle records.
+- q34/q47/q57/q73/q89 were unhealthy direct-pre-aggregate cases: narrower item/date/store-style
+  decoration and large aggregate/shuffle expansion.
+- q24a/q24b should be CountJoin wins, not direct-pre-aggregate timeouts.
+
+Latest focused post-guard result:
+
+| query | status after guard | base ms | prod ms | interpretation |
+|---|---|---:|---:|---|
+| q4 | direct pre-agg preserved | 26914 | 13758 | real speedup |
+| q11 | direct pre-agg preserved | 13423 | 6372 | real speedup |
+| q24a | routed to CountJoin | 17212 | 9558 | real speedup; old prod timed out |
+| q24b | routed to CountJoin | 10997 | 6892 | real speedup; old prod timed out |
+| q25 | CountJoin preserved | 24409 | 4254 | real speedup |
+| q29 | CountJoin preserved | 19437 | 4672 | real speedup |
+| q31 | small shape change | 6657 | 3132 | promising but repeat before claiming |
+| q64 | CountJoin preserved | 25604 | 12699 | real speedup |
+| q3 | baseline-shaped | 1296 | 703 | old regression removed; timing is noise |
+| q34 | baseline-shaped | 2121 | 1356 | old regression removed; timing is noise |
+| q47 | baseline-shaped | 7101 | 5660 | old regression removed; timing is noise |
+| q52 | baseline-shaped | 1140 | 648 | old direct rewrite skipped; timing is noise |
+| q57 | baseline-shaped | 3203 | 2241 | old regression removed; timing is noise |
+| q71 | baseline-shaped | 1920 | 1365 | old direct rewrite skipped; timing is noise |
+| q73 | baseline-shaped | 1616 | 954 | old regression removed; timing is noise |
+| q89 | baseline-shaped | 1920 | 1096 | old regression removed; timing is noise |
+| q91 | baseline-shaped | 948 | 706 | old direct rewrite skipped; timing is noise |
+| q98 | baseline-shaped | 2088 | 1104 | old direct rewrite skipped; timing is noise |
+
+Do not count same-shape `prod` timings as speedups. In many single-pass diagnostics, `prod` runs
+after `base`, so the JVM, data cache, and generated code may be warmer. If the operator multiset and
+stable counters match the baseline, classify the row as "no production rewrite" even if `prod` is
+faster.
+
+Full pre-guard sweep, after applying that rule:
+
+| scope | speedups | slowdowns | neutral/same-shape | failed |
+|---|---:|---:|---:|---:|
+| 103 TPC-DS resource variants before latest guard | 26 | 6 | 69 | 2 |
+
+The six old production slowdowns were `q3,q34,q47,q57,q73,q89`. The two failures were q24a/q24b
+prod timeout/cancellation. The focused post-guard rerun removed those failures/slowdowns on the
+checked set. A new full post-guard production sweep is still needed before quoting final TPC-DS-wide
+counts.
+
+### Remaining optimization opportunities
+
+1. q50 delayed-existence and bucket fusion.
+
+   q50 is the most concrete next target. The current plan still emits a large date-expanded stream:
+   one date CountJoin contributes about 13M rows even though the selective returned-date branch is
+   tiny. The right fix is plan shape, not CountJoin loop tuning:
+
+   - defer the pure `store_sales -> date_dim d1` existence/count step until after the selective
+     returns/date side is known; or
+   - choose a hypertree root/order that reaches the selective returned-date branch first; then
+   - evaluate the sold/returned-date lag buckets where both dates are available and emit compact
+     per-store bucket counters directly.
+
+   Success criterion: q50 should improve beyond the current roughly 1.4x-2.0x range and reduce the
+   large pure date CountJoin output, without harming q25/q64.
+
+2. Aggregate-carrying CountJoin/AggJoin fusion.
+
+   q25, q29, q50, and q64 are already strong CountJoin wins, but the physical plan still has parent
+   aggregate/projection work around CountJoin-carried counts and sums. A dedicated fusion path could
+   let CountJoin emit directly into the parent aggregate's grouping layout for pure merge cases.
+
+   Good first targets: q25 and q64. Keep the change only if it helps q64 and does not regress
+   q25/q50.
+
+3. q4/q11 repeated-summary factorization.
+
+   Decorating-dimension pre-aggregation made q4/q11 much better, but each sales-channel/year slice
+   is still built and aggregated mostly independently. A larger summary-sharing rewrite could scan
+   each channel once and produce first-year/second-year measures together.
+
+   This is more invasive than q50 because it crosses sibling summary subqueries.
+
+4. q97 physical full-outer presence-count path.
+
+   Logical q97 rewrites improved operator counts but still failed to beat baseline reliably. The
+   promising shape is a physical algorithm over the two distinct key sets that directly computes
+   `left_only`, `right_only`, and `matched`, avoiding full outer row materialization and avoiding
+   three scalar aggregate branches.
+
+   Keep q97 protected by the cost gate until there is a dedicated physical path.
+
+5. q92 correlated scalar threshold reuse.
+
+   q92 still looks like a reuse/correlation problem: the scalar average and the outer query touch
+   the same web-sales/date window. The likely optimization is shared window aggregation or a rewrite
+   that computes the threshold and qualifying rows from one compact summary.
+
+6. Broaden the gate only after plan-shape fixes.
+
+   Many forced-only candidates were faster in the old sweep, but several forced shapes were bad
+   because they added CountJoin without reducing the dominant large joins. The next gate-widening
+   pass should happen after q50/q97/q92-style improvements, not before.
+
+### Benchmark data prerequisites
+
+TPC-DS diagnostic/proper suites use real data if present and create parquet cache directories when
+needed.
+
+Defaults:
+
+- `TPCDS_DIAG_DATA=/tmp/tpcds-sf5`
+- `TPCDS_DIAG_PARQUET=/tmp/tpcds-sf5-parquet`
+- `TPCDS_PROPER_DATA=/tmp/tpcds-sf5`
+- `TPCDS_PROPER_PARQUET=/tmp/tpcds-sf5-parquet`
+
+Override them on the new server if the data lives elsewhere.
+
+The diagnostic suite configuration is fixed in code to:
+
+- `spark.sql.shuffle.partitions=16`
+- `spark.sql.autoBroadcastJoinThreshold=10MB`
+- AQE enabled unless changed elsewhere
+- whole-stage codegen enabled unless changed elsewhere
+
+### Correctness and planning checks
+
+Focused correctness after optimizer changes:
+
+```bash
+build/sbt 'sql/testOnly org.apache.spark.sql.YannakakisCorrectnessSuite -- -z "decorating"'
+```
+
+Broader count/rewrite correctness:
+
+```bash
+build/sbt 'sql/testOnly org.apache.spark.sql.YannakakisCorrectnessSuite -- -z "count"'
+```
+
+Planning-only TPC-DS applicability:
+
+```bash
+build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSApplicabilitySuite'
+```
+
+Caveat: `TPCDSApplicabilitySuite` counts logical `CountJoin`/semijoin markers. It does not fully
+capture direct non-CountJoin rewrites such as decorating-dimension pre-aggregation, so use it for
+crash/applicability orientation, not for final production coverage.
+
+Plan dump for specific queries:
+
+```bash
+TPCDS_DUMP_QUERIES=q4,q11,q24a,q24b,q25,q29,q50,q64,q92,q97 \
+  build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinPlanDumpSuite'
+```
+
+This is planning-only and uses injected stats. It prints CountJoin blocks under cost gate off and
+on. It also misses direct non-CountJoin rewrites except through the changed optimized plan shape.
+
+### Focused TPC-DS diagnostics
+
+Use this for quick performance/counter checks after a candidate optimization:
+
+```bash
+TPCDS_DIAG_DATA=/tmp/tpcds-sf5 \
+TPCDS_DIAG_PARQUET=/tmp/tpcds-sf5-parquet \
+TPCDS_DIAG_QUERIES=q4,q11,q24a,q24b,q25,q29,q50,q64,q92,q97 \
+TPCDS_DIAG_MODES=base,prod \
+  build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinDiagnosticsSuite'
+```
+
+Add `forced` when investigating cost-gated opportunities:
+
+```bash
+TPCDS_DIAG_DATA=/tmp/tpcds-sf5 \
+TPCDS_DIAG_PARQUET=/tmp/tpcds-sf5-parquet \
+TPCDS_DIAG_QUERIES=q50,q64,q92,q97 \
+TPCDS_DIAG_MODES=base,forced,prod \
+TPCDS_DIAG_PRINT_PLAN=true \
+  build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinDiagnosticsSuite'
+```
+
+Interpretation rules:
+
+- `base`: Yannakakis disabled.
+- `forced`: Yannakakis enabled, unguarded enabled, cost gate disabled.
+- `prod`: Yannakakis enabled, unguarded enabled, cost gate enabled.
+- Direct pre-aggregate rewrites can have `logicalCountJoins=0`; do not use that field alone to decide
+  whether production rewrote the query.
+- If `base` and `prod` have the same operator multiset and the same stable counters, classify the
+  row as no production rewrite. Faster `prod` in that case is warmup/order noise.
+- Useful stable counters: `cjOut`, `cjBuildBytes`, `smjOut`, `bhjOut`, `aggOut`,
+  `shuffleRecords`, and `sortPeak`. `shuffleBytes` can jitter slightly across otherwise identical
+  plans.
+
+### Full TPC-DS production diagnostic sweep
+
+This is the right next broad measurement for current production behavior. It avoids forced-mode
+timeouts and answers "how many queries are faster/slower in production now?"
+
+```bash
+OUT=/tmp/tpcds-countjoin-prod-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$OUT"
+
+export TPCDS_DIAG_DATA=/tmp/tpcds-sf5
+export TPCDS_DIAG_PARQUET=/tmp/tpcds-sf5-parquet
+export TPCDS_DIAG_MODES=base,prod
+
+for QS in \
+  q1,q2,q3,q4,q5 \
+  q6,q7,q8,q9,q10 \
+  q11,q12,q13,q14a,q14b,q15 \
+  q16,q17,q18,q19,q20 \
+  q21,q22,q23a \
+  q23b \
+  q24a \
+  q24b \
+  q25 \
+  q26,q27,q28,q29,q30 \
+  q31,q32,q33,q34,q35 \
+  q36,q37,q38,q39a,q39b,q40 \
+  q41,q42,q43,q44,q45 \
+  q46,q47,q48,q49,q50 \
+  q51,q52,q53,q54,q55 \
+  q56,q57,q58,q59,q60 \
+  q61,q62,q63,q64,q65 \
+  q66,q67,q68,q69,q70 \
+  q71,q72,q73,q74,q75 \
+  q76,q77,q78,q79,q80 \
+  q81,q82,q83,q84,q85 \
+  q86,q87,q88,q89,q90 \
+  q91,q92,q93,q94,q95 \
+  q96,q97,q98,q99
+ do
+  SAFE=${QS//,/_}
+  echo "START $QS $(date --iso-8601=seconds)" | tee -a "$OUT/manifest.log"
+  TPCDS_DIAG_QUERIES="$QS" timeout 45m \
+    build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinDiagnosticsSuite' \
+    > "$OUT/$SAFE.log" 2>&1
+  STATUS=$?
+  echo "DONE $QS status=$STATUS $(date --iso-8601=seconds)" | tee -a "$OUT/manifest.log"
+done
+```
+
+Summarize raw diagnostic lines:
+
+```bash
+rg 'TPCDS-DIAG: .* \| (base|prod) \|' "$OUT"/*.log > "$OUT/results.txt"
+rg 'TPCDS-DIAG-COUNTJOIN:' "$OUT"/*.log > "$OUT/countjoins.txt"
+```
+
+When making the final table, include:
+
+- query
+- whether production changed shape
+- whether production contains logical CountJoin
+- whether the physical shape contains CountJoin
+- base ms
+- prod ms
+- speedup only if shape changed
+- key counters: `cjOut`, `smjOut`, `bhjOut`, `aggOut`, `shuffleRecords`, `sortPeak`
+
+### Full forced/gate exploration sweep
+
+Run this when looking for new candidates or understanding what the gate skips. It is more fragile
+because forced mode intentionally exposes bad experimental shapes.
+
+```bash
+OUT=/tmp/tpcds-countjoin-forced-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$OUT"
+
+export TPCDS_DIAG_DATA=/tmp/tpcds-sf5
+export TPCDS_DIAG_PARQUET=/tmp/tpcds-sf5-parquet
+export TPCDS_DIAG_MODES=base,forced,prod
+
+for QS in \
+  q1,q2,q3,q4,q5 \
+  q6,q7,q8,q9,q10 \
+  q11,q12,q13,q14a,q14b,q15 \
+  q16,q17,q18,q19,q20 \
+  q21,q22,q23a \
+  q23b \
+  q24a \
+  q24b \
+  q25 \
+  q26,q27,q28,q29,q30 \
+  q31,q32,q33,q34,q35 \
+  q36,q37,q38,q39a,q39b,q40 \
+  q41,q42,q43,q44,q45 \
+  q46,q47,q48,q49,q50 \
+  q51,q52,q53,q54,q55 \
+  q56,q57,q58,q59,q60 \
+  q61,q62,q63,q64,q65 \
+  q66,q67,q68,q69,q70 \
+  q71,q72,q73,q74,q75 \
+  q76,q77,q78,q79,q80 \
+  q81,q82,q83,q84,q85 \
+  q86,q87,q88,q89,q90 \
+  q91,q92,q93,q94,q95 \
+  q96,q97,q98,q99
+ do
+  SAFE=${QS//,/_}
+  echo "START $QS $(date --iso-8601=seconds)" | tee -a "$OUT/manifest.log"
+  TPCDS_DIAG_QUERIES="$QS" timeout 45m \
+    build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinDiagnosticsSuite' \
+    > "$OUT/$SAFE.log" 2>&1
+  STATUS=$?
+  echo "DONE $QS status=$STATUS $(date --iso-8601=seconds)" | tee -a "$OUT/manifest.log"
+done
+```
+
+If a forced chunk times out, rerun the later queries from that chunk separately so one bad forced
+shape does not hide unrelated results.
+
+### Repeated timing benchmark
+
+The current proper benchmark is useful for forced-mode candidate timing because it warms and
+interleaves `base` and `rewritten` runs. It does not time cost-gated `prod`; it only reports the
+cost-gated CountJoin count as `gate=Y/N`.
+
+Focused repeated forced timing:
+
+```bash
+TPCDS_PROPER_DATA=/tmp/tpcds-sf5 \
+TPCDS_PROPER_PARQUET=/tmp/tpcds-sf5-parquet \
+TPCDS_PROPER_QUERIES=q4,q11,q24a,q24b,q25,q29,q50,q64,q92,q97 \
+TPCDS_PROPER_WARMUPS=1 \
+TPCDS_PROPER_REPETITIONS=3 \
+TPCDS_PROPER_SEED=20260619 \
+  build/sbt 'sql/testOnly org.apache.spark.sql.TPCDSCountJoinProperBenchmarkSuite'
+```
+
+Use this to validate a forced-mode optimization before deciding whether the production gate should
+keep it. For current production numbers, use `TPCDSCountJoinDiagnosticsSuite` with
+`TPCDS_DIAG_MODES=base,prod`, or extend `TPCDSCountJoinProperBenchmarkSuite` to time `cost-gated` as
+a third measured mode.
+
+### TPCH and JOB checks
+
+TPC-H benchmark suite:
+
+```bash
+TPCH_DIR=/tmp/tpch-sf1-pq \
+  build/sbt 'set Test/javaOptions += "-Xmx12g"' \
+    'sql/testOnly org.apache.spark.sql.TPCHBenchmarkSuite'
+```
+
+TPC-H sweep correctness is included in that suite. It skips if `TPCH_DIR` is absent.
+
+JOB benchmark suite:
+
+```bash
+build/sbt 'set Test/javaOptions += "-Xmx12g"' \
+  'sql/testOnly org.apache.spark.sql.JOBBenchmarkSuite'
+```
+
+The JOB suite currently has hard-coded paths:
+
+- `/home/as/git/Spark-Y/data/parquet/imdb`
+- `/home/as/git/Spark-Y/data/job`
+
+On a new server, either put/symlink the data there or parameterize the suite before running it.
+
+No dedicated STATS benchmark harness was found in this checkout under
+`sql/core/src/test/scala/org/apache/spark/sql`; use the external STATS harness if it exists on the
+benchmark machine.

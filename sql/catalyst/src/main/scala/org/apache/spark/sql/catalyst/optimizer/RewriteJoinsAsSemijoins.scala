@@ -44,6 +44,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     if (DEBUG_LOGGING) logWarning(msg)
   }
 
+  private val MinWideDecoratingGroupRefs = 6
+  private val MaxDecoratingPreAggExpansion = BigInt(48)
+
   /**
    * Cost gate for the count-join rewrite. Returns true when vanilla Spark would broadcast
    * every base relation except the single largest: a broadcast-friendly shape where the baseline
@@ -98,6 +101,21 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
         }
       case _ =>
         false
+    }
+  }
+
+  private def distinctCountFor(column: Attribute, plan: LogicalPlan): Option[BigInt] = {
+    plan match {
+      case NodeWithOnlyDeterministicProjectAndFilter(t: LeafNode) =>
+        findLeafNodeCol(column, plan).flatMap { leafCol =>
+          if (t.outputSet.contains(leafCol)) {
+            t.stats.attributeStats.get(leafCol).flatMap(_.distinctCount)
+          } else {
+            None
+          }
+        }
+      case _ =>
+        None
     }
   }
 
@@ -1842,6 +1860,15 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     val (items, conditions) = extractInnerJoins(join)
     if (items.size < 3) return None
 
+    if (conf.yannakakisCostGateEnabled) {
+      val hg = new Hypergraph(items, conditions)
+      if (costGateSkips(items, conditions, hg, skipNonExpanding = true)) {
+        debugLog("cost gate: vanilla near-optimal for decorating-dimension " +
+          "pre-aggregate - keeping original plan")
+        return None
+      }
+    }
+
     def isPureProjectFilterOrLeaf(plan: LogicalPlan): Boolean = plan match {
       case _: LeafNode => true
       case Project(list, child) if list.forall(_.deterministic) =>
@@ -1875,7 +1902,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
 
     case class Candidate(
         item: LogicalPlan,
-        groupRefCount: Int,
+        groupRefs: Seq[Attribute],
         joinPairs: Seq[(Attribute, Attribute)])
 
     val candidates = items.flatMap { item =>
@@ -1887,16 +1914,46 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       val simpleJoinOnly = conditionsHere.nonEmpty && joinPairs.size == conditionsHere.size
       if (groupRefsHere.size >= 2 && aggRefsHere.isEmpty && simpleJoinOnly &&
           isPureProjectFilterOrLeaf(item)) {
-        Some(Candidate(item, groupRefsHere.size, joinPairs))
+        Some(Candidate(item, groupRefsHere.toSeq.sortBy(_.exprId.id), joinPairs))
       } else {
         None
       }
     }
 
     if (candidates.isEmpty) return None
-    val candidate = candidates.maxBy(c => (c.groupRefCount, c.item.stats.sizeInBytes))
+    val candidate = candidates.maxBy(c => (c.groupRefs.size, c.item.stats.sizeInBytes))
     val dim = candidate.item
     val dimOutput = dim.outputSet
+
+    if (conf.yannakakisCostGateEnabled && candidate.groupRefs.size < MinWideDecoratingGroupRefs) {
+      debugLog("cost gate: decorating-dimension pre-aggregate is not a wide " +
+        "dimension decoration - keeping original plan")
+      return None
+    }
+
+    if (conf.yannakakisCostGateEnabled) {
+      val rowCount = dim.stats.rowCount
+      val dimJoinKeyNdv = candidate.joinPairs.flatMap { case (dimAttr, _) =>
+        distinctCountFor(dimAttr, dim)
+      }.reduceOption(_ max _)
+      val dimGroupNdv = candidate.groupRefs.map(distinctCountFor(_, dim))
+        .foldLeft(Option(BigInt(1))) {
+          case (Some(acc), Some(ndv)) => Some(acc * ndv)
+          case _ => None
+        }.map(ndv => rowCount.map(_ min ndv).getOrElse(ndv))
+
+      val groupingContainsJoinKey = candidate.groupRefs.exists { groupAttr =>
+        candidate.joinPairs.exists { case (dimAttr, _) => groupAttr.semanticEquals(dimAttr) }
+      }
+      if (!groupingContainsJoinKey && dimJoinKeyNdv.exists { keyNdv =>
+          dimGroupNdv.exists(groupNdv =>
+            groupNdv > 0 && keyNdv > groupNdv * MaxDecoratingPreAggExpansion)
+        }) {
+        debugLog("cost gate: decorating-dimension pre-aggregate would group by a much " +
+          "higher-NDV join key than the requested dimension groups - keeping original plan")
+        return None
+      }
+    }
 
     val reducedItems = items.filterNot(_ eq dim)
     val reducedConditions = conditions.toSeq.filterNot(_.references.exists(dimOutput.contains))
@@ -1947,6 +2004,25 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
         (ne, ae, merge, partial)
     }
     val preAgg = Aggregate(preGrouping, preGroupingNamed ++ aggregateSlots.map(_._4), reducedJoin)
+
+    if (conf.yannakakisCostGateEnabled) {
+      val originalRows = agg.stats.rowCount
+      val preAggRows = preAgg.stats.rowCount
+      val rowExpansionTooHigh = (originalRows, preAggRows) match {
+        case (Some(original), Some(rows)) if original > 0 =>
+          rows > original * MaxDecoratingPreAggExpansion
+        case _ => false
+      }
+      val originalSize = agg.stats.sizeInBytes
+      val preAggSize = preAgg.stats.sizeInBytes
+      val sizeExpansionTooHigh = originalSize > 0 &&
+        preAggSize > originalSize * MaxDecoratingPreAggExpansion
+      if (rowExpansionTooHigh || sizeExpansionTooHigh) {
+        debugLog("cost gate: decorating-dimension pre-aggregate would create many more " +
+          "groups than the original aggregate - keeping original plan")
+        return None
+      }
+    }
 
     val preAggPlan = reducedJoin match {
       case j: Join =>
