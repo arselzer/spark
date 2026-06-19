@@ -24,6 +24,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.dsl.expressions.DslExpression
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
+import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.planning.NodeWithOnlyDeterministicProjectAndFilter
 import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.{FullOuter, RightOuter}
@@ -261,9 +262,10 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     // Extract product aggregates
     val products = aggExpressions.flatMap { agg =>
       agg.aggregateFunction match {
-        case Sum(child, _) if child.references.nonEmpty =>
-          // Filter out count-like attributes to identify true product attributes
-          // Count attrs typically have names like "c#123" or synthetic long IDs
+        case Sum(child, _) if child.references.nonEmpty && !isConditionalOneZero(child) =>
+          // Filter out count-like attributes to identify true product attributes. Conditional
+          // one/zero sums are count-like bucket aggregates, not value products: they can be
+          // independently summed over a finer grouping and combined later.
           val refs = child.references.filter(a =>
             !a.name.startsWith("c#")).toSet
           if (refs.size >= 2) {
@@ -1304,6 +1306,189 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     Some(Project(aggExpressions.map(_.toAttribute), recombined))
   }
 
+  private sealed trait FullOuterPresenceKind
+  private case object FoLeftOnly extends FullOuterPresenceKind
+  private case object FoRightOnly extends FullOuterPresenceKind
+  private case object FoMatched extends FullOuterPresenceKind
+
+  private case class FullOuterPresenceSlot(
+      output: NamedExpression,
+      kind: FullOuterPresenceKind,
+      leftAttr: Option[Attribute],
+      rightAttr: Option[Attribute])
+
+  private def isNumericLiteral(e: Expression, value: BigDecimal): Boolean = e match {
+    case Literal(v: Byte, _) => BigDecimal(v) == value
+    case Literal(v: Short, _) => BigDecimal(v) == value
+    case Literal(v: Int, _) => BigDecimal(v) == value
+    case Literal(v: Long, _) => BigDecimal(v) == value
+    case Literal(v: Float, _) => BigDecimal.decimal(v.toDouble) == value
+    case Literal(v: Double, _) => BigDecimal.decimal(v) == value
+    case Literal(v: Decimal, _) => v.toBigDecimal == value
+    case Cast(child, _, _, _) => isNumericLiteral(child, value)
+    case _ => false
+  }
+
+  private[optimizer] def isConditionalOneZero(e: Expression): Boolean = e match {
+    case CaseWhen(Seq((_, trueValue)), Some(falseValue)) =>
+      isNumericLiteral(trueValue, BigDecimal(1)) &&
+        isNumericLiteral(falseValue, BigDecimal(0))
+    case If(_, trueValue, falseValue) =>
+      isNumericLiteral(trueValue, BigDecimal(1)) &&
+        isNumericLiteral(falseValue, BigDecimal(0))
+    case Cast(child, _, _, _) => isConditionalOneZero(child)
+    case _ => false
+  }
+
+  private def tryRewriteFullOuterPresenceCounts(
+      agg: Aggregate,
+      grouping: Seq[Expression],
+      aggExpressions: Seq[NamedExpression],
+      projectList: Seq[NamedExpression],
+      join: Join): Option[LogicalPlan] = {
+    if (!conf.yannakakisEnabled || grouping.nonEmpty) return None
+
+    val extracted = join match {
+      case ExtractEquiJoinKeys(FullOuter, leftKeys, rightKeys, otherCondition,
+          _, left, right, hint) if otherCondition.isEmpty =>
+        Some((leftKeys, rightKeys, left, right, hint))
+      case _ => None
+    }
+    if (extracted.isEmpty) return None
+    val (leftKeys, rightKeys, left, right, hint) = extracted.get
+    val leftKeySet = ExpressionSet(leftKeys)
+    val rightKeySet = ExpressionSet(rightKeys)
+    val leftUnique = left.distinctKeys.exists(_.subsetOf(leftKeySet))
+    val rightUnique = right.distinctKeys.exists(_.subsetOf(rightKeySet))
+    if (!leftUnique || !rightUnique) return None
+
+    def nullTest(e: Expression): Option[(Boolean, Boolean, Attribute)] = e match {
+      case IsNotNull(a: Attribute) if left.outputSet.contains(a) &&
+          leftKeys.exists(_.semanticEquals(a)) => Some((true, true, a))
+      case IsNull(a: Attribute) if left.outputSet.contains(a) &&
+          leftKeys.exists(_.semanticEquals(a)) => Some((true, false, a))
+      case IsNotNull(a: Attribute) if right.outputSet.contains(a) &&
+          rightKeys.exists(_.semanticEquals(a)) => Some((false, true, a))
+      case IsNull(a: Attribute) if right.outputSet.contains(a) &&
+          rightKeys.exists(_.semanticEquals(a)) => Some((false, false, a))
+      case _ => None
+    }
+
+    def classifyPredicate(predicate: Expression): Option[(FullOuterPresenceKind,
+        Option[Attribute], Option[Attribute])] = {
+      val conjuncts = splitConjunctivePredicates(predicate)
+      val tests = conjuncts.flatMap(nullTest)
+      if (tests.size != conjuncts.size || tests.size != 2) return None
+
+      val leftPresent = tests.collectFirst { case (true, true, attr) => attr }
+      val leftAbsent = tests.collectFirst { case (true, false, attr) => attr }
+      val rightPresent = tests.collectFirst { case (false, true, attr) => attr }
+      val rightAbsent = tests.collectFirst { case (false, false, attr) => attr }
+
+      if (leftPresent.isDefined && rightAbsent.isDefined) {
+        Some((FoLeftOnly, leftPresent, None))
+      } else if (leftAbsent.isDefined && rightPresent.isDefined) {
+        Some((FoRightOnly, None, rightPresent))
+      } else if (leftPresent.isDefined && rightPresent.isDefined) {
+        Some((FoMatched, None, None))
+      } else {
+        None
+      }
+    }
+
+    val projectAliasMap = projectList.map(ne => ne.toAttribute.exprId -> ne).toMap
+
+    def stripProjectAliases(e: Expression): Expression = e.transformUp {
+      case a: Attribute => projectAliasMap.get(a.exprId) match {
+        case Some(Alias(child, _)) => child
+        case Some(attr: Attribute) => attr
+        case _ => a
+      }
+    }
+
+    def classifyExpression(ne: NamedExpression): Option[FullOuterPresenceSlot] =
+      stripProjectAliases(ne) match {
+        case Alias(AggregateExpression(Sum(child, _), _, false, None, _), _) =>
+          val predicate = child match {
+            case CaseWhen(Seq((pred, trueValue)), Some(falseValue))
+                if isNumericLiteral(trueValue, BigDecimal(1)) &&
+                  isNumericLiteral(falseValue, BigDecimal(0)) => Some(pred)
+            case If(pred, trueValue, falseValue)
+                if isNumericLiteral(trueValue, BigDecimal(1)) &&
+                  isNumericLiteral(falseValue, BigDecimal(0)) => Some(pred)
+            case _ => None
+          }
+          predicate.flatMap(classifyPredicate).map { case (kind, leftAttr, rightAttr) =>
+            FullOuterPresenceSlot(ne, kind, leftAttr, rightAttr)
+          }
+        case _ => None
+      }
+
+    val slots = aggExpressions.map(classifyExpression)
+    if (slots.exists(_.isEmpty)) return None
+    val presenceSlots = slots.flatten
+    if (presenceSlots.isEmpty) return None
+
+    def uniqueAttrs(attrs: Seq[Attribute]): Seq[Attribute] = {
+      attrs.foldLeft(Seq.empty[Attribute]) { (acc, attr) =>
+        if (acc.exists(_.semanticEquals(attr))) acc else acc :+ attr
+      }
+    }
+
+    val leftPresenceAttrs = uniqueAttrs(presenceSlots.flatMap(_.leftAttr))
+    val rightPresenceAttrs = uniqueAttrs(presenceSlots.flatMap(_.rightAttr))
+    val leftRowCount = Alias(Count(Literal(1L)).toAggregateExpression(), "fo_left_rows")()
+    val rightRowCount = Alias(Count(Literal(1L)).toAggregateExpression(), "fo_right_rows")()
+    val leftPresenceCounts = leftPresenceAttrs.map { attr =>
+      Alias(Count(attr :: Nil).toAggregateExpression(), "fo_left_present")()
+    }
+    val rightPresenceCounts = rightPresenceAttrs.map { attr =>
+      Alias(Count(attr :: Nil).toAggregateExpression(), "fo_right_present")()
+    }
+    val matchedCount = Alias(Count(Literal(1L)).toAggregateExpression(), "fo_matched")()
+
+    val leftAgg = Aggregate(Nil, leftRowCount +: leftPresenceCounts, left)
+    val rightAgg = Aggregate(Nil, rightRowCount +: rightPresenceCounts, right)
+    val matchedJoin = Join(left, right, LeftSemi, join.condition, hint)
+    val matchedAgg = Aggregate(Nil, Seq(matchedCount), matchedJoin)
+    val joinedCounts = Join(Join(leftAgg, rightAgg, Inner, None, JoinHint.NONE),
+      matchedAgg, Inner, None, JoinHint.NONE)
+
+    def countFor(
+        attr: Attribute,
+        attrs: Seq[Attribute],
+        counts: Seq[NamedExpression]): Attribute = {
+      counts(attrs.indexWhere(_.semanticEquals(attr))).toAttribute
+    }
+
+    val leftRows = leftRowCount.toAttribute
+    val rightRows = rightRowCount.toAttribute
+    val matched = matchedCount.toAttribute
+    val nonEmptyOuter = Or(GreaterThan(leftRows, Literal(0L)),
+      GreaterThan(rightRows, Literal(0L)))
+    val rewrittenOutputs = presenceSlots.map { slot =>
+      val raw = slot.kind match {
+        case FoLeftOnly =>
+          Subtract(countFor(slot.leftAttr.get, leftPresenceAttrs, leftPresenceCounts), matched)
+        case FoRightOnly =>
+          Subtract(countFor(slot.rightAttr.get, rightPresenceAttrs, rightPresenceCounts), matched)
+        case FoMatched => matched
+      }
+      val out = slot.output.toAttribute
+      Alias(If(nonEmptyOuter, Cast(raw, out.dataType), Literal(null, out.dataType)),
+        out.name)(exprId = out.exprId)
+    }
+
+    val rewritten = Project(rewrittenOutputs, joinedCounts)
+    if (rewritten.collectFirst { case p if p.missingInput.nonEmpty => p }.nonEmpty) {
+      logWarning("full-outer presence-count rewrite dropped required attributes; falling back")
+      None
+    } else {
+      logInfo("new aggregate (full-outer presence counts)")
+      Some(rewritten)
+    }
+  }
+
   /**
    * One mergeable aggregate slot of a LEFT OUTER split: the original aggregate result expression
    * (an Alias over a single count/sum/min/max) plus how its per-half partial results combine in
@@ -1357,6 +1542,9 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       projectList: Seq[NamedExpression],
       join: Join): Option[LogicalPlan] = {
     if (!conf.yannakakisEnabled || conf.yannakakisCostGateEnabled) return None
+    val presenceCounts = tryRewriteFullOuterPresenceCounts(agg, grouping, aggExpressions,
+      projectList, join)
+    if (presenceCounts.isDefined) return presenceCounts
     // Normalise RIGHT OUTER to LEFT OUTER by swapping the join sides (always sound). FULL OUTER is
     // kept as-is and handled with an extra (B-only) anti half below. A conditionless (cartesian)
     // outer join is not handled.
@@ -2280,11 +2468,13 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               val productAttrsInAgg = agg.references.filter(a =>
                 !a.name.startsWith("c#") && a.name != "c")
               val isProductAgg = productAttrsInAgg.size >= 2
+              val isConditionalCountSum = RewriteJoinsAsSemijoins.isConditionalOneZero(sumChild)
 
               // Check if THIS SPECIFIC product is conflicting (Phase 2: per-product check)
-              val isConflictingProduct = conflictingProductAttrs.contains(agg.resultAttribute)
+              val isConflictingProduct =
+                conflictingProductAttrs.contains(agg.resultAttribute) && !isConditionalCountSum
 
-              if (sumChildInGrouping) {
+              if (sumChildInGrouping && !isConditionalCountSum) {
                 dbg(s"Skipping SUM at CountJoin - child $sumChild is in grouping, would be trivial")
                 // Don't add to applicableAggExpressions - it will be computed at final aggregate
                 // with count multiplication
@@ -2331,6 +2521,8 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               dbg(s"refsOnLeft: $refsOnLeft, refsOnRight: $refsOnRight")
 
               // Count how many attributes are in the product (excluding count attributes)
+              val sumChild = agg.aggregateFunction.children.head
+              val isConditionalCountSum = RewriteJoinsAsSemijoins.isConditionalOneZero(sumChild)
               val productAttrs = agg.references.filter(a =>
                 !a.name.startsWith("c#") && a.name != "c")
               val numProductAttrs = productAttrs.size
@@ -2390,7 +2582,9 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // they may add grouping at different join points depending on join order.
               val otherProductsHaveUnseenAttrs = aggExpressions.exists { otherAgg =>
                 otherAgg.aggregateFunction match {
-                  case Sum(child, _) if otherAgg != agg =>
+                  case Sum(child, _)
+                      if otherAgg != agg &&
+                        !RewriteJoinsAsSemijoins.isConditionalOneZero(child) =>
                     val otherRefs = child.references.filter(a =>
                       !a.name.startsWith("c#") && a.name != "c")
                     // Is this other product already computed?
@@ -2418,6 +2612,16 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
 
               val hasConflict = hasForeignGrouping || otherProductsHaveUnseenAttrs
 
+              // Conditional one/zero SUMs are bucketed counts. Unlike true products, a finer
+              // grouping introduced by other group keys is safe: the final aggregate simply sums
+              // the bucket counts back to the requested grouping.
+              val effectiveHasUncoveredRightAttr =
+                !isConditionalCountSum && hasUncoveredRightAttr
+              val effectiveHasForeignGrouping =
+                !isConditionalCountSum && hasForeignGrouping
+              val effectiveHasConflict =
+                !isConditionalCountSum && hasConflict
+
               // Phase 1-2: Per-product conflict check using conflict graph
               // The winner product (not in conflictingProductAttrs) is allowed to compute early
               // even if there are other products with unseen attrs - that's the whole point
@@ -2431,18 +2635,20 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
               // - Full hasConflict check applies
               val mustDeferForGrouping = if (isConflictingProduct) {
                 // Conflicting product: full check
-                hasConflict && !isLeafNode
+                effectiveHasConflict && !isLeafNode
               } else {
                 // Independent product: only foreign grouping blocks it
-                hasForeignGrouping && !isLeafNode
+                effectiveHasForeignGrouping && !isLeafNode
               }
+              val effectiveConflictingProduct = isConflictingProduct && !isConditionalCountSum
 
               dbg(s"Conflict check for ${agg}: hasForeign=$hasForeignGrouping " +
                 s"otherUnseen=$otherProductsHaveUnseenAttrs isLeaf=$isLeafNode " +
-                s"mustDefer=$mustDeferForGrouping isConflicting=$isConflictingProduct")
+                s"mustDefer=$mustDeferForGrouping isConflicting=$isConflictingProduct " +
+                s"conditionalCount=$isConditionalCountSum")
 
-              if (!SQLConf.get.yannakakisDeferProductsEnabled && !hasUncoveredRightAttr &&
-                  !mustDeferForGrouping && !isConflictingProduct) {
+              if (!SQLConf.get.yannakakisDeferProductsEnabled && !effectiveHasUncoveredRightAttr &&
+                  !mustDeferForGrouping && !effectiveConflictingProduct) {
                 // Compute product early at this join (works for any number of attributes)
                 dbg(s"Computing product early ($numProductAttrs attrs): ${agg}")
                 dbg(s"  refsOnLeft=$refsOnLeft refsOnRight=$refsOnRight")
@@ -2450,7 +2656,6 @@ class HTNode(val edges: Set[HGEdge], var children: Set[HTNode], var parent: HTNo
                 dbg(s"  applicableGroupAttributes=${applicableGroupAttributes.map(_.toString)}")
 
                 // Extract the inner expression of the Sum (e.g., role_id * info_type_id)
-                val sumChild = agg.aggregateFunction.children.head
 
                 // Check if right-side product attributes are grouped at THIS join
                 val rightRefsGroupedHere = refsOnRight.exists(a =>

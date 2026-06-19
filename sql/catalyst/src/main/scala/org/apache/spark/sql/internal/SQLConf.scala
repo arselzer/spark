@@ -3658,16 +3658,6 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
-  val YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR =
-    buildConf("spark.sql.yannakakis.forcePhysicalCountJoinOperator")
-      .doc("Test-only: force the physical count-join operator (\"broadcast\", \"shuffle\" or " +
-        "\"sortMerge\") instead of letting the planner choose. The empty default uses the normal " +
-        "broadcast->shuffle->sortMerge selection. Needed because count joins otherwise plan as " +
-        "broadcast (or shuffle) at unit-test scale and the sort-merge path is never exercised.")
-      .version("3.5.0")
-      .internal()
-      .stringConf
-      .createWithDefault("")
 
   val CBO_ENABLED =
     buildConf("spark.sql.cbo.enabled")
@@ -7460,8 +7450,6 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def yannakakisCyclicBagsEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED)
 
-  def yannakakisForcePhysicalCountJoinOperator: String =
-    getConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR)
 
   def cboEnabled: Boolean = getConf(SQLConf.CBO_ENABLED)
 

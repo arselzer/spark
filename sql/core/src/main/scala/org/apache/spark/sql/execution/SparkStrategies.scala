@@ -270,9 +270,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
     }
 
     def forceApplyShuffledHashJoin(conf: SQLConf): Boolean = {
-      // TODO temporarily disabled
-       Utils.isTesting ||
-        conf.getConfString("spark.sql.join.forceApplyShuffledHashJoin", "false") == "true"
+      conf.getConfString(
+        "spark.sql.join.forceApplyShuffledHashJoin", Utils.isTesting.toString) == "true"
     }
 
     def getShuffleHashCountJoinBuildSide(
@@ -295,10 +294,10 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
       val buildRight = if (hintOnly) {
         hintToShuffleHashJoinRight(hint)
       } else {
-                  hintToPreferShuffleHashJoinRight(hint) ||
-                    (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(right, conf) &&
-                      muchSmaller(right, left, conf)) ||
-                    forceApplyShuffledHashJoin(conf)
+        hintToPreferShuffleHashJoinRight(hint) ||
+          (!conf.preferSortMergeJoin && canBuildLocalHashMapBySize(right, conf) &&
+            muchSmaller(right, left, conf)) ||
+          forceApplyShuffledHashJoin(conf)
       }
 
       getCountJoinBuildSide(
@@ -602,19 +601,13 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
                 .get
             }
 
-            // Test-only override: force a specific physical count-join operator so the
-            // sort-merge path (otherwise never selected at unit-test scale) can be exercised.
-            conf.yannakakisForcePhysicalCountJoinOperator match {
-              case "broadcast" => createBroadcastHashCountJoin(false).get
-              case "shuffle" => createShuffleHashCountJoin(false).get
-              case "sortMerge" => createSortMergeCountJoin().get
-              case _ if hint.isEmpty =>
-                createCountJoinWithoutHint()
-              case _ =>
-                createBroadcastHashCountJoin(true)
-                  .orElse { if (hintToSortMergeJoin(hint)) createSortMergeCountJoin() else None }
-                  .orElse(createShuffleHashCountJoin(true))
-                  .getOrElse(createCountJoinWithoutHint())
+            if (hint.isEmpty) {
+              createCountJoinWithoutHint()
+            } else {
+              createBroadcastHashCountJoin(true)
+                .orElse { if (hintToSortMergeJoin(hint)) createSortMergeCountJoin() else None }
+                .orElse(createShuffleHashCountJoin(true))
+                .getOrElse(createCountJoinWithoutHint())
             }
           // CountJoin always extracts equi-join keys; this only satisfies exhaustiveness.
           case _ => Nil

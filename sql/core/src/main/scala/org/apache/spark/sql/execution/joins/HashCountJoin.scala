@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.{InternalRow, SQLConfHelper}
 import org.apache.spark.sql.catalyst.analysis.CastSupport
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
-import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction, Complete, DeclarativeAggregate, Final, NoOp, Partial, PartialMerge}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction, Complete, Count, DeclarativeAggregate, Final, NoOp, Partial, PartialMerge, Sum}
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans._
@@ -763,6 +763,16 @@ trait HashCountJoin extends JoinCodegenSupport {
       return codegenCountOnlyInner(ctx, input)
     }
     assert(buildSide == BuildRight, "count join must build the right side")
+
+    // Ordinals index streamedOutput (= left, the stream side) and buildOutput (= right).
+    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
+      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
+      .map(c => buildOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+
+    derivedCountAggregateKinds(rightCountOrdinal).foreach { kinds =>
+      return codegenCountOnlyInner(ctx, input, kinds)
+    }
     val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
     if (isEmptyHashedRelation) {
       return "// empty HashedRelation: count inner join returns nothing"
@@ -771,11 +781,6 @@ trait HashCountJoin extends JoinCodegenSupport {
     val (matched, checkCondition, buildVars) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
     val numOutput = metricTerm(ctx, "numOutputRows")
 
-    // Ordinals index streamedOutput (= left, the stream side) and buildOutput (= right).
-    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
-      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
-    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
-      .map(c => buildOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
 
     val rightCountSum = ctx.freshName("rightCountSum")
     val leftCount = ctx.freshName("leftCount")
@@ -884,11 +889,14 @@ trait HashCountJoin extends JoinCodegenSupport {
    * Inner count-join codegen when carried aggregate result columns are not consumed by the parent.
    * It emits the fan-out count and null placeholders for the dead aggregate outputs.
    */
-  protected def codegenCountOnlyInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+  protected def codegenCountOnlyInner(
+      ctx: CodegenContext,
+      input: Seq[ExprCode],
+      derivedKinds: Seq[DerivedCountAggregate] = Nil): String = {
     assert(buildSide == BuildRight, "count join must build the right side")
     assert(groupRight.isEmpty, "non-grouped count-only codegen cannot carry grouping keys")
-    assert(aggregateResultsUnusedByParent,
-      "count-only codegen cannot carry parent-visible aggregate results")
+    assert(aggregateResultsUnusedByParent || derivedKinds.nonEmpty,
+      "count-only codegen cannot carry parent-visible aggregate results unless derived from count")
     val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
     if (isEmptyHashedRelation) {
       return "// empty HashedRelation: count inner join returns nothing"
@@ -914,22 +922,38 @@ trait HashCountJoin extends JoinCodegenSupport {
       s"long $leftCount = 1L;"
     }
 
+    val matchedRows = ctx.freshName("matchedRows")
     val rightCountExpr =
       if (rightCountOrdinal != -1) s"$matched.getLong($rightCountOrdinal)" else "1L"
-    val matchBody = s"$rightCountSum += $rightCountExpr;"
+    val needsMatchedRows = derivedKinds.contains(DerivedMatchedRows)
+    val matchedRowsInit = if (needsMatchedRows) s"long $matchedRows = 0L;" else ""
+    val matchedRowsIncrement = if (needsMatchedRows) s"$matchedRows += 1L;" else ""
+    val matchBody = s"$rightCountSum += $rightCountExpr;\n$matchedRowsIncrement"
     val matchLoop = countMatchLoop(
       ctx, relationTerm, keyEv, anyNull, matched, checkCondition, keyIsUnique, matchBody)
 
-    val unusedAggVars = aggregatesRight.map { aggregate =>
-      val attr = aggregate.resultAttribute
-      ExprCode(EmptyBlock, TrueLiteral, JavaCode.defaultLiteral(attr.dataType))
+    val aggregateVars = if (derivedKinds.nonEmpty) {
+      aggregatesRight.zip(derivedKinds).map { case (aggregate, kind) =>
+        val attr = aggregate.resultAttribute
+        val value = kind match {
+          case DerivedMatchedRows => matchedRows
+          case DerivedRightCountSum => rightCountSum
+        }
+        ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(value, attr.dataType))
+      }
+    } else {
+      aggregatesRight.map { aggregate =>
+        val attr = aggregate.resultAttribute
+        ExprCode(EmptyBlock, TrueLiteral, JavaCode.defaultLiteral(attr.dataType))
+      }
     }
     val countEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(countOut, LongType))
-    val resultVars = input ++ Seq(countEv) ++ unusedAggVars
+    val resultVars = input ++ Seq(countEv) ++ aggregateVars
 
     s"""
        |${keyEv.code}
        |long $rightCountSum = 0L;
+       |$matchedRowsInit
        |$leftCountSetup
        |$matchLoop
        |if ($rightCountSum != 0L) {
@@ -957,11 +981,61 @@ trait HashCountJoin extends JoinCodegenSupport {
     })
   }
 
+  protected sealed trait DerivedCountAggregate
+  protected case object DerivedMatchedRows extends DerivedCountAggregate
+  protected case object DerivedRightCountSum extends DerivedCountAggregate
+
+  private def derivedCountAggregateKinds(
+      rightCountOrdinal: Int): Option[Seq[DerivedCountAggregate]] = {
+    if (aggregatesRight.isEmpty) {
+      return None
+    }
+
+    val rightCountAttribute = countRight.flatMap(_.references.headOption)
+    val kinds = aggregatesRight.map { aggregate =>
+      if (aggregate.isDistinct || aggregate.filter.isDefined ||
+          (aggregate.mode != Partial && aggregate.mode != Complete) ||
+          aggregate.resultAttribute.dataType != LongType) {
+        None
+      } else {
+        aggregate.aggregateFunction match {
+          case Count(children) if rightCountOrdinal == -1 && children.forall {
+              case Literal(null, _) => false
+              case _: Literal => true
+              case _ => false
+            } =>
+            Some(DerivedMatchedRows)
+          case Sum(child, _) if rightCountOrdinal != -1 &&
+              rightCountAttribute.exists(child.semanticEquals) =>
+            Some(DerivedRightCountSum)
+          case _ =>
+            None
+        }
+      }
+    }
+
+    if (kinds.forall(_.isDefined)) {
+      Some(kinds.flatten)
+    } else {
+      None
+    }
+  }
+
   protected def codegenCountGroupedInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
     if (aggregateResultsUnusedByParent) {
       return codegenCountOnlyGroupedInner(ctx, input)
     }
     assert(buildSide == BuildRight, "count join must build the right side")
+
+    // Ordinals index streamedOutput (= left) and buildOutput (= right), as in the non-grouped path.
+    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
+      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
+      .map(c => buildOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
+
+    derivedCountAggregateKinds(rightCountOrdinal).foreach { kinds =>
+      return codegenCountOnlyGroupedInner(ctx, input, kinds)
+    }
     val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
     if (isEmptyHashedRelation) {
       return "// empty HashedRelation: count inner join returns nothing"
@@ -970,11 +1044,6 @@ trait HashCountJoin extends JoinCodegenSupport {
     val (matched, checkCondition, buildVars) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
     val numOutput = metricTerm(ctx, "numOutputRows")
 
-    // Ordinals index streamedOutput (= left) and buildOutput (= right), as in the non-grouped path.
-    val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
-      .map(c => streamedOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
-    val rightCountOrdinal = countRight.filter(_.references.nonEmpty)
-      .map(c => buildOutput.indexWhere(_.exprId == c.references.head.exprId)).getOrElse(-1)
 
     val leftCount = ctx.freshName("leftCount")
     val leftCountSetup = if (leftCountOrdinal != -1) {
@@ -1080,6 +1149,19 @@ trait HashCountJoin extends JoinCodegenSupport {
     val groupReads = groupAttributes.zipWithIndex.map { case (a, i) => readField(gkeyOut, a, i) }
     val countEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(cnt, LongType))
     val resultVars = input ++ Seq(countEv) ++ aggReads.map(_._2) ++ groupReads.map(_._2)
+    val canReadGroupsFromMatchedRow = groupRight.forall { group =>
+      group.references.subsetOf(buildPlan.outputSet)
+    }
+    val directGroupVars = if (canReadGroupsFromMatchedRow) {
+      ctx.currentVars = buildVars
+      groupRight.map { group =>
+        bindReferences(Seq(group: Expression), buildPlan.output).head.genCode(ctx)
+      }
+    } else {
+      Nil
+    }
+    val directGroupEval = evaluateVariables(directGroupVars)
+    val directResultVars = input ++ Seq(countEv) ++ aggReads.map(_._2) ++ directGroupVars
     val inputEval = evaluateVariables(input)
     val iter = ctx.freshName("groupIter")
     val entry = ctx.freshName("groupEntry")
@@ -1133,7 +1215,7 @@ trait HashCountJoin extends JoinCodegenSupport {
          |}
        """.stripMargin
 
-    val uniquePath =
+    def projectedUniquePath: String =
       s"""
          |UnsafeRow $matched = $anyNull ? null :
          |  (UnsafeRow)$relationTerm.getValue(${keyEv.value});
@@ -1155,6 +1237,31 @@ trait HashCountJoin extends JoinCodegenSupport {
          |  }
          |}
        """.stripMargin
+
+    def directUniquePath: String =
+      s"""
+         |UnsafeRow $matched = $anyNull ? null :
+         |  (UnsafeRow)$relationTerm.getValue(${keyEv.value});
+         |if ($matched != null) {
+         |  $checkCondition {
+         |    long $rightCount = $rightCountExpr;
+         |    $rowCls $buf = $aggTerm.newBuffer();
+         |    $buf.setLong($countOrd, $rightCount);
+         |    $buildUpdateEval
+         |    $updateCode
+         |    $inputEval
+         |    long $cnt = $rightCount * $leftCount;
+         |    $rowCls $aggResRow = $aggTerm.eval($buf);
+         |    ${aggReads.map(_._1).mkString("\n")}
+         |    $directGroupEval
+         |    $numOutput.add(1);
+         |    ${consume(ctx, directResultVars)}
+         |  }
+         |}
+       """.stripMargin
+
+    val uniquePath =
+      if (canReadGroupsFromMatchedRow) directUniquePath else projectedUniquePath
 
     val groupedPath = if (buildKeyIsUniqueKnownStatically) {
       if (keyIsUnique) uniquePath else nonUniquePath
@@ -1181,16 +1288,21 @@ trait HashCountJoin extends JoinCodegenSupport {
    * GROUPING count-join codegen when carried aggregate result columns are not consumed by the
    * parent. This avoids aggregate-buffer allocation/init/eval work and keeps only per-group counts.
    */
-  protected def codegenCountOnlyGroupedInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+  protected def codegenCountOnlyGroupedInner(
+      ctx: CodegenContext,
+      input: Seq[ExprCode],
+      derivedKinds: Seq[DerivedCountAggregate] = Nil): String = {
     assert(buildSide == BuildRight, "count join must build the right side")
-    assert(aggregateResultsUnusedByParent,
-      "count-only grouped codegen cannot carry parent-visible aggregate results")
+    assert(aggregateResultsUnusedByParent || derivedKinds.nonEmpty,
+      "count-only grouped codegen cannot carry parent-visible aggregate results unless derived " +
+        "from count")
     val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
     if (isEmptyHashedRelation) {
       return "// empty HashedRelation: count inner join returns nothing"
     }
     val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
-    val (matched, checkCondition, _) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
+    val (matched, checkCondition, buildVars) =
+      getJoinCondition(ctx, input, streamedPlan, buildPlan)
     val numOutput = metricTerm(ctx, "numOutputRows")
 
     val leftCountOrdinal = countLeft.filter(_.references.nonEmpty)
@@ -1213,13 +1325,20 @@ trait HashCountJoin extends JoinCodegenSupport {
     val aggTerm = ctx.addMutableState(aggClass, "groupedAgg",
       v => s"$v = $thisPlan.createGroupedAggregator();", forceInline = true)
 
+    val needsCountMap = !(buildKeyIsUniqueKnownStatically && keyIsUnique)
+
     val mapCls = "java.util.HashMap"
-    val countHolderCls = classOf[MutableLong].getName
-    val countMap = ctx.addMutableState(s"$mapCls<UnsafeRow, $countHolderCls>", "cjCountMap",
-      v => s"$v = new $mapCls<UnsafeRow, $countHolderCls>();", forceInline = true)
+    val countHolderCls = classOf[scala.runtime.LongRef].getName
+    val countMap = if (needsCountMap) {
+      ctx.addMutableState(s"$mapCls<UnsafeRow, $countHolderCls>", "cjCountMap",
+        v => s"$v = new $mapCls<UnsafeRow, $countHolderCls>();", forceInline = true)
+    } else {
+      ""
+    }
     val rightCount = ctx.freshName("rightCount")
     val countHolder = ctx.freshName("countHolder")
     val gkey = ctx.freshName("gkey")
+    val groupCount = ctx.freshName("groupCount")
     val cnt = ctx.freshName("cnt")
     val gkeyOut = ctx.freshName("gkeyOut")
     val rightCountExpr =
@@ -1238,14 +1357,34 @@ trait HashCountJoin extends JoinCodegenSupport {
         JavaCode.variable(v, attr.dataType)))
     }
 
-    val unusedAggVars = aggregatesRight.map { aggregate =>
-      val attr = aggregate.resultAttribute
-      ExprCode(EmptyBlock, TrueLiteral, JavaCode.defaultLiteral(attr.dataType))
+    val aggregateVars = if (derivedKinds.nonEmpty) {
+      aggregatesRight.zip(derivedKinds).map { case (aggregate, _) =>
+        val attr = aggregate.resultAttribute
+        ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(groupCount, attr.dataType))
+      }
+    } else {
+      aggregatesRight.map { aggregate =>
+        val attr = aggregate.resultAttribute
+        ExprCode(EmptyBlock, TrueLiteral, JavaCode.defaultLiteral(attr.dataType))
+      }
     }
     val groupAttributes = groupRight.map(_.toAttribute)
     val groupReads = groupAttributes.zipWithIndex.map { case (a, i) => readField(gkeyOut, a, i) }
     val countEv = ExprCode(EmptyBlock, FalseLiteral, JavaCode.variable(cnt, LongType))
-    val resultVars = input ++ Seq(countEv) ++ unusedAggVars ++ groupReads.map(_._2)
+    val resultVars = input ++ Seq(countEv) ++ aggregateVars ++ groupReads.map(_._2)
+    val canReadGroupsFromMatchedRow = groupRight.forall { group =>
+      group.references.subsetOf(buildPlan.outputSet)
+    }
+    val directGroupVars = if (canReadGroupsFromMatchedRow) {
+      ctx.currentVars = buildVars
+      groupRight.map { group =>
+        bindReferences(Seq(group: Expression), buildPlan.output).head.genCode(ctx)
+      }
+    } else {
+      Nil
+    }
+    val directGroupEval = evaluateVariables(directGroupVars)
+    val directResultVars = input ++ Seq(countEv) ++ aggregateVars ++ directGroupVars
     val inputEval = evaluateVariables(input)
     val iter = ctx.freshName("groupIter")
     val entry = ctx.freshName("groupEntry")
@@ -1256,10 +1395,10 @@ trait HashCountJoin extends JoinCodegenSupport {
          |UnsafeRow $gkey = $aggTerm.groupKey($matched);
          |$countHolderCls $countHolder = ($countHolderCls) $countMap.get($gkey);
          |if ($countHolder == null) {
-         |  $countHolder = new $countHolderCls();
+         |  $countHolder = new $countHolderCls(0L);
          |  $countMap.put($gkey.copy(), $countHolder);
          |}
-         |$countHolder.value_$$eq($countHolder.value() + $rightCount);
+         |$countHolder.elem += $rightCount;
        """.stripMargin
 
     val matches = ctx.freshName("matches")
@@ -1287,14 +1426,15 @@ trait HashCountJoin extends JoinCodegenSupport {
          |while ($iter.hasNext()) {
          |  java.util.Map.Entry $entry = (java.util.Map.Entry) $iter.next();
          |  UnsafeRow $gkeyOut = (UnsafeRow) $entry.getKey();
-         |  long $cnt = (($countHolderCls) $entry.getValue()).value() * $leftCount;
+         |  long $groupCount = (($countHolderCls) $entry.getValue()).elem;
+         |  long $cnt = $groupCount * $leftCount;
          |  ${groupReads.map(_._1).mkString("\n")}
          |  $numOutput.add(1);
          |  ${consume(ctx, resultVars)}
          |}
        """.stripMargin
 
-    val uniquePath =
+    def projectedUniquePath: String =
       s"""
          |UnsafeRow $matched = $anyNull ? null :
          |  (UnsafeRow)$relationTerm.getValue(${keyEv.value});
@@ -1303,13 +1443,34 @@ trait HashCountJoin extends JoinCodegenSupport {
          |    long $rightCount = $rightCountExpr;
          |    UnsafeRow $gkeyOut = $aggTerm.groupKey($matched);
          |    $inputEval
-         |    long $cnt = $rightCount * $leftCount;
+         |    long $groupCount = $rightCount;
+         |    long $cnt = $groupCount * $leftCount;
          |    ${groupReads.map(_._1).mkString("\n")}
          |    $numOutput.add(1);
          |    ${consume(ctx, resultVars)}
          |  }
          |}
        """.stripMargin
+
+    def directUniquePath: String =
+      s"""
+         |UnsafeRow $matched = $anyNull ? null :
+         |  (UnsafeRow)$relationTerm.getValue(${keyEv.value});
+         |if ($matched != null) {
+         |  $checkCondition {
+         |    long $rightCount = $rightCountExpr;
+         |    $inputEval
+         |    long $groupCount = $rightCount;
+         |    long $cnt = $groupCount * $leftCount;
+         |    $directGroupEval
+         |    $numOutput.add(1);
+         |    ${consume(ctx, directResultVars)}
+         |  }
+         |}
+       """.stripMargin
+
+    val uniquePath =
+      if (canReadGroupsFromMatchedRow) directUniquePath else projectedUniquePath
 
     val groupedPath = if (buildKeyIsUniqueKnownStatically) {
       if (keyIsUnique) uniquePath else nonUniquePath

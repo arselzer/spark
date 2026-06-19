@@ -183,7 +183,13 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
    */
   private def assertCountJoinCodegenMatches(
       query: String, hint: String, extraConf: (String, String)*): Unit = {
-    withSQLConf((yannakakisOn ++ extraConf): _*) {
+    val physicalConf = if (extraConf.exists(_._1 == SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key) &&
+        !extraConf.exists(_._1 == SQLConf.PREFER_SORTMERGEJOIN.key)) {
+      extraConf :+ (SQLConf.PREFER_SORTMERGEJOIN.key -> "false")
+    } else {
+      extraConf
+    }
+    withSQLConf((yannakakisOn ++ physicalConf): _*) {
       // AQE off so the WholeStageCodegen `*(n)` markers are present in the static executedPlan
       // (under AQE they only appear after the plan is finalized at run time).
       val onPlan = withSQLConf(
@@ -658,11 +664,11 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       SQLConf.YANNAKAKIS_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
-      SQLConf.PREFER_SORTMERGEJOIN.key -> "true") {
+      SQLConf.PREFER_SORTMERGEJOIN.key -> "true",
+      "spark.sql.join.forceApplyShuffledHashJoin" -> "false") {
       val df = sql(query)
-      // scalastyle:off println
-      println("Q7BUG executed plan:\n" + df.queryExecution.executedPlan)
-      // scalastyle:on println
+      val plan = df.queryExecution.executedPlan.toString
+      assert(plan.contains("SortMergeCountJoin"), s"expected SortMergeCountJoin:\n$plan")
       checkAnswer(df, expected)
     }
   }
@@ -756,6 +762,53 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       from gfc1 join gfc2 on gfc1.k = gfc2.k
       group by g""",
       "guarded count FILTER must be desugared and rewritten")
+  }
+
+  test("conditional one-zero sum across relations is carried by count-join") {
+    Seq(
+      (1, 10, 100, 5, 1),
+      (2, 20, 200, 50, 1),
+      (3, 30, 300, 90, 2))
+      .toDF("ss_ticket_number", "ss_item_sk", "ss_customer_sk", "ss_sold_date_sk",
+        "ss_store_sk")
+      .createOrReplaceTempView("q50_sales_t")
+    Seq(
+      (1, 10, 100, 20),
+      (1, 10, 100, 40),
+      (2, 20, 200, 70),
+      (3, 30, 300, 250))
+      .toDF("sr_ticket_number", "sr_item_sk", "sr_customer_sk", "sr_returned_date_sk")
+      .createOrReplaceTempView("q50_returns_t")
+    Seq((1, "A"), (2, "B")).toDF("s_store_sk", "s_store_name")
+      .createOrReplaceTempView("q50_store_t")
+    Seq((20, 2001, 8), (40, 2001, 8), (70, 2001, 8), (250, 2001, 8))
+      .toDF("d_date_sk", "d_year", "d_moy")
+      .createOrReplaceTempView("q50_date_t")
+
+    val query = """
+      select s_store_name,
+             sum(case when sr_returned_date_sk - ss_sold_date_sk <= 30 then 1 else 0 end) as d30,
+             sum(case when sr_returned_date_sk - ss_sold_date_sk > 30 and
+                       sr_returned_date_sk - ss_sold_date_sk <= 60 then 1 else 0 end) as d60,
+             sum(case when sr_returned_date_sk - ss_sold_date_sk > 120 then 1 else 0 end) as d120
+      from q50_sales_t, q50_returns_t, q50_store_t, q50_date_t
+      where sr_returned_date_sk = d_date_sk and d_year = 2001 and d_moy = 8
+        and ss_ticket_number = sr_ticket_number
+        and ss_item_sk = sr_item_sk
+        and ss_customer_sk = sr_customer_sk
+        and ss_store_sk = s_store_sk
+      group by s_store_name"""
+
+    assertSameResults(query, "conditional one-zero bucket sums")
+    withSQLConf((yannakakisOn :+ (SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
+      val plan = sql(query).queryExecution.executedPlan
+      val carryingCountJoins = plan.collect {
+        case cj: HashCountJoin if cj.aggregatesRight.nonEmpty => cj
+      }
+      assert(carryingCountJoins.nonEmpty,
+        s"""expected a count-join carrying conditional bucket aggregates:
+           |$plan""".stripMargin)
+    }
   }
 
   test("guarded count over nullable column does not overcount") {
@@ -936,13 +989,30 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     assertSameResults(query, "per (nation, year) sums must not collapse (TPC-H Q9 shape)")
   }
 
-  // Force the shuffle and sort-merge count-join operators. The default planner already picks
-  // broadcast for these tiny relations (so the shared HashCountJoin trait is covered by the
-  // other tests via the broadcast variant); "shuffle" re-covers that same trait, and
-  // "sortMerge" exercises the otherwise-never-selected SortMergeCountJoin evaluator. Broadcast
-  // is intentionally not forced: a multi-relation right subtree can exceed the broadcast size
-  // threshold, so it is not always a feasible choice to force.
-  private val countJoinOperators = Seq("shuffle", "sortMerge")
+  private val shuffledCountJoinConfs = Seq(
+    SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+    SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
+    SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+
+  private val sortMergeCountJoinConfs = Seq(
+    SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+    SQLConf.PREFER_SORTMERGEJOIN.key -> "true",
+    "spark.sql.join.forceApplyShuffledHashJoin" -> "false",
+    SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+
+  private def assertSameResultsOnCountJoinExec(
+      query: String,
+      hint: String,
+      expectedExec: String,
+      extraConfs: (String, String)*): Unit = {
+    withSQLConf(extraConfs: _*) {
+      withSQLConf(yannakakisOn: _*) {
+        val plan = sql(query).queryExecution.executedPlan.toString
+        assert(plan.contains(expectedExec), s"$hint: expected $expectedExec:\n$plan")
+      }
+      assertSameResults(query, hint)
+    }
+  }
 
   private val q9FromOrders: Seq[Seq[String]] = {
     val relations = Seq("part_t9", "supplier_t9", "lineitem_t9", "partsupp_t9",
@@ -954,37 +1024,34 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
         Seq("nation_t9", "orders_t9", "part_t9", "partsupp_t9", "supplier_t9", "lineitem_t9"))
   }
 
-  test("Q9 grouped count-join: per-group sums correct under every physical operator") {
-    // nation-rooted order builds a CountJoin that both groups (groupRight) and aggregates -
-    // the shape that exposed the buffer-aliasing bug; run it under each physical operator.
+  test("Q9 grouped count-join: per-group sums correct on shuffled-hash path") {
+    // Nation-rooted order builds a CountJoin that both groups (groupRight) and aggregates -
+    // the shape that exposed the buffer-aliasing bug.
+    createQ9Tables()
     val fromOrder = Seq("supplier_t9", "lineitem_t9", "partsupp_t9",
       "orders_t9", "nation_t9", "part_t9")
-    for (op <- countJoinOperators) {
-      createQ9Tables()
-      val query = s"""
-        select nation, o_year, sum(amount) as sum_profit
-        from (
-          select n_name as nation, extract(year from o_orderdate) as o_year,
-                 l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
-          from ${fromOrder.mkString(", ")}
-          where s_suppkey = l_suppkey and ps_suppkey = l_suppkey
-            and ps_partkey = l_partkey and p_partkey = l_partkey
-            and o_orderkey = l_orderkey and s_nationkey = n_nationkey
-            and p_name like '%green%'
-        ) as profit
-        group by nation, o_year"""
-      withSQLConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> op) {
-        assertSameResults(query, s"Q9 grouped sums, operator=$op")
-      }
-    }
+    val query = s"""
+      select nation, o_year, sum(amount) as sum_profit
+      from (
+        select n_name as nation, extract(year from o_orderdate) as o_year,
+               l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
+        from ${fromOrder.mkString(", ")}
+        where s_suppkey = l_suppkey and ps_suppkey = l_suppkey
+          and ps_partkey = l_partkey and p_partkey = l_partkey
+          and o_orderkey = l_orderkey and s_nationkey = n_nationkey
+          and p_name like '%green%'
+      ) as profit
+      group by nation, o_year"""
+    assertSameResultsOnCountJoinExec(query, "Q9 grouped sums on shuffled-hash path",
+      "ShuffledHashCountJoin", shuffledCountJoinConfs: _*)
   }
 
-  test("count-join GROUP BY <expr>: correct under every physical operator and FROM order") {
+  test("count-join GROUP BY <expr>: correct on shuffled-hash path and FROM order") {
     // GROUP BY year(o_orderdate): the rewrite reduces by the underlying attribute o_orderdate
-    // (carried in groupRight) and reconstructs year() at the final aggregate. Exercises the
-    // grouped count-join under each operator with a grouping EXPRESSION (not a plain key), and
-    // a simple single-relation sum to isolate the grouping path from product handling.
-    for (op <- countJoinOperators; fromOrder <- q9FromOrders) {
+    // (carried in groupRight) and reconstructs year() at the final aggregate. Exercises a grouping
+    // EXPRESSION (not a plain key), and a simple single-relation sum to isolate the grouping path
+    // from product handling.
+    for (fromOrder <- q9FromOrders) {
       createQ9Tables()
       val query = s"""
         select n_name as nation, year(o_orderdate) as o_year, sum(l_extendedprice) as rev
@@ -994,10 +1061,9 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
           and o_orderkey = l_orderkey and s_nationkey = n_nationkey
           and p_name like '%green%'
         group by n_name, year(o_orderdate)"""
-      withSQLConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> op) {
-        assertSameResults(query,
-          s"GROUP BY year(o_orderdate), operator=$op, order=${fromOrder.mkString(",")}")
-      }
+      assertSameResultsOnCountJoinExec(query,
+        s"GROUP BY year(o_orderdate), order=${fromOrder.mkString(",")}",
+        "ShuffledHashCountJoin", shuffledCountJoinConfs: _*)
     }
   }
 
@@ -1068,57 +1134,53 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
-  test("cross-relation filter: correct under shuffle and sort-merge operators") {
+  test("cross-relation filter: correct on shuffled-hash and sort-merge paths") {
     Seq((1, 100, 5), (1, 200, 50), (2, 300, 1)).toDF("k", "v", "x")
       .createOrReplaceTempView("cf_a")
     Seq((1, 10), (1, 60), (2, 0)).toDF("k", "y").createOrReplaceTempView("cf_b")
-    val query = "select sum(v) as s from cf_a a, cf_b b where a.k = b.k and a.x < b.y"
-    for (op <- countJoinOperators) {
-      withSQLConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> op) {
-        assertSameResults(query, s"cross-relation filter a.x < b.y, operator=$op")
-      }
-    }
+    val shuffleQuery = "select /*+ SHUFFLE_HASH(b) */ sum(v) as s " +
+      "from cf_a a join cf_b b on a.k = b.k where a.x < b.y"
+    assertSameResultsOnCountJoinExec(shuffleQuery,
+      "cross-relation filter a.x < b.y on shuffled-hash path", "ShuffledHashCountJoin",
+      shuffledCountJoinConfs: _*)
+
+    val sortMergeQuery = "select /*+ MERGE(b) */ sum(v) as s " +
+      "from cf_a a join cf_b b on a.k = b.k where a.x < b.y"
+    assertSameResultsOnCountJoinExec(sortMergeQuery,
+      "cross-relation filter a.x < b.y on sort-merge path", "SortMergeCountJoin",
+      sortMergeCountJoinConfs: _*)
   }
 
-  test("cross-relation filter: a fully-filtered group emits no phantom row (every operator)") {
+  test("cross-relation filter: a fully-filtered group emits no phantom row") {
     // k=2's only match (x=1, y=0) fails a.x < b.y, so its rightCountSum is 0. An ungrouped sum
     // hides a phantom count-0 row (it contributes v*0=0), but grouped count(*) does not: vanilla
-    // yields only k=1 (count 3); a phantom row would add a spurious k=2 group. Exercises the
-    // rightCountSum==0 guard on the grouping path of every physical operator (esp. SMJ).
+    // yields only k=1 (count 3); a phantom row would add a spurious k=2 group.
     Seq((1, 100, 5), (1, 200, 50), (2, 300, 1)).toDF("k", "v", "x")
       .createOrReplaceTempView("cf_a")
     Seq((1, 10), (1, 60), (2, 0)).toDF("k", "y").createOrReplaceTempView("cf_b")
-    val query = "select a.k as k, count(*) as c from cf_a a, cf_b b " +
-      "where a.k = b.k and a.x < b.y group by a.k"
-    for (op <- countJoinOperators) {
-      withSQLConf(SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> op) {
-        assertSameResults(query, s"fully-filtered group, operator=$op")
-      }
-    }
+    val shuffleQuery = "select /*+ SHUFFLE_HASH(b) */ a.k as k, count(*) as c " +
+      "from cf_a a join cf_b b on a.k = b.k where a.x < b.y group by a.k"
+    assertSameResultsOnCountJoinExec(shuffleQuery,
+      "fully-filtered group on shuffled-hash path", "ShuffledHashCountJoin",
+      shuffledCountJoinConfs: _*)
+
+    val sortMergeQuery = "select /*+ MERGE(b) */ a.k as k, count(*) as c " +
+      "from cf_a a join cf_b b on a.k = b.k where a.x < b.y group by a.k"
+    assertSameResultsOnCountJoinExec(sortMergeQuery,
+      "fully-filtered group on sort-merge path", "SortMergeCountJoin",
+      sortMergeCountJoinConfs: _*)
   }
 
   test("grouped count-join correct under sort-merge spill (tiny in-memory threshold)") {
-    // Force the SortMergeCountJoin buffered-matches array onto its spillable path by capping the
-    // in-memory threshold at 1 row, with multiple matches per key (the Q9 nation-rooted shape).
-    createQ9Tables()
-    val fromOrder = Seq("supplier_t9", "lineitem_t9", "partsupp_t9",
-      "orders_t9", "nation_t9", "part_t9")
-    val query = s"""
-      select nation, o_year, sum(amount) as sum_profit
-      from (
-        select n_name as nation, extract(year from o_orderdate) as o_year,
-               l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
-        from ${fromOrder.mkString(", ")}
-        where s_suppkey = l_suppkey and ps_suppkey = l_suppkey
-          and ps_partkey = l_partkey and p_partkey = l_partkey
-          and o_orderkey = l_orderkey and s_nationkey = n_nationkey
-          and p_name like '%green%'
-      ) as profit group by nation, o_year"""
-    withSQLConf(
-      SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> "sortMerge",
-      SQLConf.SORT_MERGE_JOIN_EXEC_BUFFER_IN_MEMORY_THRESHOLD.key -> "1") {
-      assertSameResults(query, "grouped count-join under sort-merge spill")
-    }
+    // Exercise the SortMergeCountJoin buffered-matches spill path by capping the in-memory
+    // threshold at 1 row while the hinted build side has multiple matches per key.
+    Seq(1, 1, 2).toDF("k").createOrReplaceTempView("smjsp_a")
+    Seq((1, "x"), (1, "x"), (2, "y")).toDF("k", "g").createOrReplaceTempView("smjsp_b")
+    val query = "select /*+ MERGE(b) */ b.g, count(*) as c " +
+      "from smjsp_a a join smjsp_b b on a.k = b.k group by b.g"
+    assertSameResultsOnCountJoinExec(query, "grouped count-join under sort-merge spill",
+      "SortMergeCountJoin", (sortMergeCountJoinConfs :+
+        (SQLConf.SORT_MERGE_JOIN_EXEC_BUFFER_IN_MEMORY_THRESHOLD.key -> "1")): _*)
   }
 
   test("codegen: pure-count count-join matches interpreted (whole-stage on vs off)") {
@@ -1140,6 +1202,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     val query = "select count(*) as c from cng_a a join cng_b b on a.k = b.k"
     withSQLConf((yannakakisOn ++ Seq(
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
         SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
         SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
       val plan = sql(query).queryExecution.executedPlan
@@ -1161,6 +1224,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
   private def assertGroupingCodegenMatches(query: String, hint: String): Unit = {
     withSQLConf((yannakakisOn ++ Seq(
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
         SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
       val plan = sql(query).queryExecution.executedPlan
       val groupingCjs = plan.collect { case cj: HashCountJoin if cj.groupRight.nonEmpty => cj }
@@ -1205,6 +1269,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2"
     withSQLConf((yannakakisOn ++ Seq(
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
         SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
         SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
       val plan = sql(query).queryExecution.executedPlan
@@ -1253,6 +1318,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "where a.ak = f.ak and b.bk = f.bk and a.ak = d.ak group by g1, g2"
     withSQLConf((yannakakisOn ++ Seq(
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
         SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
       // Confirm the test actually exercises a GROUPING count-join.
       val plan = sql(query).queryExecution.executedPlan
@@ -1321,14 +1387,12 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1")
   }
 
-  // Forces the sort-merge count-join operator and asserts it is whole-stage-codegen'd (the
-  // `*(n) ... SortMergeCountJoin` marker), then that codegen results equal interpreted (codegen
-  // off) and vanilla. Before SMJ codegen support the operator runs interpreted (no marker) -> fail.
+  // Uses a MERGE hint to select sort-merge count-join and asserts it is whole-stage-codegen'd
+  // (the `*(n) ... SortMergeCountJoin` marker), then that codegen results equal interpreted
+  // (codegen off) and vanilla. Before SMJ codegen support the operator runs interpreted (no
+  // marker) -> fail.
   private def assertSMJCountJoinCodegenMatches(query: String, hint: String): Unit = {
-    val smjConf = Seq(
-      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
-      SQLConf.YANNAKAKIS_FORCE_PHYSICAL_COUNTJOIN_OPERATOR.key -> "sortMerge",
-      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")
+    val smjConf = sortMergeCountJoinConfs
     withSQLConf((yannakakisOn ++ smjConf): _*) {
       val onPlan = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
         sql(query).queryExecution.executedPlan.toString
@@ -1350,7 +1414,8 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     // fan-out on k (a has dup keys) with a carried SUM over the build (dim) column v.
     Seq(1, 1, 2, 2, 2).toDF("k").createOrReplaceTempView("smjng_a")
     Seq((1, 100), (2, 200)).toDF("k", "v").createOrReplaceTempView("smjng_b")
-    val query = "select count(*) as c, sum(v) as s from smjng_a a join smjng_b b on a.k = b.k"
+    val query = "select /*+ MERGE(b) */ count(*) as c, sum(v) as s " +
+      "from smjng_a a join smjng_b b on a.k = b.k"
     assertSMJCountJoinCodegenMatches(query, "SMJ non-grouping count+sum")
   }
 
@@ -1359,8 +1424,8 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     Seq(1, 1, 2, 2, 2, 3).toDF("k").createOrReplaceTempView("smjg_a")
     Seq((1, 100, "x"), (2, 200, "y"), (3, 300, "x"))
       .toDF("k", "v", "g").createOrReplaceTempView("smjg_b")
-    val query =
-      "select g, count(*) as c, sum(v) as s from smjg_a a join smjg_b b on a.k = b.k group by g"
+    val query = "select /*+ MERGE(b) */ g, count(*) as c, sum(v) as s " +
+      "from smjg_a a join smjg_b b on a.k = b.k group by g"
     assertSMJCountJoinCodegenMatches(query, "SMJ grouped count+sum")
   }
 
@@ -1378,6 +1443,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       "where f.k = d1.k and f.k = d2.k"
     withSQLConf((yannakakisOn ++ Seq(
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
         SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false")): _*) {
       val on = withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
         sql(query).collect().toSeq.map(_.toString)
@@ -1407,6 +1473,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
   private def assertShuffledCountJoinHasRuntimeFastPath(query: String, hint: String): String = {
     withSQLConf((yannakakisOn ++ Seq(
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
         SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
         SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
       val plan = sql(query).queryExecution.executedPlan
@@ -1451,6 +1518,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
   private def assertShuffledCountJoinHasStaticFastPath(query: String, hint: String): String = {
     withSQLConf((yannakakisOn ++ Seq(
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+        SQLConf.PREFER_SORTMERGEJOIN.key -> "false",
         SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
         SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true")): _*) {
       val plan = sql(query).queryExecution.executedPlan
@@ -2020,6 +2088,67 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     val fired = appender.loggingEvents.exists(
       _.getMessage.getFormattedMessage.contains("new aggregate (full-outer split)"))
     assert(fired, s"$hint: expected the FULL OUTER split to fire")
+  }
+
+  /**
+   * Asserts the direct FULL-OUTER presence-count rewrite fired and results match vanilla. This
+   * shape deliberately avoids CountJoin: the matched rows are counted via a left-semi join, and
+   * the unmatched counts are derived from scalar side counts.
+   */
+  private def assertFullOuterPresenceCountsAndCorrect(query: String, hint: String): Unit = {
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(query).collect().toSeq
+    }
+
+    val appender = new LogAppender("full-outer presence-count rewrite")
+    withLogAppender(appender) {
+      withSQLConf(yannakakisOn: _*) {
+        val df = sql(query)
+        checkAnswer(df, expected)
+        val plan = df.queryExecution.optimizedPlan.toString
+        assert(!plan.contains("CountJoin"),
+          s"$hint: direct presence-count path should not emit CountJoin:\n$plan")
+      }
+    }
+    val fired = appender.loggingEvents.exists(
+      _.getMessage.getFormattedMessage.contains("new aggregate (full-outer presence counts)"))
+    assert(fired, s"$hint: expected the FULL OUTER presence-count rewrite to fire")
+  }
+
+  test("FULL OUTER presence-count sums use scalar counts and match vanilla") {
+    val storeRows: Seq[(Option[Int], Option[Int])] = Seq(
+      (Some(1), Some(10)),
+      (Some(1), Some(10)),
+      (Some(2), Some(20)),
+      (None, Some(30)),
+      (Some(4), None))
+    val catalogRows: Seq[(Option[Int], Option[Int])] = Seq(
+      (Some(1), Some(10)),
+      (Some(3), Some(30)),
+      (Some(3), Some(30)),
+      (None, Some(40)),
+      (Some(5), None))
+    storeRows.toDF("customer_sk", "item_sk").createOrReplaceTempView("fo_pc_store")
+    catalogRows.toDF("customer_sk", "item_sk").createOrReplaceTempView("fo_pc_catalog")
+
+    assertFullOuterPresenceCountsAndCorrect(
+      """with store_keys as (
+        |  select customer_sk, item_sk from fo_pc_store group by customer_sk, item_sk
+        |), catalog_keys as (
+        |  select customer_sk, item_sk from fo_pc_catalog group by customer_sk, item_sk
+        |)
+        |select
+        |  sum(case when s.customer_sk is not null and c.customer_sk is null
+        |    then 1 else 0 end) as store_only,
+        |  sum(case when s.customer_sk is null and c.customer_sk is not null
+        |    then 1 else 0 end) as catalog_only,
+        |  sum(case when s.customer_sk is not null and c.customer_sk is not null
+        |    then 1 else 0 end) as matched
+        |from store_keys s full outer join catalog_keys c
+        |on s.customer_sk = c.customer_sk and s.item_sk = c.item_sk
+        |""".stripMargin,
+      "FULL OUTER presence-count sums")
   }
 
   // FULL OUTER fixture: matched (k=1 fan-out, k=2), A-only unmatched (k=3,4), B-only unmatched
