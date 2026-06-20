@@ -357,4 +357,56 @@ class TPCDSCountJoinDiagnosticsSuite extends QueryTest with SharedSparkSession w
       }
     }
   }
+
+  // Calibration: with the runtime revert ENABLED (divergence factor 4.0, floor 1) under real CBO
+  // stats, none of the verified wins must be reverted - under ANALYZE'd stats their build estimate
+  // holds (materialized ~= estimate), so the divergence criterion keeps them. Confirms on real data
+  // what DemoteNonReducingCountJoinSuite proves on stubs, and that results stay correct with revert
+  // on. (A build-vs-probe ratio reverted q25 here - a reducing win can have build >= probe.)
+  test("verified wins are NOT reverted under CBO with runtime revert enabled") {
+    assume(new File(s"$parquetDir/store_sales").exists() &&
+      new File(s"$parquetDir/customer").exists(),
+      s"parquet tables absent under $parquetDir; skipping")
+    val allTables = tableColumns.keys.toSeq.filter(t => new File(s"$parquetDir/$t").exists())
+    withTable(allTables: _*) {
+      allTables.foreach { t =>
+        spark.sql(s"DROP TABLE IF EXISTS $t")
+        spark.sql(s"CREATE TABLE $t USING parquet LOCATION " +
+          s"'${new File(s"$parquetDir/$t").getAbsolutePath}'")
+        if (t == "inventory") spark.sql(s"ANALYZE TABLE $t COMPUTE STATISTICS")
+        else spark.sql(s"ANALYZE TABLE $t COMPUTE STATISTICS FOR ALL COLUMNS")
+      }
+      val cbo = Seq(
+        SQLConf.CBO_ENABLED.key -> "true",
+        SQLConf.PLAN_STATS_ENABLED.key -> "true")
+      val baseMode = Mode("base", cbo :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false"))
+      val revertMode = Mode("revert", cbo ++ Seq(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_RUNTIME_REVERT_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS.key -> "1",
+        SQLConf.YANNAKAKIS_RUNTIME_REVERT_DIVERGENCE_FACTOR.key -> "4.0"))
+      // q25/q29/q64 produce CountJoin execs; q4/q11 pre-aggregate. Assert the CountJoin wins keep
+      // their CountJoin execs in the final AQE plan (not reverted); all keep correct results.
+      val countJoinWins = Set("q25", "q29", "q64")
+      for (q <- Seq("q4", "q11", "q25", "q29", "q64")) {
+        val sqlText = resourceToString(s"tpcds/$q.sql",
+          classLoader = Thread.currentThread().getContextClassLoader)
+        val baseR = run(sqlText, baseMode)
+        run(sqlText, revertMode) // warmup
+        val revR = run(sqlText, revertMode)
+        val revOps = operatorCounts(allNodes(revR.physicalPlan))
+        // scalastyle:off println
+        println(s"TPCDS-CBOREVERT: $q | base=${baseR.rows}r revert=${revR.rows}r | revOps=$revOps")
+        // scalastyle:on println
+        assert(baseR.rows == revR.rows, s"$q rows differ with runtime revert enabled (correctness)")
+        if (countJoinWins.contains(q)) {
+          assert(revOps.contains("CountJoin"),
+            s"$q was REVERTED under CBO with revert enabled - the criterion mis-classified a win " +
+              s"(its count-join build is not << probe). revOps=$revOps")
+        }
+      }
+    }
+  }
 }

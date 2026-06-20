@@ -36,21 +36,22 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * statistics cannot provide and the reason static cost gates could not separate reducing from
  * non-reducing rewrites.
  *
- * REDUCTION CRITERION (NDV-free). Runtime stage stats carry rowCount and sizeInBytes but NO column
- * NDV (ShuffleExchangeExec.runtimeStatistics omits attributeStats), so the decision uses only the
- * two materialized row counts reachable: the count-join's build (right) and probe (left) inputs.
- * A count-join EARNS its build cost by collapsing build-side fan-out: the verified wins build a
- * small dimension against a large fact probe (build << probe), so they reduce and are kept. A
- * count-join is judged non-reducing - and reverted - only when its materialized build is large
- * (>= the runtimeRevertMinBuildRows floor) AND did not collapse fan-out relative to the probe, i.e.
- * buildRows >= probeRows * runtimeRevertReductionFactor. That is the q2/q34 pathology (a big build
- * the rewrite was chosen for on a stale estimate). Missing row counts (stage not yet materialized)
- * never revert - the opportunity recurs on the next re-optimization once the build materializes.
+ * DIVERGENCE CRITERION (NDV-free). Runtime stage stats carry rowCount/sizeInBytes but NO column NDV
+ * (ShuffleExchangeExec.runtimeStatistics omits attributeStats). The decision keys on whether the
+ * planning-time estimate the rewrite was chosen on held up: at rewrite time each CountJoin is
+ * tagged with its STATIC build estimate (RewriteJoinsAsSemijoins.BUILD_ROWCOUNT_ESTIMATE_TAG); at
+ * AQE re-optimization the build has materialized and its real row count is known. A count-join is
+ * reverted only when its materialized build is large (>= the runtimeRevertMinBuildRows floor) AND
+ * exceeds its static estimate by at least runtimeRevertDivergenceFactor - i.e. the estimate was
+ * falsified upward, the q2/q34 pathology. This deliberately does NOT use build-vs-probe size: a
+ * reducing win can have a large build that collapses high fan-out (its build can exceed the
+ * probe), and a vs-probe ratio was measured to revert q25, a verified win. Keying on estimate
+ * divergence keeps such wins (their estimate held) while still catching rewrites chosen on a stale
+ * estimate. Missing materialized rowCount or estimate tag never reverts - conservative; the chance
+ * recurs on the next re-optimization once the build materializes.
  *
  * NOTE: the factor is a heuristic still needing empirical calibration against the benchmark before
- * enabling in production; it is default-off (Long.MaxValue floor). A secondary guard keyed on the
- * planner's own estimate being falsified (materialized build >> stashed static estimate) is a
- * documented refinement if the build-vs-probe ratio proves insufficient on real data.
+ * enabling in production; it is default-off (Long.MaxValue floor).
  */
 object DemoteNonReducingCountJoin extends Rule[LogicalPlan] {
 
@@ -59,10 +60,10 @@ object DemoteNonReducingCountJoin extends Rule[LogicalPlan] {
       return plan
     }
     val minBuildRows = BigInt(conf.yannakakisRuntimeRevertMinBuildRows)
-    val reductionFactor = conf.yannakakisRuntimeRevertReductionFactor
+    val divergenceFactor = conf.yannakakisRuntimeRevertDivergenceFactor
     plan.transformDown {
       case p if p.getTagValue(RewriteJoinsAsSemijoins.ORIGINAL_PLAN_TAG).isDefined &&
-          isNonReducing(p, minBuildRows, reductionFactor) =>
+          isNonReducing(p, minBuildRows, divergenceFactor) =>
         val original = p.getTagValue(RewriteJoinsAsSemijoins.ORIGINAL_PLAN_TAG).get
         logInfo(log"Reverting non-reducing count-join rewrite to the original plan")
         original
@@ -70,20 +71,20 @@ object DemoteNonReducingCountJoin extends Rule[LogicalPlan] {
   }
 
   /**
-   * True if any count-join in the tagged subtree is non-reducing by materialized row counts: its
-   * build (right) is at least `minBuildRows` AND did not collapse fan-out relative to its probe
-   * (left), i.e. buildRows >= probeRows * `reductionFactor`. Uses only rowCount (no NDV). Returns
-   * false when either row count is missing (not yet materialized) - conservative, never revert on
-   * an unmaterialized estimate.
+   * True if any count-join in the tagged subtree is non-reducing by estimate divergence: its
+   * materialized build (right) row count is at least `minBuildRows` AND at least `divergenceFactor`
+   * times the static build estimate stashed at rewrite time. Uses only rowCount (no NDV). Returns
+   * false when the materialized rowCount or the static-estimate tag is missing - conservative:
+   * never revert on an unmaterialized build or an un-stashed estimate.
    */
   private def isNonReducing(
-      plan: LogicalPlan, minBuildRows: BigInt, reductionFactor: Double): Boolean = {
+      plan: LogicalPlan, minBuildRows: BigInt, divergenceFactor: Double): Boolean = {
     plan.collectFirst {
       case cj: CountJoin
         if cj.right.stats.rowCount.exists { buildRows =>
           buildRows >= minBuildRows &&
-            cj.left.stats.rowCount.exists { probeRows =>
-              buildRows.toDouble >= probeRows.toDouble * reductionFactor
+            cj.getTagValue(RewriteJoinsAsSemijoins.BUILD_ROWCOUNT_ESTIMATE_TAG).exists { estimate =>
+              buildRows.toDouble >= estimate.toDouble * divergenceFactor
             }
         } => cj
     }.isDefined

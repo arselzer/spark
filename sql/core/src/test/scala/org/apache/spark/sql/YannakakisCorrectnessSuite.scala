@@ -135,7 +135,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
       SQLConf.YANNAKAKIS_RUNTIME_REVERT_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS.key -> "0",
-      SQLConf.YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR.key -> "0.0")
+      SQLConf.YANNAKAKIS_RUNTIME_REVERT_DIVERGENCE_FACTOR.key -> "0.0")
     withSQLConf(revertOn: _*) {
       val df = sql(q)
       checkAnswer(df, expected) // correctness preserved across the swap

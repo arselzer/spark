@@ -41,12 +41,16 @@ class DemoteNonReducingCountJoinSuite extends SparkFunSuite with SQLHelper {
       Statistics(sizeInBytes = math.max(1L, rows) * 8, rowCount = Some(BigInt(rows)))
   }
 
-  /** A standard inner CountJoin (BuildRight): `probeRows` left and `buildRows` right input. */
-  private def countJoin(probeRows: Long, buildRows: Long): CountJoin = {
+  /**
+   * A standard inner CountJoin (BuildRight) whose right input materializes to `buildRows`, tagged
+   * with a static build estimate of `buildEstimate` (as the rewrite would stash). The probe is
+   * fixed and irrelevant to the divergence criterion.
+   */
+  private def countJoin(buildRows: Long, buildEstimate: Long): CountJoin = {
     val l = AttributeReference("l", IntegerType)()
     val r = AttributeReference("r", IntegerType)()
-    CountJoin(
-      left = StatStub(probeRows, Seq(l)),
+    val cj = CountJoin(
+      left = StatStub(1000, Seq(l)),
       right = StatStub(buildRows, Seq(r)),
       joinType = Inner,
       condition = Some(EqualTo(l, r)),
@@ -55,6 +59,8 @@ class DemoteNonReducingCountJoinSuite extends SparkFunSuite with SQLHelper {
       aggregatesRight = Nil,
       groupRight = Nil,
       hint = JoinHint.NONE)
+    cj.setTagValue(RewriteJoinsAsSemijoins.BUILD_ROWCOUNT_ESTIMATE_TAG, BigInt(buildEstimate))
+    cj
   }
 
   private def tagged(cj: CountJoin, original: LogicalPlan): CountJoin = {
@@ -65,21 +71,24 @@ class DemoteNonReducingCountJoinSuite extends SparkFunSuite with SQLHelper {
   private val revertConf = Seq(
     SQLConf.YANNAKAKIS_RUNTIME_REVERT_ENABLED.key -> "true",
     SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS.key -> "1000",
-    SQLConf.YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR.key -> "1.0",
+    SQLConf.YANNAKAKIS_RUNTIME_REVERT_DIVERGENCE_FACTOR.key -> "4.0",
     // rowCount only survives stats estimation under CBO (size-only mode strips it).
     SQLConf.CBO_ENABLED.key -> "true")
 
-  test("reverts a non-reducing count-join (large build, no fan-out reduction)") {
+  test("reverts a count-join whose materialized build diverges far above its estimate") {
     val original: LogicalPlan = StatStub(1, Seq(AttributeReference("o", IntegerType)()))
-    val cj = tagged(countJoin(probeRows = 10000, buildRows = 10800000), original)
+    // materialized 10.8M vs estimate 1000 = 10800x divergence (the q2/q34 pathology).
+    val cj = tagged(countJoin(buildRows = 10800000, buildEstimate = 1000), original)
     withSQLConf(revertConf: _*) {
       assert(DemoteNonReducingCountJoin(cj) eq original)
     }
   }
 
-  test("keeps a reducing count-join (small build vs large fact probe = the 7-wins shape)") {
+  test("keeps a large build whose estimate HELD (the q25 reducing-win shape)") {
     val original: LogicalPlan = StatStub(1, Seq(AttributeReference("o", IntegerType)()))
-    val cj = tagged(countJoin(probeRows = 10000000, buildRows = 5000), original)
+    // materialized 5M, estimate 5M: a big build, but the estimate was accurate, so it is kept.
+    // (A build-vs-probe ratio would have wrongly reverted this - the calibration finding.)
+    val cj = tagged(countJoin(buildRows = 5000000, buildEstimate = 5000000), original)
     withSQLConf(revertConf: _*) {
       assert(DemoteNonReducingCountJoin(cj) eq cj)
     }
@@ -87,8 +96,8 @@ class DemoteNonReducingCountJoinSuite extends SparkFunSuite with SQLHelper {
 
   test("keeps a count-join whose build is below the floor") {
     val original: LogicalPlan = StatStub(1, Seq(AttributeReference("o", IntegerType)()))
-    // build (500) > probe (10) so the reduction test alone would revert, but it is below the floor.
-    val cj = tagged(countJoin(probeRows = 10, buildRows = 500), original)
+    // 500 diverges 500x above the estimate (1) but is below the 1000-row floor, so it is kept.
+    val cj = tagged(countJoin(buildRows = 500, buildEstimate = 1), original)
     withSQLConf(revertConf: _*) {
       assert(DemoteNonReducingCountJoin(cj) eq cj)
     }
@@ -96,7 +105,7 @@ class DemoteNonReducingCountJoinSuite extends SparkFunSuite with SQLHelper {
 
   test("no-op when runtime revert is disabled") {
     val original: LogicalPlan = StatStub(1, Seq(AttributeReference("o", IntegerType)()))
-    val cj = tagged(countJoin(probeRows = 10000, buildRows = 10800000), original)
+    val cj = tagged(countJoin(buildRows = 10800000, buildEstimate = 1000), original)
     withSQLConf(
       SQLConf.YANNAKAKIS_RUNTIME_REVERT_ENABLED.key -> "false",
       SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS.key -> "1000",

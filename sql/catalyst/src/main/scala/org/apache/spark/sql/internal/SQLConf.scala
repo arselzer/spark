@@ -3684,18 +3684,19 @@ object SQLConf {
       .longConf
       .createWithDefault(Long.MaxValue)
 
-  val YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR =
-    buildConf("spark.sql.yannakakis.runtimeRevertReductionFactor")
-      .doc("Reduction criterion for runtimeRevertEnabled (above the runtimeRevertMinBuildRows " +
-        "floor): revert a count-join when its materialized build row count is at least this " +
-        "of its materialized probe (stream) row count - i.e. the build did NOT collapse fan-out " +
-        "relative to the probe, so it pays a large build cost for little reduction. The verified " +
-        "wins build a small dimension against a large fact probe (build << probe), so they stay " +
-        "below this and are never reverted. Needs calibration before enabling in production")
+  val YANNAKAKIS_RUNTIME_REVERT_DIVERGENCE_FACTOR =
+    buildConf("spark.sql.yannakakis.runtimeRevertDivergenceFactor")
+      .doc("Divergence criterion for runtimeRevertEnabled (above the runtimeRevertMinBuildRows " +
+        "floor): revert a count-join when its MATERIALIZED build row count is at least this " +
+        "multiple of the STATIC build estimate the rewrite was chosen on - i.e. the estimate was " +
+        "falsified upward (the q2/q34 pathology). Keying on estimate-accuracy, not absolute or " +
+        "vs-probe build size, avoids reverting a reducing win whose build legitimately exceeds " +
+        "the probe (high fan-out collapsed) - a vs-probe ratio was measured to revert q25. " +
+        "Needs calibration before enabling in production")
       .version("4.1.0")
       .internal()
       .doubleConf
-      .createWithDefault(1.0)
+      .createWithDefault(4.0)
 
   val YANNAKAKIS_CYCLIC_BAGS_ENABLED =
     buildConf("spark.sql.yannakakis.cyclicBagsEnabled")
@@ -7508,8 +7509,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def yannakakisRuntimeRevertMinBuildRows: Long =
     getConf(SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS)
 
-  def yannakakisRuntimeRevertReductionFactor: Double =
-    getConf(SQLConf.YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR)
+  def yannakakisRuntimeRevertDivergenceFactor: Double =
+    getConf(SQLConf.YANNAKAKIS_RUNTIME_REVERT_DIVERGENCE_FACTOR)
 
   def yannakakisCyclicBagsEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED)

@@ -57,10 +57,30 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
   val ORIGINAL_PLAN_TAG: TreeNodeTag[LogicalPlan] =
     TreeNodeTag[LogicalPlan]("yannakakis_original_plan")
 
-  /** Tags the rewritten subtree with its original Aggregate so AQE can revert it at runtime. */
+  /**
+   * Static (planning-time) build-side row-count estimate stashed on each CountJoin when runtime
+   * revert is enabled. The AQE revert rule compares it to the MATERIALIZED build row count: a large
+   * upward divergence means the rewrite was chosen on a falsified estimate (the q2/q34 pathology),
+   * whereas a count-join whose estimate held - even a large reducing build - is kept. Keying on
+   * estimate-accuracy rather than absolute/relative build size avoids reverting reducing wins whose
+   * build legitimately exceeds the probe (high fan-out collapsed).
+   */
+  val BUILD_ROWCOUNT_ESTIMATE_TAG: TreeNodeTag[BigInt] =
+    TreeNodeTag[BigInt]("yannakakis_build_rowcount_estimate")
+
+  /**
+   * Tags the rewritten subtree with its original Aggregate (so AQE can revert it at runtime) and
+   * each CountJoin with its static build row-count estimate (so the revert rule can detect estimate
+   * divergence against the materialized build).
+   */
   private def stashOriginal(original: Aggregate, rewritten: LogicalPlan): LogicalPlan = {
     if (conf.yannakakisRuntimeRevertEnabled && !(rewritten eq original)) {
       rewritten.setTagValue(ORIGINAL_PLAN_TAG, original)
+      rewritten.foreach {
+        case cj: CountJoin =>
+          cj.right.stats.rowCount.foreach(rc => cj.setTagValue(BUILD_ROWCOUNT_ESTIMATE_TAG, rc))
+        case _ =>
+      }
     }
     rewritten
   }

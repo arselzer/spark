@@ -2168,3 +2168,33 @@ via CountJoinAwareCostEvaluator. Remaining to ENABLE in production: calibrate ru
 Factor against the real 7 wins under CBO (none must revert) and add a synthetic cardinality-divergence
 harness; the optional static-estimate divergence guard stays a refinement if build-vs-probe proves
 insufficient.
+
+## 2026-06-20 Runtime revert: calibration FOUND the build-vs-probe flaw -> switched to DIVERGENCE
+
+Built the real-data calibration ("verified wins are NOT reverted under CBO with runtime revert
+enabled" in TPCDSCountJoinDiagnosticsSuite) and it immediately did its job: with the build-vs-probe
+criterion (factor 1.0) under real CBO stats, q25 - a verified win - was REVERTED (its final plan came
+back as SortMergeJoin, no CountJoin). This empirically confirmed risk #1: a count-join can be
+REDUCING yet have build >= probe (it collapses high build-side fan-out), so a vs-probe ratio
+mis-classifies it. build-vs-probe is the wrong signal.
+
+Switched the criterion to DIVERGENCE (the principled refinement, no longer optional): stash each
+CountJoin's STATIC build row-count estimate at rewrite time (RewriteJoinsAsSemijoins.BUILD_ROWCOUNT_
+ESTIMATE_TAG, set in stashOriginal), and revert only when the MATERIALIZED build is >= floor AND >=
+estimate * runtimeRevertDivergenceFactor (default 4.0). This keys on the planner's estimate being
+falsified upward (the q2/q34 pathology), NOT on absolute or vs-probe build size, so a large
+reducing build whose estimate held is kept. Replaced runtimeRevertReductionFactor with
+runtimeRevertDivergenceFactor.
+
+Validation (all green, default-off):
+- DemoteNonReducingCountJoinSuite (stubs): reverts on 10800x divergence; KEEPS a 5M build whose
+  estimate held (the q25 shape a vs-probe ratio would have reverted); keeps below floor; no-op off.
+- Real-data calibration (factor 4.0, CBO): q25/q29/q64 KEEP their CountJoin execs (not reverted),
+  q4/q11 unchanged, ALL results == base. Under ANALYZE'd stats the wins' build estimates hold, so no
+  divergence fires.
+- YannakakisCorrectnessSuite 120 + adaptive unit 4 = 124/124.
+
+The firing side (divergence FIRES on a real q2/q34-class falsified estimate) is covered by the stub
+suite + the e2e smoke (forced via factor 0.0); a realistic q2/q34 integration repro is still future
+work (SF5 is uniform). Feature complete and correct for the KEEP side on real data; remaining to
+enable: a realistic falsified-estimate integration test and a production factor sweep.
