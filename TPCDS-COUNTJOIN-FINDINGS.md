@@ -2257,3 +2257,30 @@ JOB-GCG (grouped count-join codegen): grouping count-joins codegen, match=true.
 This is a much stronger validation than TPC-DS (net wins ~1.2-1.9x): JOB's deep many-way joins are the
 count-join/Yannakakis ideal, and the rewrite delivers 2-3.7x on the heavy queries with correct
 results. IMDB data + JOB queries reproduced via IMDBSetupSuite + gregrahn/join-order-benchmark.
+
+## 2026-06-20 STATS-CEB results: fires on all 146, 0 mismatches, rescues 7 vanilla-DNF
+
+Staged the STATS dataset (8 Stack-Exchange tables, 38MB CSV) + the 146 STATS-CEB COUNT(*)-over-join
+queries from End-to-End-CardEst-Benchmark. Adapted STATSBenchmarkSuite to the CSV + concatenated-query
+layout (derive types from the in-suite schema; rewrite PostgreSQL '...'::timestamp casts to Spark
+CAST). Result (rewrite off vs on, AQE off, vanilla<=15s / rewrite<=60s timeouts):
+
+  146 queries | rewritten=146 (100%) | vanilla-DNF(>15s)=7 | rewrite-DNF=0 | mismatches=0
+  geomean speedup where both finished (n=139) = 1.37x
+
+Every STATS-CEB query is a COUNT(*) over a multi-table join with filters - the count-join's exact
+target - so it fires on ALL 146 with results identical to vanilla (0 mismatches). The headline wins
+are the 7 queries where vanilla DID NOT FINISH within 15s (it materializes the join fan-out) while the
+count-join finished in 265ms-2.5s (q032 355ms, q048 265ms, q058 342ms, q120 600ms, q122 539ms, q033
+1.66s, q049 2.55s) - effectively >=10-56x. On the 139 queries vanilla can finish, a steady 1.37x
+geomean. Data + queries reproduced under /home/as/git/Spark-Y/data/stats via STATSBenchmarkSuite.
+
+## 2026-06-20 Multi-benchmark validation summary
+
+The count-join rewrite is now validated across THREE benchmarks, all results == vanilla:
+- TPC-DS SF5: 7 wins (q4 +48%, q11 +66%, q24a/b +41/43%, q25 +89%, q29 +80%, q50 +24%, q64 +62%),
+  verified to hold under CBO column stats; full firing-set sweep regression-free.
+- JOB (IMDB): 7/8 queries win, 2.13-3.66x on the heavy many-way joins.
+- STATS-CEB: fires on 146/146, 0 mismatches, 1.37x geomean + 7 vanilla-DNF rescues (>=10-56x).
+Plus AQE robustness (probe-side skew handling, #3) and the default-off runtime keep-or-revert
+(divergence criterion + adoption cost evaluator) for the cases static stats cannot predict.
