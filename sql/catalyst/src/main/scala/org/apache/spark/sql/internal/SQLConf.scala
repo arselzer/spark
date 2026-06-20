@@ -3645,6 +3645,19 @@ object SQLConf {
       .booleanConf
       .createWithDefault(true)
 
+  val YANNAKAKIS_ELIMINATE_NOOP_DIMS_ENABLED =
+    buildConf("spark.sql.yannakakis.eliminateNoOpDimensionsEnabled")
+      .doc("Inside the count-join rewrite, drop a dimension relation joined only on its unique " +
+        "(PK) key to a provably non-null fact FK when no dimension attribute is referenced " +
+        "by the grouping, aggregates, projection, or any other join: such an inner join neither " +
+        "filters nor decorates, so it is a semantic no-op. Removing it before hypertree " +
+        "construction avoids a gratuitous existence stream (e.g. q50's 13.3M-row store_sales to " +
+        "date_dim pass). Conservative: requires provable PK uniqueness and FK non-nullness")
+      .version("4.1.0")
+      .internal()
+      .booleanConf
+      .createWithDefault(true)
+
   val YANNAKAKIS_CYCLIC_BAGS_ENABLED =
     buildConf("spark.sql.yannakakis.cyclicBagsEnabled")
       .doc("Handle CYCLIC join queries (which otherwise fall back to the original plan) via a " +
@@ -7446,6 +7459,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def yannakakisCostGateEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_COST_GATE_ENABLED)
+
+  def yannakakisEliminateNoOpDimensionsEnabled: Boolean =
+    getConf(SQLConf.YANNAKAKIS_ELIMINATE_NOOP_DIMS_ENABLED)
 
   def yannakakisCyclicBagsEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED)

@@ -462,6 +462,59 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
   }
 
+  test("no-op dimension elimination drops unreferenced PK-FK joins, keeps filtered ones") {
+    withTable("noop_fact", "noop_unref", "noop_filt") {
+      sql("CREATE TABLE noop_fact (fk INT, dk INT, v DOUBLE) USING parquet")
+      sql("CREATE TABLE noop_unref (k INT, label STRING) USING parquet")   // no-op: unfiltered
+      sql("CREATE TABLE noop_filt (k INT, yr INT) USING parquet")          // selective dimension
+      sql("INSERT INTO noop_fact VALUES (1,100,1.0),(2,100,2.0),(3,200,3.0),(1,100,4.0)")
+      sql("INSERT INTO noop_unref VALUES (1,'a'),(2,'b'),(3,'c')")          // k unique, covers fk
+      sql("INSERT INTO noop_filt VALUES (100,2001),(200,2002)")            // k unique
+
+      // noop_unref is joined on its unique key to a non-null fact FK and NONE of its columns are
+      // referenced -> a no-op that must be eliminated. noop_filt is joined the same way but its
+      // WHERE yr=2001 makes the join SELECTIVE (drops dk=200) -> must NOT be eliminated.
+      val q =
+        """select f.dk, count(*) c, sum(f.v) s
+           from noop_fact f
+           join noop_unref n on f.fk = n.k
+           join noop_filt d on f.dk = d.k
+           where d.yr = 2001
+           group by f.dk"""
+      var expected: Seq[Row] = null
+      withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+        expected = sql(q).collect().toSeq   // d.yr=2001 keeps only dk=100: (100, 3, 7.0)
+      }
+
+      sql("ANALYZE TABLE noop_unref COMPUTE STATISTICS FOR COLUMNS k")
+      sql("ANALYZE TABLE noop_filt COMPUTE STATISTICS FOR COLUMNS k")
+      sql("ANALYZE TABLE noop_fact COMPUTE STATISTICS FOR COLUMNS fk, dk")
+      val cfg = Seq(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "false",
+        SQLConf.CBO_ENABLED.key -> "true",
+        SQLConf.PLAN_STATS_ENABLED.key -> "true")
+      withSQLConf(cfg: _*) {
+        val df = sql(q)
+        checkAnswer(df, expected)   // correctness: result must be unchanged by the elimination
+        val plan = df.queryExecution.optimizedPlan.toString
+        assert(!plan.contains("noop_unref"),
+          "unfiltered, unreferenced PK-FK dimension noop_unref should be eliminated:\n" + plan)
+        assert(plan.contains("noop_filt"),
+          "selective (filtered) dimension noop_filt must NOT be eliminated:\n" + plan)
+      }
+      // With the flag off, nothing is eliminated (and results stay correct).
+      withSQLConf((cfg :+
+          (SQLConf.YANNAKAKIS_ELIMINATE_NOOP_DIMS_ENABLED.key -> "false")): _*) {
+        val df = sql(q)
+        checkAnswer(df, expected)
+        assert(df.queryExecution.optimizedPlan.toString.contains("noop_unref"),
+          "with elimination disabled, noop_unref should be retained")
+      }
+    }
+  }
+
   test("decorating dimension pre-aggregate preserves duplicate dimension rows") {
     Seq((1, 10, 5L), (1, 20, 7L), (2, 10, 11L), (3, 10, 13L))
       .toDF("c_sk", "d_sk", "v").createOrReplaceTempView("dd_sales")

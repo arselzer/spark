@@ -170,6 +170,95 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
         (allEquiJoinsHaveUniqueSide(items, conditions) ||
           dominatedByOneLargeInput(items, hg)))
 
+  /**
+   * Drop "no-op" dimension relations from an inner-join item list before hypertree construction.
+   * A dimension D is a no-op when it is joined to the rest by exactly ONE equi-condition D.k = F.fk
+   * where D.k is provably unique (PK) in D and F.fk is provably non-null, AND no attribute of D is
+   * referenced by `externalRefs` (the grouping + aggregate attributes the rewrite must produce).
+   * Under those conditions the inner join with D neither filters (F.fk non-null + D.k unique =>
+   * 1:1, row-preserving) nor decorates (D is never read), so removing D and its condition is a
+   * semantic no-op that avoids materializing a gratuitous existence stream (q50's store_sales ->
+   * unfiltered date_dim pass, ~13.3M rows). Re-runs to a fixpoint since removing one dimension can
+   * expose another. Conservative: any uncertainty (flag off, missing stats, multi-condition,
+   * non-unique key, nullable FK, fewer than 3 items) keeps the item, so it can only ever remove a
+   * provably redundant join.
+   */
+  private def eliminateNoOpDimensions(
+      items: Seq[LogicalPlan],
+      conditions: ExpressionSet,
+      externalRefs: AttributeSet): (Seq[LogicalPlan], ExpressionSet) = {
+    if (!conf.yannakakisEliminateNoOpDimensionsEnabled) return (items, conditions)
+
+    def equiKeys(cond: Expression): Option[(Attribute, Attribute)] = cond match {
+      case EqualTo(l: Attribute, r: Attribute) => Some((l, r))
+      case EqualTo(Cast(l: Attribute, _, _, _), r: Attribute) => Some((l, r))
+      case EqualTo(l: Attribute, Cast(r: Attribute, _, _, _)) => Some((l, r))
+      case _ => None
+    }
+
+    def conjuncts(e: Expression): Seq[Expression] = e match {
+      case And(l, r) => conjuncts(l) ++ conjuncts(r)
+      case other => Seq(other)
+    }
+
+    // D is row-preserving on its key iff it is just project/filter over a leaf AND its only
+    // predicate is isnotnull(dKey) (which drops only null keys, which can never match an equi-join
+    // anyway). ANY other filter would make the join a selective semijoin, NOT a no-op - eliminating
+    // it would drop fact rows. So a FILTERED dimension (e.g. date_dim WHERE d_year=2001) is kept.
+    def isNonReducingLeaf(d: LogicalPlan, dKey: Attribute): Boolean = {
+      val projFilterOverLeaf = d match {
+        case _: LeafNode => true
+        case NodeWithOnlyDeterministicProjectAndFilter(_: LeafNode) => true
+        case _ => false
+      }
+      projFilterOverLeaf && d.collect { case f: Filter => f.condition }
+        .flatMap(conjuncts)
+        .forall {
+          case IsNotNull(a: Attribute) => a.semanticEquals(dKey)
+          case _ => false
+        }
+    }
+
+    // Returns the single join condition to drop with D, if D is a removable no-op dimension.
+    def removableCond(d: LogicalPlan, curConds: Seq[Expression],
+        curItems: Seq[LogicalPlan]): Option[Expression] = {
+      val dOut = d.outputSet
+      if (dOut.exists(externalRefs.contains)) return None       // D feeds the result -> keep
+      val dConds = curConds.filter(_.references.exists(dOut.contains))
+      if (dConds.size != 1) return None                         // not a single-edge leaf -> keep
+      val cond = dConds.head
+      val (a, b) = equiKeys(cond).getOrElse(return None)
+      val (dKey, factKey) =
+        if (dOut.contains(a) && !dOut.contains(b)) (a, b)
+        else if (dOut.contains(b) && !dOut.contains(a)) (b, a)
+        else return None
+      if (!isNonReducingLeaf(d, dKey)) return None              // D filters/decorates rows -> keep
+      if (!hasUniqueKeyStats(dKey, d)) return None              // D.k not provably unique -> keep
+      val factItem = curItems.find(it => (it ne d) && it.outputSet.contains(factKey))
+      val factNonNull = !factKey.nullable ||
+        factItem.exists(_.constraints.contains(IsNotNull(factKey)))
+      if (!factNonNull) return None                             // FK may be null -> keep
+      Some(cond)
+    }
+
+    var curItems = items
+    var curConds = conditions.toSeq
+    var changed = true
+    while (changed && curItems.size >= 3) {
+      changed = false
+      val victim = curItems.iterator
+        .map(d => (d, removableCond(d, curConds, curItems)))
+        .collectFirst { case (d, Some(cond)) => (d, cond) }
+      victim.foreach { case (d, cond) =>
+        debugLog("eliminating no-op dimension join; output=" + d.outputSet)
+        curItems = curItems.filterNot(_ eq d)
+        curConds = curConds.filterNot(_ eq cond)
+        changed = true
+      }
+    }
+    (curItems, ExpressionSet(curConds))
+  }
+
   // A "product aggregate" is a SUM over 2+ non-count attributes from different relations (e.g.
   // SUM(a*b)); a "cross-relation filter" is a non-equi predicate spanning relations. Both are
   // extracted as DeferredComputations so the rewrite can detect product conflicts: when 2+
@@ -318,7 +407,7 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
     // rewrite actually applies.
     val resultExpressions = desugarFilteredAggregates(origResultExpressions)
     // Extract the join items (including any filters, etc.)
-    val (items, conditions) = extractInnerJoins(join)
+    val (rawItems, rawConditions) = extractInnerJoins(join)
 
     val equivalentAggregateExpressions = new EquivalentExpressions
     // Extract the AggregateExpressions from the result expressions
@@ -494,6 +583,11 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
       agg
     }
     else {
+      // Drop provably-redundant dimension joins (PK-FK no-ops) before building the hypergraph so
+      // both the counting and pre-agg paths see the reduced join. externalRefs is everything the
+      // rewrite must still produce from the join (grouping + aggregate attributes).
+      val (items, conditions) =
+        eliminateNoOpDimensions(rawItems, rawConditions, aggregateAttributes ++ groupAttributes)
       val hg = new Hypergraph(items, conditions)
       // For acyclic queries flatGYO returns the join tree directly (unchanged behaviour). When
       // it returns null the query is cyclic: if cyclic-bag decomposition is enabled, try to
