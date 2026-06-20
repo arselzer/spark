@@ -123,6 +123,52 @@ class STATSBenchmarkSuite extends QueryTest with SharedSparkSession {
   private def geomean(xs: Seq[Double]): Double =
     if (xs.isEmpty) 0.0 else math.exp(xs.map(math.log).sum / xs.size)
 
+  // Validates the workflow hypothesis: the 21 STATS-CEB "losers" the gate wrongly KEEPS are PK-star
+  // joins (users.Id/posts.Id hub); allEquiJoinsHaveUniqueSide is meant to skip them but needs NDV
+  // (distinctCount), absent on raw parquet. Registering ANALYZE'd catalog tables + CBO should let
+  // the gate correctly SKIP the 21 losers while KEEPING the 4 winners (q003/q004/q007/q008)
+  // keys). Plan-only (no timing), so it is fast.
+  test("STATS-CEB gate decisions under ANALYZE'd NDV stats") {
+    assume(new File(csvDir).isDirectory, s"STATS CSVs not present at $csvDir")
+    assume(new File(queriesFile).isFile, s"STATS queries not present at $queriesFile")
+    if (!new File(parquetDir).isDirectory) buildParquetFromCsv()
+    withTable(schemas.map(_._1): _*) {
+      schemas.foreach { case (t, _) =>
+        spark.sql(s"DROP TABLE IF EXISTS $t")
+        val loc = new File(s"$parquetDir/$t").getAbsolutePath
+        spark.sql(s"CREATE TABLE $t USING parquet LOCATION '$loc'")
+        spark.sql(s"ANALYZE TABLE $t COMPUTE STATISTICS FOR ALL COLUMNS")
+      }
+      val queries = loadQueries().toMap
+      val gateOn = Seq(
+        SQLConf.CBO_ENABLED.key -> "true",
+        SQLConf.PLAN_STATS_ENABLED.key -> "true",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true")
+      val losers = Seq("q011", "q013", "q025", "q027", "q028", "q029", "q036", "q041", "q054",
+        "q061", "q084", "q085", "q093", "q111", "q117", "q118", "q121", "q123", "q124", "q125",
+        "q137")
+      val winners = Seq("q003", "q004", "q007", "q008")
+      def gateKeeps(name: String): Boolean =
+        withSQLConf(gateOn: _*) {
+          spark.sql(queries(name)).queryExecution.optimizedPlan.toString.contains("CountJoin")
+        }
+      val losersSkipped = losers.count(n => !gateKeeps(n))
+      val winnersKept = winners.count(gateKeeps)
+      // scalastyle:off println
+      println(s"STATS-CEB NDV-GATE: of 21 known losers, gate now SKIPS $losersSkipped/21; " +
+        s"of 4 known winners, gate KEEPS $winnersKept/4")
+      losers.foreach(n => println(s"  loser  $n gateKeeps=${gateKeeps(n)} (want false)"))
+      winners.foreach(n => println(s"  winner $n gateKeeps=${gateKeeps(n)} (want true)"))
+      // scalastyle:on println
+      // The unique-side arm should now skip the PK-star losers; the winners (non-unique) stay kept.
+      assert(losersSkipped >= 17, s"expected NDV to let the gate skip most PK-star losers, " +
+        s"got $losersSkipped/21")
+    }
+  }
+
   test("STATS-CEB benchmark: count-join rewrite off vs on, all 146 queries") {
     assume(new File(csvDir).isDirectory, s"STATS CSVs not present at $csvDir")
     assume(new File(queriesFile).isFile, s"STATS queries not present at $queriesFile")

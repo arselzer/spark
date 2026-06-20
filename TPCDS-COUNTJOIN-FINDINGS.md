@@ -2284,3 +2284,32 @@ The count-join rewrite is now validated across THREE benchmarks, all results == 
 - STATS-CEB: fires on 146/146, 0 mismatches, 1.37x geomean + 7 vanilla-DNF rescues (>=10-56x).
 Plus AQE robustness (probe-side skew handling, #3) and the default-off runtime keep-or-revert
 (divergence criterion + adoption cost evaluator) for the cases static stats cannot predict.
+
+## 2026-06-20 New-optimization mining from JOB/STATS: gate mis-calibration is real but NOT free
+
+JOB/STATS (real join workloads) gave what TPC-DS could not: a workload where the cost gate's keep/skip
+decisions can be scored against ACTUAL outcomes. STATS-CEB measured: unguarded geomean 1.38x, with the
+gate (prod) 1.56x - but the gate KEEPS 21 cheap-overhead losers it should skip (q121 0.22x, q085 0.69x,
+... all PK-star joins on users.Id/posts.Id, off 124-1011ms) and SKIPS 4 real winners (q007 3.10x,
+q008 2.57x, q004 1.60x, q003 1.36x - 2-table many-to-many, no unique side). ~0.2x of geomean is left on
+the table. The separator is FAN-OUT / unique-side structure, not query size (winner q007 off=1271ms
+overlaps loser q123 off=1011ms).
+
+A workflow's leading hypothesis was that this is a FREE unlock: the losers are PK-stars and
+allEquiJoinsHaveUniqueSide (the arm meant to skip them) is dead only for want of NDV, so ANALYZE-ing
+the tables would fix it. MEASURED AND REFUTED: with the STATS tables registered as catalog tables,
+ANALYZE TABLE ... FOR ALL COLUMNS, and CBO+gate on, the gate skipped only 1/21 losers and kept 0/4
+winners (all winners still skipped). NDV did NOT make the unique-side arm fire on the PK-star losers
+(STATSBenchmarkSuite "gate decisions under ANALYZE'd NDV stats"). So static-gate calibration on real
+join shapes remains hard - the same stats-fragility wall hit throughout, now confirmed even WITH NDV.
+
+Honest conclusion on "further potential": the mis-calibration is REAL and measurable (~0.2x geomean),
+but the easy fix failed. The remaining levers are all medium-effort and either stats-fragile or risky:
+(a) a structural smallest-hub-star fan-out proxy in the gate (no-NDV); (b) recovering the 4 skipped
+winners by scoping the degree-2 broadcast skip (but that arm is load-bearing on the TPC-DS
+broadcast-friendly-2-table skip, so it has blast radius); (c) the AQE runtime reduction-ratio revert -
+extend DemoteNonReducingCountJoin to also revert when MATERIALIZED probe-output/build-rows ~= 1 (no
+fan-out collapsed). Option (c) is the most principled: it decides on measured fan-out, the one signal
+that is reliable, and reuses the runtime-revert infrastructure already built - the same lesson as the
+whole keep-or-revert effort. None is a quick win; the count-join rewrite itself is validated and
+strong across three benchmarks, and further gains are firmly in the hard cost-decision regime.
