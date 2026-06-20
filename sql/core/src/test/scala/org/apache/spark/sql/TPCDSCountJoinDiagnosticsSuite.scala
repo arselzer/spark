@@ -259,4 +259,54 @@ class TPCDSCountJoinDiagnosticsSuite extends QueryTest with SharedSparkSession w
       }
     }
   }
+
+  // Demonstrates the no-op dimension elimination on q50 with REAL column stats. The default
+  // diagnostics path uses parquet temp views with no ANALYZE'd NDV, so the (correctly conservative)
+  // elimination is inert there. Here we register q50's tables as catalog tables, ANALYZE the
+  // dimensions for column stats, enable CBO, and compare base / prod-noelim / prod-elim.
+  test("q50 stats-equipped wall-clock: no-op dimension elimination") {
+    assume(new File(s"$parquetDir/date_dim").exists() &&
+      new File(s"$parquetDir/store_sales").exists(),
+      s"q50 parquet tables absent under $parquetDir; skipping")
+    val q50Tables = Seq("store_sales", "store_returns", "store", "date_dim")
+    withTable(q50Tables: _*) {
+      q50Tables.foreach { t =>
+        spark.sql(s"DROP TABLE IF EXISTS $t")
+        spark.sql(s"CREATE TABLE $t USING parquet LOCATION " +
+          s"'${new File(s"$parquetDir/$t").getAbsolutePath}'")
+      }
+      // Full column (NDV) stats on all tables so CBO has complete cardinality info and PK
+      // uniqueness is provable.
+      q50Tables.foreach(t =>
+        spark.sql(s"ANALYZE TABLE $t COMPUTE STATISTICS FOR ALL COLUMNS"))
+
+      val sqlText = resourceToString("tpcds/q50.sql",
+        classLoader = Thread.currentThread().getContextClassLoader)
+      val cbo = Seq(
+        SQLConf.CBO_ENABLED.key -> "true",
+        SQLConf.PLAN_STATS_ENABLED.key -> "true")
+      val on = Seq(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true")
+      val statsModes = Seq(
+        Mode("base", cbo :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false")),
+        Mode("prod-noelim",
+          cbo ++ on :+ (SQLConf.YANNAKAKIS_ELIMINATE_NOOP_DIMS_ENABLED.key -> "false")),
+        Mode("prod-elim",
+          cbo ++ on :+ (SQLConf.YANNAKAKIS_ELIMINATE_NOOP_DIMS_ENABLED.key -> "true")))
+      statsModes.foreach { mode =>
+        run(sqlText, mode) // warmup
+        val measured = (1 to 3).map(_ => run(sqlText, mode))
+        val result = measured.last
+        val minMs = measured.map(_.ms).min
+        val nodes = allNodes(result.physicalPlan)
+        // scalastyle:off println
+        println(s"TPCDS-Q50STATS: ${mode.name} | rows=${result.rows} | ms=${minMs} | " +
+          s"logicalCountJoins=${result.optimizedCountJoins} | " +
+          s"operators=${operatorCounts(nodes)} | metrics=${metricSummary(nodes)}")
+        // scalastyle:on println
+      }
+    }
+  }
 }

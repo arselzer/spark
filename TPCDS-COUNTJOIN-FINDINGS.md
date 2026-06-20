@@ -1833,3 +1833,49 @@ evidence.
 - #3 (q64 partial-agg fusion): assessed and SKIPPED - redundant with Spark's automatic partial+final
   aggregation (confirmed in q64's plan).
 - #2 (q64 fusion guard): not needed (no #3).
+
+## 2026-06-20 PIVOTAL: stats-equipped measurement overturns the q50 elimination AND flags a win risk
+
+Goal was to MEASURE q50's wall-clock gain from the no-op elimination by giving q50's tables real
+column stats (CREATE external catalog tables over the parquet + ANALYZE FOR ALL COLUMNS + CBO).
+Added a `q50 stats-equipped` test to TPCDSCountJoinDiagnosticsSuite. Result (warm-min, SF5, full
+column stats on all 4 q50 tables):
+
+| mode | ms | logicalCountJoins | join ops | note |
+|---|---:|---:|---|---|
+| base | 6926 | 0 | SMJ | vanilla |
+| prod-noelim | 5353 | 3 | all BroadcastHashCountJoin | +23% WIN (rewrite, elimination OFF) |
+| prod-elim | 6777 | 2 | + a ShuffledHashCountJoin | -27% vs prod-noelim (elimination ON) |
+
+Finding 1 - the q50 elimination is COUNTERPRODUCTIVE (overturns optimization #1's premise):
+- It DOES fire with stats (logicalCountJoins 3 -> 2; d1 dropped) and results are correct, BUT
+- removing the "no-op" d1 made Spark's planner switch a BroadcastHashCountJoin to a
+  ShuffledHashCountJoin -> q50 prod 5353 -> 6777 ms (+27% SLOWER).
+- The original premise (the prior agent's claim that d1 was the 13.3M-row stream) was WRONG: d1 is a
+  BROADCAST existence join; the 13.28M shuffleRecords is store_sales itself and is UNCHANGED by the
+  elimination. The "no-op" join was physically load-bearing (kept the count-join chain broadcast).
+- ACTION: flipped spark.sql.yannakakis.eliminateNoOpDimensionsEnabled to DEFAULT OFF. The transform
+  is correct (YannakakisCorrectnessSuite test still validates it with the flag forced on) but needs a
+  cost-aware guard (only eliminate if it does not force a shuffle) before it could be enabled. The
+  measurement did its job: caught a regression before it shipped default-on.
+- Silver lining: prod-noelim shows the BASE q50 CountJoin rewrite is a genuine +23% WIN under full
+  CBO stats (the earlier stats-less +14% was not an artifact; the partial-stats -55% run WAS an
+  artifact of incomplete fact stats).
+
+Finding 2 - q4/q11 (2 of the 7 wins) are AT RISK under CBO stats (from the next-opt investigation):
+- q4/q11's per-channel pre-agg unit is a clean star (customer JOIN store_sales JOIN date_dim) where
+  BOTH edges have a PK-unique side (c_customer_sk=ss_customer_sk, ss_sold_date_sk=d_date_sk). With
+  NDV stats, allEquiJoinsHaveUniqueSide (RewriteJoinsAsSemijoins.scala:129-142) returns TRUE, so the
+  decorating-pre-agg cost gate (costGateSkips skipNonExpanding=true, ~scala:1975) FIRES and SKIPS the
+  pre-agg -> q4/q11 revert to base. On the stats-less benchmark hasUniqueKeyStats is always false, so
+  the arm is inert and the wins show - i.e. q4/q11's wins are partly a stats-LESS artifact.
+- The 5 CountJoin wins (q25/q29/q24a/q24b/q64) are SAFE under stats: they have fact-to-fact edges
+  with no PK side (store_sales<->store_returns<->catalog_sales) so allEquiJoinsHaveUniqueSide stays
+  false; several also have maxKeyDegree>=3 which independently forces keep.
+- This is the same aggregate-blindness as q15/q69: the gate sees join shape, not the aggregate
+  collapse the pre-agg buys (q4 shuffleRecords 25.7M->2.5M, sortPeak 8.2G->0).
+
+Implication: a production system with CBO stats would (a) gain nothing from the no-op elimination
+(now off) and (b) LOSE q4/q11 to the pre-agg FK-uniqueness gate. The next concrete work (ranked by
+the investigation) is: CONFIRM the q4/q11 flip empirically (stats-injected test), then make the
+pre-agg gate aggregate-aware so q4/q11 survive ANALYZE'd stats - the only real threat to the wins.

@@ -3649,14 +3649,16 @@ object SQLConf {
     buildConf("spark.sql.yannakakis.eliminateNoOpDimensionsEnabled")
       .doc("Inside the count-join rewrite, drop a dimension relation joined only on its unique " +
         "(PK) key to a provably non-null fact FK when no dimension attribute is referenced " +
-        "by the grouping, aggregates, projection, or any other join: such an inner join neither " +
-        "filters nor decorates, so it is a semantic no-op. Removing it before hypertree " +
-        "construction avoids a gratuitous existence stream (e.g. q50's 13.3M-row store_sales to " +
-        "date_dim pass). Conservative: requires provable PK uniqueness and FK non-nullness")
+        "by the grouping, aggregates, projection, or any other join AND the dimension is " +
+        "unfiltered: such an inner join is a row-preserving no-op. Correct, but DEFAULT OFF: " +
+        "measurement (q50, full CBO stats) showed removing a redundant broadcast existence join " +
+        "perturbs join-strategy selection (broadcast -> shuffle) and REGRESSED q50 ~27%. The " +
+        "'no-op' join can be physically load-bearing, so this needs a cost-aware guard first. " +
+        "Requires provable PK uniqueness (column NDV stats) + FK non-nullness")
       .version("4.1.0")
       .internal()
       .booleanConf
-      .createWithDefault(true)
+      .createWithDefault(false)
 
   val YANNAKAKIS_CYCLIC_BAGS_ENABLED =
     buildConf("spark.sql.yannakakis.cyclicBagsEnabled")

@@ -493,6 +493,7 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
         SQLConf.YANNAKAKIS_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
         SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "false",
+        SQLConf.YANNAKAKIS_ELIMINATE_NOOP_DIMS_ENABLED.key -> "true",  // default off; force on here
         SQLConf.CBO_ENABLED.key -> "true",
         SQLConf.PLAN_STATS_ENABLED.key -> "true")
       withSQLConf(cfg: _*) {
