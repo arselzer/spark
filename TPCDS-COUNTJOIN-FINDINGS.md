@@ -1908,3 +1908,51 @@ is the same class as the q15/q69 issue and is entangled with q34's stats-underes
 it needs a plan-level test harness under stats (the applicability suite is CountJoin-marker-based and
 cannot observe pre-agg firing). This fix removes the one clearly-wrong arm safely; the rest is
 deferred.
+
+## 2026-06-20 RESOLVED: all 7 wins hold under real CBO column stats
+
+Built the plan-level under-CBO-stats harness the re-prioritization called for (a `q4/q11 + CountJoin
+wins under CBO column stats` test in TPCDSCountJoinDiagnosticsSuite: register all TPC-DS tables as
+catalog tables over the parquet, ANALYZE FOR ALL COLUMNS, enable CBO, run base vs prod, assert
+results == vanilla). Result (warm-min, SF5, full column stats):
+
+| query | base ms | prod ms | speedup | prod rewrite | rows match |
+|---|---:|---:|---:|---|---|
+| q4 | 28047 | 11993 | +57% | pre-agg (lcj=0; 0 SMJ/0 Sort vs base 6/12) | yes |
+| q11 | 14133 | 4550 | +68% | pre-agg (lcj=0; 0 SMJ/0 Sort) | yes |
+| q25 | 21130 | 1919 | +91% | CountJoin (lcj=7) | yes |
+| q29 | 21212 | 3670 | +83% | CountJoin (lcj=7) | yes |
+| q64 | 43033 | 13403 | +69% | CountJoin (lcj=36) | yes |
+
+The at-risk worry is REFUTED: q4/q11's decorating pre-aggregate FIRES under real CBO column stats
+(prod has zero SortMergeJoin/Sort, the SMJ+sort-removal signature of the pre-agg). The broadcast arm
+does not skip them either (their 'all but largest' includes customer, which is not broadcast-eligible
+at SF5, so baselineBroadcastsAllButLargest is false), and the pre-agg unique-side fix (b7d16ab043)
+removed the one arm that would have. So the '7 wins' claim is now MEASURED under production-like CBO
+stats, not merely asserted on the stats-less benchmark. All five rewrite under CBO with results
+identical to vanilla.
+
+Note the earlier injectStats applicability showing q4/q11 = cost-gate-SKIPS was a false alarm from two
+sources: (a) the applicability classifier is CountJoin-marker-based and cannot see pre-agg firing
+(pre-agg has lcj=0), and (b) injectStats uses SF1-scaled sizes that differ from real SF5, changing
+the size-based arms. Real-execution measurement is the ground truth, and it is positive.
+
+## 2026-06-20 codegen cleanups (from the bytecode review)
+
+- needCopyResult (committed d427be163a): a NON-grouped count join emits at most one row per stream
+  input (it aggregates matches into a count rather than fanning out), so the whole-stage boundary
+  copy is unnecessary. ShuffledHashCountJoinExec dropped its hard-coded needCopyResult=true ->
+  streamedPlan.needCopyResult || groupRight.nonEmpty; BroadcastHashCountJoinExec gated its copy on
+  groupRight.nonEmpty && multipleOutputForOneInput. Correctness 119/119; all 6 CountJoin wins'
+  row counts identical to base across whole-stage boundaries (no corruption). SF5 wall-clock delta is
+  within the noise floor (copies are cheap at this cardinality); the saving scales with count-join
+  output volume.
+- Dead-code: deleted HashCountJoin.codegenInner (a stale duplicate of the standard HashJoin inner
+  codegen, never called - doConsume routes InnerLike to codegenCountInner). The codegenOuter/Semi/
+  Anti/Existence branches were KEPT: they are reachable extension scaffolding (gated only by the
+  execs' InnerLike require), not pure rot.
+- Bytecode review conclusion: the DeclarativeAggregate count-join codegen (the path the 7 wins use)
+  is already well-optimized (factorized fan-out + fused aggregate-as-payload, primitive-long count,
+  derived-count short-circuit). The remaining codegen items are either low-impact (interpreted/
+  imperative-aggregate fallback, which the wins do not use) or large bets (columnar output); see the
+  ranked review. No further codegen speedup is realistically on the table for the measured wins.

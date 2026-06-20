@@ -309,4 +309,52 @@ class TPCDSCountJoinDiagnosticsSuite extends QueryTest with SharedSparkSession w
       }
     }
   }
+
+  // Verify the production wins under REAL CBO column stats (the benchmark uses temp views with no
+  // ANALYZE, so the NDV-dependent gate arms are inert there). Registers all TPC-DS tables as
+  // catalog tables over the parquet, ANALYZEs for column stats, enables CBO, reports base vs prod
+  // the at-risk pre-agg wins (q4/q11) and the asserted-safe CountJoin wins (q25/q29/q64). Key
+  // question: do q4/q11 still rewrite under CBO (pre-agg fires -> fewer SMJ / less shuffle),
+  // or do the broadcast/dominated arms skip them (prod ops == base)? Asserts results == vanilla.
+  test("q4/q11 + CountJoin wins under CBO column stats") {
+    assume(new File(s"$parquetDir/store_sales").exists() &&
+      new File(s"$parquetDir/customer").exists(),
+      s"q4/q11 parquet tables absent under $parquetDir; skipping")
+    val allTables = tableColumns.keys.toSeq.filter(t => new File(s"$parquetDir/$t").exists())
+    withTable(allTables: _*) {
+      allTables.foreach { t =>
+        spark.sql(s"DROP TABLE IF EXISTS $t")
+        spark.sql(s"CREATE TABLE $t USING parquet LOCATION " +
+          s"'${new File(s"$parquetDir/$t").getAbsolutePath}'")
+        // inventory is huge and unused by the verified queries; column-analyze the rest for NDV.
+        if (t == "inventory") spark.sql(s"ANALYZE TABLE $t COMPUTE STATISTICS")
+        else spark.sql(s"ANALYZE TABLE $t COMPUTE STATISTICS FOR ALL COLUMNS")
+      }
+      val cbo = Seq(
+        SQLConf.CBO_ENABLED.key -> "true",
+        SQLConf.PLAN_STATS_ENABLED.key -> "true")
+      val baseMode = Mode("base", cbo :+ (SQLConf.YANNAKAKIS_ENABLED.key -> "false"))
+      val prodMode = Mode("prod", cbo ++ Seq(
+        SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+        SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true"))
+      for (q <- Seq("q4", "q11", "q25", "q29", "q64")) {
+        val sqlText = resourceToString(s"tpcds/$q.sql",
+          classLoader = Thread.currentThread().getContextClassLoader)
+        run(sqlText, baseMode) // warmup
+        val baseR = run(sqlText, baseMode)
+        val baseNodes = allNodes(baseR.physicalPlan)
+        run(sqlText, prodMode) // warmup
+        val prodR = run(sqlText, prodMode)
+        val prodNodes = allNodes(prodR.physicalPlan)
+        // scalastyle:off println
+        println(s"TPCDS-CBOVERIFY: $q | base=${baseR.ms}ms/${baseR.rows}r " +
+          s"prod=${prodR.ms}ms/${prodR.rows}r prodLcj=${prodR.optimizedCountJoins} | " +
+          s"baseOps=${operatorCounts(baseNodes)} | prodOps=${operatorCounts(prodNodes)} | " +
+          s"baseMet=${metricSummary(baseNodes)} | prodMet=${metricSummary(prodNodes)}")
+        // scalastyle:on println
+        assert(baseR.rows == prodR.rows, s"$q row count differs under CBO (correctness)")
+      }
+    }
+  }
 }

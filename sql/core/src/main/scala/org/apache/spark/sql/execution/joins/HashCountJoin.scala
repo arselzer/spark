@@ -697,60 +697,6 @@ trait HashCountJoin extends JoinCodegenSupport {
   }
 
   /**
-   * Generates the code for Inner join.
-   */
-  protected def codegenInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
-    val HashedRelationInfo(relationTerm, keyIsUnique, isEmptyHashedRelation) = prepareRelation(ctx)
-    val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
-    val (matched, checkCondition, buildVars) = getJoinCondition(ctx, input, streamedPlan, buildPlan)
-    val numOutput = metricTerm(ctx, "numOutputRows")
-
-    val resultVars = buildSide match {
-      case BuildLeft => buildVars ++ input
-      case BuildRight => input ++ buildVars
-    }
-
-    if (isEmptyHashedRelation) {
-      """
-        |// If HashedRelation is empty, hash inner join simply returns nothing.
-      """.stripMargin
-    } else if (keyIsUnique) {
-      s"""
-         |// generate join key for stream side
-         |${keyEv.code}
-         |// find matches from HashedRelation
-         |UnsafeRow $matched = $anyNull ? null: (UnsafeRow)$relationTerm.getValue(${keyEv.value});
-         |if ($matched != null) {
-         |  $checkCondition {
-         |    $numOutput.add(1);
-         |    ${consume(ctx, resultVars)}
-         |  }
-         |}
-       """.stripMargin
-    } else {
-      val matches = ctx.freshName("matches")
-      val iteratorCls = classOf[Iterator[UnsafeRow]].getName
-
-      s"""
-         |// generate join key for stream side
-         |${keyEv.code}
-         |// find matches from HashRelation
-         |$iteratorCls $matches = $anyNull ?
-         |  null : ($iteratorCls)$relationTerm.get(${keyEv.value});
-         |if ($matches != null) {
-         |  while ($matches.hasNext()) {
-         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
-         |    $checkCondition {
-         |      $numOutput.add(1);
-         |      ${consume(ctx, resultVars)}
-         |    }
-         |  }
-         |}
-       """.stripMargin
-    }
-  }
-
-  /**
    * Inner-join codegen for the non-grouping, pure-count path: per stream row, accumulate the
    * (count-multiplied) number of build matches that pass the residual condition and emit ONE row
    * (left cols ++ count), or nothing when no match passes (the phantom-count-0 case).
