@@ -1805,3 +1805,31 @@ plan-proven to fire and drop the stream when CBO column stats exist (the normal 
 wall-clock SF5 demonstration would require ANALYZE'd catalog tables (data rewrite). NOTE: this same
 stats gap means ALL NDV-based logic in the rule (e.g. allEquiJoinsHaveUniqueSide arm of the cost
 gate) is inert on the current benchmark - the sweep results are driven by size-based stats only.
+
+### #3 (q64 partial-aggregate fusion): assessed REDUNDANT, not implemented
+
+The investigation's rank-3 idea was to insert a partial HashAggregate above the top CountJoin to
+collapse q64's 83.8M-row stream before the exchange. Checking q64's actual prod plan (q64_plan.log)
+shows this is already done by Spark's automatic partial+final aggregation:
+
+```
+final   HashAggregate(... sum ...)            <- final agg
+  Exchange hashpartitioning(15 group cols)     <- the shuffle
+    partial HashAggregate(... partial_sum ...) <- ALREADY here, directly above the CountJoin
+      BroadcastHashCountJoin [ss_item_sk=cs_item_sk] ... [count(1)]   <- top CountJoin
+```
+
+The partial aggregate already collapses the 83.8M CountJoin output before the exchange. The residual
+10.9M shuffleRecords is the genuine cardinality of q64's 15-column GROUP BY (i_product_name,
+i_item_sk, s_store_name, s_zip, 6 address cols, 3 d_year cols, ...), not an un-aggregated stream - an
+explicit partial agg cannot reduce it. So #3 as specified would be a no-op, and #2 (its guard) guards
+nothing. The only way to shrink q64 further is aggregating INSIDE the count-join (AggJoin operator
+surgery - the high-risk rank-5 variant), which is out of scope for this pass. #3 skipped with
+evidence.
+
+### "Do #1/#2/#3" outcome
+
+- #1 (q50 no-op dimension elimination): IMPLEMENTED + validated + committed (correct, stats-gated).
+- #3 (q64 partial-agg fusion): assessed and SKIPPED - redundant with Spark's automatic partial+final
+  aggregation (confirmed in q64's plan).
+- #2 (q64 fusion guard): not needed (no #3).
