@@ -2020,3 +2020,44 @@ for workloads the benchmark cannot exhibit (skew, cardinality divergence). #1 (s
 stream-side-split-only) is the most contained; #3 (runtime keep-or-revert) is the highest-value but is
 a large bet gated on a reversibility spike. Both are unmeasurable here, so neither should ship without
 a dedicated skew / cardinality-divergence test harness.
+
+## 2026-06-20 Reversibility spike (gate for the runtime keep-or-revert rule) - VERDICT: FEASIBLE
+
+Question: can a CountJoin be reverted to a plain Join+Aggregate at AQE time, so a runtime rule can
+demote a non-reducing rewrite? Answer: YES, but via RETAIN-ORIGINAL, not chain-reconstruction.
+
+Key realization: apply() (RewriteJoinsAsSemijoins.scala:1285-1316) matches an Aggregate-over-Join
+subtree and REPLACES it with the rewrite; the original `agg` is in hand at rewrite time (it is the
+fallback value returned on failure, e.g. line 1348). So we never need to reconstruct a Join from
+CountJoin carrier fields (which IS hard for chained count joins like q64's ~36). Instead retain the
+original whole subtree and swap the ENTIRE rewritten subtree back to it. Revert grain = one apply()
+match (one Aggregate-over-Join), which always has a clean original. The chain problem dissolves.
+
+Two load-bearing facts verified in code:
+- Swap is schema-safe: validateOrFallback (RewriteJoinsAsSemijoins.scala:1881) rejects any rewrite
+  with missingInput, so the rewritten subtree is output-compatible with the original agg; swapping
+  back restores the exact original output (same resultIds), transparent to the parent.
+- There is a place for the rule: AQE reOptimize (AdaptiveSparkPlanExec.scala:793) calls
+  optimizer.execute(logicalPlan) - it runs the LOGICAL optimizer on each re-optimization, on a plan
+  whose materialized stages carry real stats. A cost-based revert rule lives there and reads MEASURED
+  cardinality (not the estimates the session proved unreliable - this is the whole point).
+
+Proposed mechanism: (1) at rewrite time, stash the original agg on the rewritten root via a
+TreeNodeTag (lightweight, survives transforms, dormant - not planned); (2) an AQE reOptimize revert
+rule reads the materialized build-side stats and, when the count-join is genuinely non-reducing (real
+build rowCount vastly exceeds the rewrite break-even / output ~= input), swaps the whole rewritten
+subtree back to the stashed original; (3) AQE then plans the original normally, recovering runtime
+filters / DPP / skew handling too.
+
+Remaining risks to PROTOTYPE before committing to the full rule (none look like blockers):
+1. Timing - confirm reOptimize fires at the boundary where the build exchange is materialized (stats
+   known) but the count-join compute stage has not yet run. The build is a materialized exchange and
+   the count-join is the next stage, so the window exists; needs prototype confirmation.
+2. Criterion calibration - "non-reducing" must NEVER fire on the 7 wins (they reduce under CBO).
+   Reliable with real materialized cardinality, but needs a synthetic cardinality-divergence test
+   (the benchmark cannot exercise it).
+3. Stash durability - the tag/original must survive AQE's transforms until the decision point.
+
+Bottom line: the highest-value direction is UNBLOCKED. Next concrete step is a minimal prototype
+(TreeNodeTag stash + a test-flag-gated always-revert rule + correctness run to prove the swap is
+schema-safe and correct), then the real cost criterion + a synthetic cardinality-divergence harness.
