@@ -2313,3 +2313,28 @@ fan-out collapsed). Option (c) is the most principled: it decides on measured fa
 that is reliable, and reuses the runtime-revert infrastructure already built - the same lesson as the
 whole keep-or-revert effort. None is a quick win; the count-join rewrite itself is validated and
 strong across three benchmarks, and further gains are firmly in the hard cost-decision regime.
+
+## 2026-06-20 FIX: unique-side gate detection robust to HLL NDV undercount (the 21 losers)
+
+Diagnosed WHY ANALYZE'd NDV did not let the gate skip the 21 STATS-CEB losers, and FIXED it. Added a
+diagnostic to hasUniqueKeyStats and re-ran under ANALYZE'd catalog tables + CBO. Root cause: the
+unique-side check required distinct/row within ndvMaxError*2 = 0.10 of 1.0, but ANALYZE's HLL NDV
+UNDER-COUNTS true keys past that. Measured: posts.Id (true PK) came back 89098/91976 = 0.969 (PASS),
+but users.Id (true PK) came back 34884/40325 = 0.865 - a 13.5% HLL undercount that FAILED the 0.10
+tolerance. 20 of the 21 losers are PK-star joins on users.Id, so the gate wrongly KEPT them.
+
+Fix (RewriteJoinsAsSemijoins.scala): replace the tight near-1 tolerance with a generous distinct/row
+FLOOR, UniqueSideMinDistinctRatio = 0.8 (a side is treated as ~key/low-fan-out when distinct/row >=
+0.8). This tolerates HLL undercount (true keys measured 0.865-0.969) while genuine non-keys sit far
+below (~0.08 - comments.UserId 13264/174305), a wide safe gap.
+
+Validated (STATSBenchmarkSuite "gate decisions under ANALYZE'd NDV stats" + TPCDS CBO harnesses):
+- NDV gate now SKIPS 20/21 PK-star losers (was 1/21) - the gate correctly avoids the count-join
+  overhead on row-preserving FK/dimension joins under CBO.
+- TPC-DS wins PRESERVED under CBO: q25 lcj=7 (+91%), q29 lcj=7 (+81%), q64 lcj=36 (+67%) still fire;
+  q4/q11 pre-agg still win - their wins come from NON-unique fact-fact edges, so allEquiJoinsHave
+  UniqueSide stays false and the looser floor does not skip them.
+- Correctness 120/120.
+This is a production (CBO) improvement at the right layer (static gate), not a benchmark-number change
+(the un-ANALYZE'd benchmark has no NDV). Remaining: the 4 Arm1-skipped winners (q003/q004/q007/q008)
+are a separate broadcast-arm issue (rank 2), not addressed here.

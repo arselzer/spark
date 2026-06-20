@@ -46,6 +46,10 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
 
   private val MinWideDecoratingGroupRefs = 6
   private val MaxDecoratingPreAggExpansion = BigInt(48)
+  // A join side is treated as ~unique (a key -> row-preserving, low fan-out) when its distinct/row
+  // ratio is at least this. Generous on purpose: ANALYZE's HLL NDV under-counts true keys (a real
+  // PK measured at 0.865), while genuine non-keys sit far lower (~0.08), leaving a wide safe gap.
+  private val UniqueSideMinDistinctRatio = 0.8
 
   /**
    * Stash for the original Aggregate-over-join subtree, set on the rewritten subtree's root when
@@ -132,8 +136,13 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
               colStats.hasCountStats && colStats.nullCount.get == 0 && {
                 val rowCount = t.stats.rowCount.get
                 val distinctCount = colStats.distinctCount.get
-                val relDiff = math.abs((distinctCount.toDouble / rowCount.toDouble) - 1.0d)
-                relDiff <= conf.ndvMaxError * 2
+                // "Unique side" = approximately a key (row-preserving, low fan-out -> little for
+                // the count-join to collapse). Use a generous distinct/row FLOOR, not a near-1
+                // tolerance: ANALYZE's HLL NDV under-counts true keys past its target error (on
+                // STATS-CEB the PK users.Id came back 0.865, a 13.5% undercount the old
+                // ndvMaxError*2=0.10 wrongly rejected, keeping 20 PK-star losers). Non-keys sit far
+                // below the floor (~0.08), a wide safe gap. See UniqueSideMinDistinctRatio.
+                distinctCount.toDouble >= rowCount.toDouble * UniqueSideMinDistinctRatio
               }
             }
         }
