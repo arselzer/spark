@@ -1956,3 +1956,67 @@ the size-based arms. Real-execution measurement is the ground truth, and it is p
   derived-count short-circuit). The remaining codegen items are either low-impact (interpreted/
   imperative-aggregate fallback, which the wins do not use) or large bets (columnar output); see the
   ranked review. No further codegen speedup is realistically on the table for the measured wins.
+
+## 2026-06-20 Fresh-angles investigation (spill / AQE / runtime-filters / reuse)
+
+A probe of UNEXPLORED angles (deliberately excluding the dead static-gate class). Four findings, all
+code-verified:
+
+1. AQE SKEW GAP (real, robustness). OptimizeSkewedJoin.optimizeSkewJoin matches ONLY SortMergeJoinExec
+   (line ~201) and ShuffledHashJoinExec (~210), never the Count variants - even though isSkewJoin
+   plumbing already exists on both (SortMergeCountJoinExec.scala:47, ShuffledHashCountJoinExec.scala:50)
+   and DynamicJoinSelection already teaches an AQE rule about CountJoin. Consequence: on a skewed join
+   key, a CountJoin gets NO straggler-partition splitting that the equivalent vanilla SMJ/SHJ would get
+   - i.e. the rewrite can be SLOWER than vanilla on skew (a potential regression-vs-vanilla, invisible
+   on uniform TPC-DS). Fix: add Count-exec cases to optimizeSkewJoin. CORRECTNESS GATE: count
+   propagation under skew-split. Splitting the STREAM (left, non-counted) side is safe (each stream row
+   still sees the full build, so its count is complete); splitting the BUILD (counted) side yields
+   PARTIAL counts per sub-partition that the downstream must re-sum. Safe implementation = restrict the
+   split to the stream side only. Unmeasurable at SF5 (no skew); needs a synthetic-skew correctness
+   test. Value: medium (production robustness), effort: medium.
+
+2. RUNTIME-FILTER / DPP LOSS (real, net-negative). The Semijoin Rewrite batch (Optimizer.scala:241)
+   runs BEFORE PartitionPruning (SparkOptimizer.scala:56) and InjectRuntimeFilter (~62), and those
+   rules match only Join nodes (patterns.scala:187; PartitionPruning.scala:226). The rewrite replaces
+   the Aggregate-over-Join subtree with nested CountJoins (no Join nodes inside), so the bloom filters /
+   DPP that vanilla would inject are NEVER injected into a rewritten subtree. A CountJoin-specific
+   extractor (ExtractCountJoinEquiJoinKeys, patterns.scala:244) exists but neither rule uses it. This
+   is a real loss that could underlie some forced slowdowns. Pre-agg does NOT enable a downstream bloom
+   filter (the physical Count ops have zero BloomFilter/DynamicPruning refs) - it is a pure loss, not an
+   enablement. Fix: teach InjectRuntimeFilter/PartitionPruning to descend through CountJoin via the
+   existing extractor. Value: medium, effort: large. Lower-yield than #1 per the judge.
+
+3. RUNTIME KEEP-OR-REVERT (the principled direction for the UNSOLVED problems). selectCountJoinStrategy
+   (DynamicJoinSelection.scala:107-157) is a near-verbatim clone of selectJoinStrategy that only flips
+   build strategy (broadcast<->shuffle-hash) and NEVER reconsiders keeping the rewrite - exactly the
+   axis the session proved is not the discriminator. The CountJoin survives into the AQE-visible plan
+   with materialized child mapStats, so a runtime re-decision is possible: demote a CountJoin back to a
+   plain Join when the materialized build cardinality vastly exceeds estimate or the count-join is
+   non-reducing. This is the ONLY layer that sees true cardinality, so the only thing that can safely
+   capture q15/q69 AND fix q2/q34 fragility. LOAD-BEARING GATE: reversibility. CountJoin
+   (basicLogicalOperators.scala:777-786) collapses the original join subtree into count/group/agg
+   carrier fields; reconstructing a plain Join from a CountJoin - especially CHAINED ones (q64 has ~36)
+   - is genuinely uncertain and MUST be proven by a reversibility spike BEFORE committing engineering
+   time. Value: high, effort: large, status: gated on the spike.
+
+4. SPILL/OOM and EXCHANGE-REUSE: NON-EXPOSURES (documented so they are not re-derived). The per-group
+   count maps (codegen cjBufMap HashCountJoin.scala:1147-1161; interpreted 533-535; SMJ
+   EvaluatorFactory:230) are scoped to a SINGLE stream/left row - cleared/drained before the next - so
+   peak live entries are bounded by per-join-key build-match fan-out, which the HashedRelation (or, for
+   SMJ, the already-spillable ExternalAppendOnlyUnsafeRowArray) holds anyway. A spilling
+   UnsafeFixedWidthAggregationMap would not lower peak memory and would endanger the optimized fast
+   paths (the unique-key no-map path, the per-row clear-vs-reallocate). Not warranted. Exchange reuse:
+   the count-join carriers already canonicalize stably and ReuseExchangeAndSubquery dedups at Exchange
+   boundaries governed by leaf-scan canonicalization; no defect, and forcing a custom doCanonicalize is
+   dangerous (multiple aggregatesRight canonicalize to exprId=0). No action.
+
+Non-actions confirmed: the SMJ EvaluatorFactory non-inner branches (405+) are extension scaffolding
+behind require(InnerLike), KEPT for consistency with the codegenOuter/Semi/Anti decision; the
+SortMergeCountJoinExec.scala:166 eval(0, ...) partitionIndex is NOT a footgun - the standard
+SortMergeJoinExec does the identical eval(0, ...) and partitionIndex is debug-only.
+
+Bottom line: no new MEASURABLE-at-SF5 improvement exists; the fresh value is all production-hardening
+for workloads the benchmark cannot exhibit (skew, cardinality divergence). #1 (skew wiring,
+stream-side-split-only) is the most contained; #3 (runtime keep-or-revert) is the highest-value but is
+a large bet gated on a reversibility spike. Both are unmeasurable here, so neither should ship without
+a dedicated skew / cardinality-divergence test harness.
