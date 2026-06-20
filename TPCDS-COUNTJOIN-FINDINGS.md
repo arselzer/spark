@@ -2198,3 +2198,14 @@ The firing side (divergence FIRES on a real q2/q34-class falsified estimate) is 
 suite + the e2e smoke (forced via factor 0.0); a realistic q2/q34 integration repro is still future
 work (SF5 is uniform). Feature complete and correct for the KEEP side on real data; remaining to
 enable: a realistic falsified-estimate integration test and a production factor sweep.
+
+## 2026-06-20 Regression sweep: shipped changes clean across the firing set
+
+Re-ran the count-join firing set (24 queries that produce count-joins / pre-agg in prod) base vs prod
+at SF5 after the cumulative default-behavior changes (pre-agg unique-side fix, needCopyResult,
+codegenInner deletion). Result: ALL 24 have prod rows == base rows (needCopyResult correctness holds
+across the whole firing set, not just the 7 wins), and all 7 wins still rewrite and win - q4 +48%,
+q11 +66%, q24a +41%, q24b +43%, q25 +89%, q29 +80%, q50 +24%, q64 +62% (matching the documented
+baseline within the iters=1 noise). q8 hits the rule's pre-existing empty.reduceLeft fallback (not a
+win; falls back to the correct original plan, rows match) - graceful degradation, not a regression.
+The shipped default-behavior changes are confirmed regression-free.
