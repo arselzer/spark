@@ -101,6 +101,12 @@ case class AdaptiveSparkPlanExec(
     conf.getConf(SQLConf.ADAPTIVE_CUSTOM_COST_EVALUATOR_CLASS) match {
       case Some(className) =>
         CostEvaluator.instantiate(className, context.session.sparkContext.getConf)
+      case _ if conf.yannakakisRuntimeRevertEnabled =>
+        // The count-join runtime revert (DemoteNonReducingCountJoin) is shuffle-neutral-or-heavier,
+        // so the default shuffle-count cost would never adopt it. This evaluator adds a count-join
+        // tier so the revert is adopted, while staying identical to SimpleCostEvaluator for every
+        // other (count-join-count-neutral) AQE decision. Only installed when revert is enabled.
+        CountJoinAwareCostEvaluator(conf.getConf(SQLConf.ADAPTIVE_FORCE_OPTIMIZE_SKEWED_JOIN))
       case _ => SimpleCostEvaluator(conf.getConf(SQLConf.ADAPTIVE_FORCE_OPTIMIZE_SKEWED_JOIN))
     }
 

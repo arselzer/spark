@@ -2140,3 +2140,31 @@ runtimeRevertReductionFactor against the real 7 wins under CBO so none is revert
 (3) optional secondary divergence guard (stash the static build estimate; revert when materialized
 build >> estimate) if build-vs-probe proves insufficient; (4) a synthetic cardinality-divergence
 integration harness (SF5 uniform data cannot exercise it).
+
+## 2026-06-20 Runtime revert: production ADOPTION solved (CountJoinAwareCostEvaluator), 124/124
+
+Resolved remaining item (1). A reverted plan is NOT shuffle-cheaper (reverting collapses the
+count-join chain back into a multi-way join, usually ADDING shuffles), so AQE's default
+SimpleCostEvaluator never adopts it - confirmed by the prototype. Added CountJoinAwareCostEvaluator
+(sql/core/.../execution/adaptive/countJoinCosting.scala): a lexicographic cost
+(skewJoins, countJoins, shuffles) where the count-join tier sits ABOVE shuffles, so a reverted
+(count-join-free) plan wins even when it has more shuffles.
+
+Why it is safe (the key insight that made this clean): the count-join tier only decides a comparison
+when the two plans differ in COUNT-JOIN COUNT - and the only AQE transform that changes count-join
+count is the revert itself. Skew splitting and partition coalescing are count-join-count-neutral, so
+for them the count-join tier always ties and the cost falls through to shuffles/skew exactly as
+SimpleCostEvaluator - every non-revert AQE decision is bit-identical. (My earlier worry that a
+count-join penalty would bias skew/coalesce was wrong for this reason.)
+
+Wiring: AdaptiveSparkPlanExec installs CountJoinAwareCostEvaluator instead of SimpleCostEvaluator ONLY
+when yannakakisRuntimeRevertEnabled and no explicit custom evaluator class is set. Default off ->
+SimpleCostEvaluator -> upstream behavior bit-for-bit. The e2e test now drives adoption through this
+production path (the test-only PenalizeCountJoinCostEvaluator was deleted). 124/124.
+
+Net feature state (all default-off, end-to-end working via the production path): reversibility (spike)
+-> stash + AQE revert rule (prototype) -> reduction-aware criterion + deterministic proof -> adoption
+via CountJoinAwareCostEvaluator. Remaining to ENABLE in production: calibrate runtimeRevertReduction
+Factor against the real 7 wins under CBO (none must revert) and add a synthetic cardinality-divergence
+harness; the optional static-estimate divergence guard stays a refinement if build-vs-probe proves
+insufficient.

@@ -19,9 +19,6 @@ package org.apache.spark.sql
 
 import java.sql.Date
 
-import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.adaptive.{Cost, CostEvaluator, SimpleCost}
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 import org.apache.spark.sql.execution.joins.{HashCountJoin, SortMergeCountJoinExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -128,16 +125,14 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     // autoBroadcast off so the count-join builds via a shuffle stage (materialized, stats present).
     // End-to-end SMOKE test of the swap mechanism (the reduction criterion itself is proven
     // deterministically in DemoteNonReducingCountJoinSuite). reductionFactor=0.0 + floor=0 make the
-    // revert on this tiny star regardless of its (non-)reduction. The rule computes the revert, but
-    // AQE only ADOPTS a re-optimized plan when cheaper by its CostEvaluator (default = shuffle
-    // count), which the revert does not reduce at comparison time, so a test evaluator that
-    // penalizes count-join execs supplies the adoption signal. Production adoption needs a
-    // flag-gated count-join-aware evaluator (deferred); see the findings doc.
+    // revert fire on this tiny star regardless of its (non-)reduction. Adoption uses the PRODUCTION
+    // path: enabling runtimeRevert auto-installs CountJoinAwareCostEvaluator, whose count-join tier
+    // makes the reverted (count-join-free) plan win even though it is not shuffle-cheaper. No
+    // custom
+    // cost-evaluator class is set here.
     val revertOn = yannakakisOn ++ Seq(
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
-      SQLConf.ADAPTIVE_CUSTOM_COST_EVALUATOR_CLASS.key ->
-        classOf[PenalizeCountJoinCostEvaluator].getName,
       SQLConf.YANNAKAKIS_RUNTIME_REVERT_ENABLED.key -> "true",
       SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS.key -> "0",
       SQLConf.YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR.key -> "0.0")
@@ -2532,20 +2527,5 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     withSQLConf(yannakakisOn: _*) {
       checkAnswer(sql(query), expected)
     }
-  }
-}
-
-/**
- * Test-only AQE cost evaluator that makes a count-join-free plan cheaper, so the runtime revert
- * (DemoteNonReducingCountJoin) is actually ADOPTED. The default SimpleCostEvaluator counts only
- * shuffles, which a revert does not reduce, so it would discard the reverted plan. The production
- * integration needs a real evaluator that prices a count-join's measured (non-)reduction; this
- * stub just heavily penalizes count-join execs to exercise the swap end to end.
- */
-class PenalizeCountJoinCostEvaluator extends CostEvaluator {
-  override def evaluateCost(plan: SparkPlan): Cost = {
-    val countJoins = plan.collect { case p if p.nodeName.contains("CountJoin") => p }.size
-    val shuffles = plan.collect { case s: ShuffleExchangeLike => s }.size
-    SimpleCost(countJoins.toLong * 1000000L + shuffles)
   }
 }
