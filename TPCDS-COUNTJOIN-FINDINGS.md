@@ -2209,3 +2209,33 @@ q11 +66%, q24a +41%, q24b +43%, q25 +89%, q29 +80%, q50 +24%, q64 +62% (matching
 baseline within the iters=1 noise). q8 hits the rule's pre-existing empty.reduceLeft fallback (not a
 win; falls back to the correct original plan, rows match) - graceful degradation, not a regression.
 The shipped default-behavior changes are confirmed regression-free.
+
+## 2026-06-20 #3 DONE: CountJoin wired into AQE OptimizeSkewedJoin (probe-side skew)
+
+Closed the AQE skew gap: OptimizeSkewedJoin now handles ShuffledHashCountJoinExec and
+SortMergeCountJoinExec (they were excluded, so a CountJoin on a skewed key could be slower than the
+vanilla join, which does get split).
+
+Correctness constraint (the key design point): only the PROBE (left) side may be split. A count-join
+streams the probe and builds/counts the right; splitting the build replicates the probe and each
+replica counts only its sub-partition's matches -> PARTIAL counts. Splitting the probe is safe (each
+probe row still sees the full replicated build, so its count stays complete). Implemented via a new
+allowSplitRight param to tryOptimizeJoinChildren (false for count-joins); the existing SMJ/SHJ callers
+keep the default true, so their behavior is unchanged.
+
+Two interactions found by the synthetic-skew test and handled:
+1. A count-join is ALWAYS under an aggregate, so skew-splitting its probe forces a re-cluster shuffle
+   for that aggregate. OptimizeSkewedJoin rejects extra-shuffle skew plans unless
+   spark.sql.adaptive.forceOptimizeSkewedJoin=true (the SPARK-33832 path). So count-join skew relief
+   requires that flag (or a cost-evaluator that deems it worth it) - documented, not auto-forced.
+2. The skew-split input breaks the count-join's whole-stage codegen (generated a malformed method
+   parameter; without skew the same query codegens fine). Fix: supportCodegen = ... && !isSkewJoin on
+   both execs, so a skew-split count-join falls back to the (correct) interpreted path. Skew is
+   exceptional and the split relieves a straggler, so the interpreted cost is well worth it; a
+   codegen path for skew-split count-joins is future work.
+
+Validation: new AdaptiveQueryExecSuite test "CountJoin gets adaptive skew-join handling on the probe
+(left) side" - skewed probe key, count-join gets isSkewJoin=true with results == vanilla. 7/7 skew
+tests (6 existing unaffected by allowSplitRight) and 124/124 count-join correctness (supportCodegen
+change only affects skew-split count-joins; the wins have isSkewJoin=false). Unmeasurable on uniform
+SF5; this is production robustness for skewed-key workloads.

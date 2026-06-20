@@ -69,6 +69,11 @@ case class ShuffledHashCountJoinExec(
   override def output: Seq[Attribute] = left.output ++ Seq(countRight.get.toAttribute) ++
     aggregatesRight.map(_.resultAttribute) ++ groupRight.map(_.toAttribute)
 
+  // A skew-split probe changes the input partitioning the whole-stage codegen assumes; fall back to
+  // the (correct) interpreted path under skew. Skew is exceptional and the split relieves a
+  // straggler, so the interpreted cost is well worth it; a codegen path for skew is future work.
+  override def supportCodegen: Boolean = super.supportCodegen && !isSkewJoin
+
   // The count-join output is left.output ++ count ++ aggResults ++ groupRight - it does NOT
   // include the build (right) join-key attributes, so ShuffledJoin's PartitioningCollection(left,
   // right) would advertise a partitioning on attributes no downstream operator can reference.

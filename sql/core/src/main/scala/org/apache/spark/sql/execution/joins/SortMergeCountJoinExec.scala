@@ -184,7 +184,7 @@ case class SortMergeCountJoinExec(
   // grouping and non-grouping inner paths are supported; non-declarative aggregates fall back to
   // the interpreted evaluator (supportCodegen = false routes doExecute through the factory).
   override def supportCodegen: Boolean =
-    joinType.isInstanceOf[InnerLike] &&
+    joinType.isInstanceOf[InnerLike] && !isSkewJoin &&
       aggregatesRight.forall(_.aggregateFunction.isInstanceOf[DeclarativeAggregate])
 
   // Per-task grouped aggregator (group-key projection + buffer init/eval), built from generated

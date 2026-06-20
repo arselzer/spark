@@ -40,7 +40,7 @@ import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.datasources.noop.NoopDataSource
 import org.apache.spark.sql.execution.datasources.v2.V2TableWriteExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ENSURE_REQUIREMENTS, Exchange, REPARTITION_BY_COL, REPARTITION_BY_NUM, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike, ShuffleOrigin}
-import org.apache.spark.sql.execution.joins.{BaseJoinExec, BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, ShuffledHashJoinExec, ShuffledJoin, SortMergeJoinExec}
+import org.apache.spark.sql.execution.joins.{BaseJoinExec, BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, ShuffledHashCountJoinExec, ShuffledHashJoinExec, ShuffledJoin, SortMergeCountJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.metric.SQLShuffleReadMetricsReporter
 import org.apache.spark.sql.execution.streaming.runtime.{MemoryStream, StreamingQueryWrapper}
 import org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider
@@ -891,6 +891,49 @@ class AdaptiveQueryExecSuite
           val rightJoin = getJoinNode(rightAdaptivePlan)
           checkSkewJoin(rightJoin, 0, 1)
         }
+      }
+    }
+  }
+
+  test("CountJoin gets adaptive skew-join handling on the probe (left) side") {
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.COALESCE_PARTITIONS_MIN_PARTITION_NUM.key -> "1",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "100",
+      SQLConf.SKEW_JOIN_SKEWED_PARTITION_THRESHOLD.key -> "800",
+      SQLConf.ADVISORY_PARTITION_SIZE_IN_BYTES.key -> "800",
+      // A count-join is always under an aggregate, so skew-splitting its probe forces a re-cluster
+      // shuffle for that aggregate; accept it (as SPARK-33832 does) so skew relief still applies.
+      SQLConf.ADAPTIVE_FORCE_OPTIMIZE_SKEWED_JOIN.key -> "true",
+      SQLConf.YANNAKAKIS_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_UNGUARDED_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "false") {
+      withTempView("cjSkewFact", "cjDim") {
+        // Probe (fact) is heavily skewed on the join key (k=249 over-represented); the dim is
+        // uniform. The count-join streams the fact (left) and builds the dim (right), so skew is
+        // on the probe side - exactly the side the wiring is allowed to split.
+        spark.range(0, 1000, 1, 10)
+          .select(
+            when($"id" < 250, 249).when($"id" >= 750, 1000).otherwise($"id").as("k"),
+            $"id".as("v"))
+          .createOrReplaceTempView("cjSkewFact")
+        spark.range(0, 1000, 1, 10).select($"id".as("k")).createOrReplaceTempView("cjDim")
+        val q = "SELECT f.k, count(*) AS c, sum(f.v) AS s FROM cjSkewFact f " +
+          "JOIN cjDim d ON f.k = d.k GROUP BY f.k"
+        val expected = withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+          spark.sql(q).collect().toSeq
+        }
+        val df = spark.sql(q)
+        checkAnswer(df, expected) // results correct with a skew-split count-join
+        val finalPlan = df.queryExecution.executedPlan
+        val countJoins = collect(finalPlan) {
+          case j: ShuffledHashCountJoinExec => j.asInstanceOf[ShuffledJoin]
+          case j: SortMergeCountJoinExec => j.asInstanceOf[ShuffledJoin]
+        }
+        assert(countJoins.nonEmpty, s"expected a count-join in the plan:\n$finalPlan")
+        assert(countJoins.exists(_.isSkewJoin),
+          s"count-join should receive skew handling on the skewed probe:\n$finalPlan")
       }
     }
   }

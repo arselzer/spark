@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.exchange.{ENSURE_REQUIREMENTS, EnsureRequirements, ValidateRequirements}
-import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, SortMergeJoinExec}
+import org.apache.spark.sql.execution.joins.{ShuffledHashCountJoinExec, ShuffledHashJoinExec, SortMergeCountJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
 
@@ -110,9 +110,14 @@ case class OptimizeSkewedJoin(ensureRequirements: EnsureRequirements)
   private def tryOptimizeJoinChildren(
       left: ShuffleQueryStageExec,
       right: ShuffleQueryStageExec,
-      joinType: JoinType): Option[(SparkPlan, SparkPlan)] = {
+      joinType: JoinType,
+      allowSplitRight: Boolean = true): Option[(SparkPlan, SparkPlan)] = {
     val canSplitLeft = canSplitLeftSide(joinType)
-    val canSplitRight = canSplitRightSide(joinType)
+    // A count-join must never split its build (right) side: splitting the build replicates the
+    // probe and each replica counts only its sub-partition's matches, yielding PARTIAL counts.
+    // Splitting the probe (left) side is safe - each probe row still sees the full (replicated)
+    // build, so its count stays complete. Callers for count-joins pass allowSplitRight = false.
+    val canSplitRight = canSplitRightSide(joinType) && allowSplitRight
     if (!canSplitLeft && !canSplitRight) return None
 
     val leftSizes = left.mapStats.get.bytesByPartitionId
@@ -214,6 +219,33 @@ case class OptimizeSkewedJoin(ensureRequirements: EnsureRequirements)
         case (newLeft, newRight) =>
           shj.copy(left = newLeft, right = newRight, isSkewJoin = true)
       }.getOrElse(shj)
+
+    // Count-join variants get the same skew handling as their plain counterparts, but only the
+    // probe (left) side may be split - allowSplitRight = false keeps the build (counted) side
+    // whole so counts stay complete (see tryOptimizeJoinChildren). This closes a gap where a
+    // CountJoin on a skewed probe key was slower than the vanilla join, which does get split.
+    case shcj: ShuffledHashCountJoinExec if !shcj.isSkewJoin =>
+      (shcj.left, shcj.right) match {
+        case (ShuffleStage(left: ShuffleQueryStageExec),
+            ShuffleStage(right: ShuffleQueryStageExec)) =>
+          tryOptimizeJoinChildren(left, right, shcj.joinType, allowSplitRight = false).map {
+            case (newLeft, newRight) =>
+              shcj.copy(left = newLeft, right = newRight, isSkewJoin = true)
+          }.getOrElse(shcj)
+        case _ => shcj
+      }
+
+    case smcj: SortMergeCountJoinExec if !smcj.isSkewJoin =>
+      (smcj.left, smcj.right) match {
+        case (s1 @ SortExec(_, _, ShuffleStage(left: ShuffleQueryStageExec), _),
+            s2 @ SortExec(_, _, ShuffleStage(right: ShuffleQueryStageExec), _)) =>
+          tryOptimizeJoinChildren(left, right, smcj.joinType, allowSplitRight = false).map {
+            case (newLeft, newRight) =>
+              smcj.copy(left = s1.copy(child = newLeft), right = s2.copy(child = newRight),
+                isSkewJoin = true)
+          }.getOrElse(smcj)
+        case _ => smcj
+      }
   }
 
   override def apply(plan: SparkPlan): SparkPlan = {
