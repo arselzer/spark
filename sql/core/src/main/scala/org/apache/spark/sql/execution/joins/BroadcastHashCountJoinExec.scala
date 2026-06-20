@@ -187,10 +187,15 @@ case class BroadcastHashCountJoinExec(
     case _ => false
   }
 
-  // If the streaming side needs to copy result, this join plan needs to copy too. Otherwise,
-  // this join plan only needs to copy result if it may output multiple rows for one input.
+  // If the streaming side needs to copy, this join must too. Otherwise it copies only if it may
+  // output MULTIPLE rows for one input. Unlike a regular join, the count join aggregates its
+  // matches, so a NON-grouped count join emits at most one row per input even with duplicate build
+  // keys (consume() runs once, guarded by `count != 0`). Multiple rows per input require BOTH
+  // grouping (one row per group) AND duplicate keys (>1 match to group), so gate the copy on
+  // groupRight.nonEmpty as well, not duplicate keys alone.
   override def needCopyResult: Boolean =
-    streamedPlan.asInstanceOf[CodegenSupport].needCopyResult || multipleOutputForOneInput
+    streamedPlan.asInstanceOf[CodegenSupport].needCopyResult ||
+      (groupRight.nonEmpty && multipleOutputForOneInput)
 
   /**
    * Returns a tuple of Broadcast of HashedRelation and the variable name for it.

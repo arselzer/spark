@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical._
-import org.apache.spark.sql.execution.{RowIterator, SparkPlan}
+import org.apache.spark.sql.execution.{CodegenSupport, RowIterator, SparkPlan}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.util.collection.{BitSet, OpenHashSet}
 
@@ -357,7 +357,15 @@ case class ShuffledHashCountJoinExec(
     streamedPlan.execute() :: buildPlan.execute() :: Nil
   }
 
-  override def needCopyResult: Boolean = true
+  // Unlike a regular shuffled hash join (which fans out on duplicate build keys and so must always
+  // copy), the count join AGGREGATES its matches: a NON-grouped count join emits at most one row
+  // per stream input row (consume() runs once, guarded by `count != 0`; the match loop accumulates
+  // the count). Multiple output rows per input occur ONLY when grouping (one row per group). So the
+  // copy is needed only for the grouped case (or if the streamed side needs it). This discriminator
+  // is grouping-based (known at plan time), not key-uniqueness-based (which a shuffled build cannot
+  // determine), so it is safe where the standard shuffled join conservatively copies always.
+  override def needCopyResult: Boolean =
+    streamedPlan.asInstanceOf[CodegenSupport].needCopyResult || groupRight.nonEmpty
 
   protected override def prepareRelation(ctx: CodegenContext): HashedRelationInfo = {
     val thisPlan = ctx.addReferenceObj("plan", this)
