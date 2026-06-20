@@ -1972,7 +1972,15 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
 
     if (conf.yannakakisCostGateEnabled) {
       val hg = new Hypergraph(items, conditions)
-      if (costGateSkips(items, conditions, hg, skipNonExpanding = true)) {
+      // Decorating pre-aggregate aggregates BEFORE the dimension join, so the CountJoin-specific
+      // unique-side skip (allEquiJoinsHaveUniqueSide, part of costGateSkips' skipNonExpanding arm)
+      // must NOT apply here: a non-expanding FK/dimension join can still benefit from early
+      // aggregation (q4/q11 collapse the fact 10x+ before a broadcast dimension join). With column
+      // NDV stats that unique-side arm would otherwise skip the q4/q11 pre-agg win. Keep only the
+      // broadcast-friendliness (skipNonExpanding=false) and dominated-by-one-large-input guards.
+      val nearOptimal = costGateSkips(items, conditions, hg, skipNonExpanding = false) ||
+        dominatedByOneLargeInput(items, hg)
+      if (nearOptimal) {
         debugLog("cost gate: vanilla near-optimal for decorating-dimension " +
           "pre-aggregate - keeping original plan")
         return None

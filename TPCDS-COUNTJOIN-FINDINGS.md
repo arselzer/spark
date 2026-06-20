@@ -1879,3 +1879,32 @@ Implication: a production system with CBO stats would (a) gain nothing from the 
 (now off) and (b) LOSE q4/q11 to the pre-agg FK-uniqueness gate. The next concrete work (ranked by
 the investigation) is: CONFIRM the q4/q11 flip empirically (stats-injected test), then make the
 pre-agg gate aggregate-aware so q4/q11 survive ANALYZE'd stats - the only real threat to the wins.
+
+## 2026-06-20 FIX: pre-agg gate no longer applies the CountJoin unique-side skip
+
+Confirmed the q4/q11 risk empirically: under injectStats (NDV present) the applicability report shows
+q4 and q11 as gate=cost-gate-SKIPS. The decorating pre-agg gate (RewriteJoinsAsSemijoins.scala:1973)
+reused costGateSkips(..., skipNonExpanding=true), whose arm includes allEquiJoinsHaveUniqueSide - a
+CountJoin-specific signal: a non-expanding FK/dimension join means a CountJoin adds no fan-out
+reduction, but a DECORATING PRE-AGGREGATE still helps because it aggregates BEFORE the dimension
+join. So that arm wrongly skips the q4/q11 pre-agg win once column NDV stats make it fire.
+
+Fix: at the pre-agg gate, use costGateSkips(skipNonExpanding=false) (drops the unique-side arm) plus
+dominatedByOneLargeInput explicitly. I.e. drop ONLY the unique-side CountJoin skip; keep the
+broadcast-friendliness and dominated-by-one-large-input guards.
+
+Why keep dominated/broadcast (not the full "no gate for pre-agg"): those size-based arms are what
+gate-skip q34's BAD pre-agg (386x expansion) on the current benchmark - and the pre-agg's own
+row-expansion guard (:2008) cannot catch q34 because planning stats underestimate the expansion. So
+dropping them would REGRESS q34. The unique-side arm, by contrast, is inert without NDV (no
+regression on the stats-less benchmark; correctness 119/119; applicability skip-count unchanged at
+104) and only matters under CBO - exactly where it was harming q4/q11.
+
+Remaining gap (documented, not fully fixed): under CBO stats, q4/q11 could still be skipped by the
+broadcast (arm1) or dominated arms if those happen to fire on their star. The principled complete fix
+is an AGGREGATE-AWARE pre-agg gate that decides on the pre-agg's estimated ROW REDUCTION (which
+separates q4 'reduces 10x' from q34 'expands 386x'), rather than CountJoin join-shape proxies. That
+is the same class as the q15/q69 issue and is entangled with q34's stats-underestimated backstop, so
+it needs a plan-level test harness under stats (the applicability suite is CountJoin-marker-based and
+cannot observe pre-agg firing). This fix removes the one clearly-wrong arm safely; the rest is
+deferred.
