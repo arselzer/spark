@@ -2239,3 +2239,21 @@ Validation: new AdaptiveQueryExecSuite test "CountJoin gets adaptive skew-join h
 tests (6 existing unaffected by allowSplitRight) and 124/124 count-join correctness (supportCodegen
 change only affects skew-split count-joins; the wins have isSkewJoin=false). Unmeasurable on uniform
 SF5; this is production robustness for skewed-key workloads.
+
+## 2026-06-20 JOB (Join Order Benchmark) results: strong wins on the target workload
+
+Staged the IMDB May-2013 CSV snapshot (imdb.tgz, 3.7GB) -> parquet (1.8GB, 21 tables, cast_info
+36.2M / movie_info 14.8M / name 4.2M / title 2.5M rows) via the new IMDBSetupSuite (parses the
+gregrahn schema.sql for columns, reads the PostgreSQL-COPY CSVs). Ran the existing JOBBenchmarkSuite
+(rewrite on vs off), 3/3 tests pass:
+
+JOB-BENCH (yannakakis on vs off, all applied=true match=true):
+  1a 1.15x | 3a 1.11x | 6a 2.13x | 8a 1.01x | 16a 2.79x | 17a 3.66x | 26a 0.88x | 33a 1.44x
+7/8 win, big on the heavy many-way joins (6a/16a/17a), one slight loss (26a). Results match vanilla.
+JOB-CG (count-join codegen vs interpreted): codegen consistently faster (17a interp 25.6s ->
+codegen 13.4s), cg-marker=true, match=true.
+JOB-GCG (grouped count-join codegen): grouping count-joins codegen, match=true.
+
+This is a much stronger validation than TPC-DS (net wins ~1.2-1.9x): JOB's deep many-way joins are the
+count-join/Yannakakis ideal, and the rewrite delivers 2-3.7x on the heavy queries with correct
+results. IMDB data + JOB queries reproduced via IMDBSetupSuite + gregrahn/join-order-benchmark.
