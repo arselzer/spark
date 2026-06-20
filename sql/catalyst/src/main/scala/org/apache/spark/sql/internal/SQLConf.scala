@@ -3662,12 +3662,12 @@ object SQLConf {
 
   val YANNAKAKIS_RUNTIME_REVERT_ENABLED =
     buildConf("spark.sql.yannakakis.runtimeRevertEnabled")
-      .doc("PROTOTYPE. When AQE is on, allow the count-join rewrite to be reverted at runtime " +
-        "back to the original Aggregate-over-Join when materialized stage statistics show the " +
-        "count-join is non-reducing (the rewrite stashes the original subtree via a tree-node " +
-        "tag, and an AQE re-optimization rule swaps it back). This is the only layer that sees " +
-        "TRUE materialized cardinality, which planning-time stats cannot. Default off; the " +
-        "revert criterion is still a placeholder (see runtimeRevertMinBuildRows)")
+      .doc("When AQE is on, allow the count-join rewrite to be reverted at runtime back to the " +
+        "original Aggregate-over-Join when materialized stage statistics show the count-join is " +
+        "non-reducing (the rewrite stashes the original subtree via a tree-node tag, and an AQE " +
+        "re-optimization rule swaps it back). This is the only layer that sees TRUE materialized " +
+        "cardinality, which planning-time stats cannot. Default off; enable with a finite " +
+        "runtimeRevertMinBuildRows floor. The reduction factor needs calibration before production")
       .version("4.1.0")
       .internal()
       .booleanConf
@@ -3675,15 +3675,27 @@ object SQLConf {
 
   val YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS =
     buildConf("spark.sql.yannakakis.runtimeRevertMinBuildRows")
-      .doc("PROTOTYPE placeholder criterion for runtimeRevertEnabled: revert a count-join when " +
-        "its materialized build-side row count is at least this value. Defaults to Long.MaxValue " +
-        "(never reverts). NOTE: build size alone is NOT the right signal (the verified wins have " +
-        "large but REDUCING builds); the production criterion must compare materialized build/" +
-        "output rows against the rewrite break-even. Used low in tests to exercise the swap")
+      .doc("Floor for runtimeRevertEnabled: never revert a count-join whose materialized build " +
+        "row count is below this value (small builds are cheap; not worth reverting). Defaults " +
+        "to Long.MaxValue so the feature is inert until lowered. Above the floor, the revert " +
+        "uses the reduction test (see runtimeRevertReductionFactor), not build size alone")
       .version("4.1.0")
       .internal()
       .longConf
       .createWithDefault(Long.MaxValue)
+
+  val YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR =
+    buildConf("spark.sql.yannakakis.runtimeRevertReductionFactor")
+      .doc("Reduction criterion for runtimeRevertEnabled (above the runtimeRevertMinBuildRows " +
+        "floor): revert a count-join when its materialized build row count is at least this " +
+        "of its materialized probe (stream) row count - i.e. the build did NOT collapse fan-out " +
+        "relative to the probe, so it pays a large build cost for little reduction. The verified " +
+        "wins build a small dimension against a large fact probe (build << probe), so they stay " +
+        "below this and are never reverted. Needs calibration before enabling in production")
+      .version("4.1.0")
+      .internal()
+      .doubleConf
+      .createWithDefault(1.0)
 
   val YANNAKAKIS_CYCLIC_BAGS_ENABLED =
     buildConf("spark.sql.yannakakis.cyclicBagsEnabled")
@@ -7495,6 +7507,9 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
 
   def yannakakisRuntimeRevertMinBuildRows: Long =
     getConf(SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS)
+
+  def yannakakisRuntimeRevertReductionFactor: Double =
+    getConf(SQLConf.YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR)
 
   def yannakakisCyclicBagsEnabled: Boolean =
     getConf(SQLConf.YANNAKAKIS_CYCLIC_BAGS_ENABLED)

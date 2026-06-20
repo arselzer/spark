@@ -2103,3 +2103,40 @@ criterion (the placeholder build-rows threshold -> real break-even) and confirm 
 under CBO; (3) a synthetic cardinality-divergence harness (SF5 uniform data cannot exercise it). The
 hard feasibility questions (reversibility, stash durability, schema-safe swap, stats availability,
 adoption mechanism) are all answered YES.
+
+## 2026-06-20 Runtime revert: production criterion (reduction-aware) + deterministic proof (124/124)
+
+Replaced the prototype's placeholder criterion (build size alone, which would revert the reducing
+wins) with a REDUCTION-AWARE, NDV-free criterion, and added the load-bearing deterministic test.
+
+Criterion (DemoteNonReducingCountJoin.isNonReducing): revert a count-join only when its materialized
+BUILD (right) row count is >= the runtimeRevertMinBuildRows floor AND did not collapse fan-out
+relative to its materialized PROBE (left), i.e. buildRows >= probeRows * runtimeRevertReductionFactor.
+Uses only rowCount (runtime stage stats carry no NDV - ShuffleExchangeExec.runtimeStatistics omits
+attributeStats). The verified wins build a small dimension against a large fact probe (build << probe)
+so they are NEVER reverted; the q2/q34 pathology (a big build chosen on a stale estimate) is. Missing
+row counts (stage not yet materialized) never revert - the chance recurs on the next pass.
+
+Config: YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR (double, default 1.0) added; MIN_BUILD_ROWS is now
+the floor (default Long.MaxValue = inert); ENABLED default off. Feature stays default-safe.
+
+Proof: DemoteNonReducingCountJoinSuite (new, no SparkSession/AQE) drives the criterion on hand-built
+CountJoins with stubbed rowCounts: reverts non-reducing (build 10.8M, probe 10k); KEEPS reducing
+(build 5k, probe 10M = the 7-wins shape); keeps below floor; no-op when disabled. The e2e
+YannakakisCorrectnessSuite prototype test now uses the reduction knobs (forced via factor 0.0) and
+remains a swap-mechanism smoke test. 124/124 (120 correctness incl. e2e + 4 unit).
+
+KEY caveat that contradicts the design synthesis: the synthesis assumed the revert is shuffle-neutral
+so AQE's default equal-cost tie-break would adopt it WITHOUT a custom cost evaluator. The prototype
+empirically REFUTED this - the first run (default evaluator) computed the revert but AQE DISCARDED it
+(the reverted plan was not cheaper by shuffle count at comparison time). So the e2e test still needs
+the test PenalizeCountJoinCostEvaluator for adoption. Therefore production ADOPTION needs a flag-gated
+(installed only when runtimeRevertEnabled, never global) count-join-aware CostEvaluator that makes a
+reverted plan win; a global one biases skew/coalesce on unrelated queries and must be avoided.
+
+Remaining before enabling in production (all gated, default-off until then): (1) the flag-gated
+adoption CostEvaluator (the criterion alone reverts but AQE will not adopt without it); (2) calibrate
+runtimeRevertReductionFactor against the real 7 wins under CBO so none is reverted while q2/q34 are;
+(3) optional secondary divergence guard (stash the static build estimate; revert when materialized
+build >> estimate) if build-vs-probe proves insufficient; (4) a synthetic cardinality-divergence
+integration harness (SF5 uniform data cannot exercise it).

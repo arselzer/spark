@@ -126,17 +126,21 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     }
     // With AQE + revert + threshold 0, the materialized build triggers a swap back to the original.
     // autoBroadcast off so the count-join builds via a shuffle stage (materialized, stats present).
-    // The rule computes the revert, but AQE only ADOPTS a re-optimized plan when it is cheaper by
-    // its CostEvaluator (default = shuffle count), which a revert does not reduce. So the revert's
-    // real integration point is the cost model: a custom evaluator that prices the count-join's
-    // (non-)reduction. Here a test evaluator penalizes count-join execs so the reverted plan wins.
+    // End-to-end SMOKE test of the swap mechanism (the reduction criterion itself is proven
+    // deterministically in DemoteNonReducingCountJoinSuite). reductionFactor=0.0 + floor=0 make the
+    // revert on this tiny star regardless of its (non-)reduction. The rule computes the revert, but
+    // AQE only ADOPTS a re-optimized plan when cheaper by its CostEvaluator (default = shuffle
+    // count), which the revert does not reduce at comparison time, so a test evaluator that
+    // penalizes count-join execs supplies the adoption signal. Production adoption needs a
+    // flag-gated count-join-aware evaluator (deferred); see the findings doc.
     val revertOn = yannakakisOn ++ Seq(
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
       SQLConf.ADAPTIVE_CUSTOM_COST_EVALUATOR_CLASS.key ->
         classOf[PenalizeCountJoinCostEvaluator].getName,
       SQLConf.YANNAKAKIS_RUNTIME_REVERT_ENABLED.key -> "true",
-      SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS.key -> "0")
+      SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS.key -> "0",
+      SQLConf.YANNAKAKIS_RUNTIME_REVERT_REDUCTION_FACTOR.key -> "0.0")
     withSQLConf(revertOn: _*) {
       val df = sql(q)
       checkAnswer(df, expected) // correctness preserved across the swap
