@@ -1757,3 +1757,19 @@ and this measured evidence are preserved here so the AQE approach can build on t
   q34-class pre-agg expansion and the q15/q69 capture both need AQE/runtime adaptivity, not static
   stats. Net: the one clean STRUCTURAL bug (Mode A) is fixed; the remaining slowdowns/speedups are
   fundamentally cost-estimation problems that require runtime adaptivity, not more static gating.
+
+### Final validation: full base,forced,prod re-sweep on the committed branch
+
+Re-ran the full sweep (72 firing + control, warm-min) on the committed branch (Mode A) to validate
+end-to-end. Tally: WIN=7, changed~neutral=4, gate-skip=57, same-shape=9, REGRESSIONS=0 (77 queries).
+
+- All 7 production wins hold: q25 +89%, q29 +79%, q11 +67%, q64 +62%, q4 +55%, q24b +44%, q24a +38%
+  (minor warm-min variation vs the pre-optimization sweep; all solidly winning).
+- Mode A confirmed for ALL affected queries: q72/q94/q95 forced now == base (+4%/+4%/+1%, reclassified
+  from gate-skip-with-slow-forced to neutral/same-shape). The -79%/-82%/-68% forced slowdowns are
+  gone.
+- 0 production regressions; the only timeouts are the expected q24a/q24b FORCED pre-agg probes (the
+  catastrophic shape the prod guard avoids - unchanged, and not a path Mode A touches).
+
+The branch is production-safe: Mode A is a pure robustness improvement (worst-case forced slowdowns
+reduced) with zero change to the production win set.
