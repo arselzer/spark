@@ -2061,3 +2061,45 @@ Remaining risks to PROTOTYPE before committing to the full rule (none look like 
 Bottom line: the highest-value direction is UNBLOCKED. Next concrete step is a minimal prototype
 (TreeNodeTag stash + a test-flag-gated always-revert rule + correctness run to prove the swap is
 schema-safe and correct), then the real cost criterion + a synthetic cardinality-divergence harness.
+
+## 2026-06-20 Runtime keep-or-revert PROTOTYPE - works end to end (120/120)
+
+Built and validated the prototype. It works, and it surfaced the real integration point.
+
+Pieces:
+- Flags (both default-safe): YANNAKAKIS_RUNTIME_REVERT_ENABLED (off), YANNAKAKIS_RUNTIME_REVERT_MIN_
+  BUILD_ROWS (Long.MaxValue = never revert). Accessors in SQLConf.
+- Stash: RewriteJoinsAsSemijoins.ORIGINAL_PLAN_TAG (TreeNodeTag[LogicalPlan]); apply() tags each
+  rewritten subtree's root with the original Aggregate via stashOriginal (only when revert enabled).
+- AQE rule: DemoteNonReducingCountJoin (new), registered as a batch in AQEOptimizer right after
+  Dynamic Join Selection. It reverts a tagged subtree to its stashed original when a count-join in it
+  has a materialized build row count >= the threshold.
+- Test: "PROTOTYPE: AQE runtime revert ..." in YannakakisCorrectnessSuite, plus a test-only
+  PenalizeCountJoinCostEvaluator. 120/120 (119 prior + this).
+
+What the prototype PROVED (each verified, not assumed):
+1. Stash durability: the tag SURVIVES into AQE re-optimization (reOptimize runs on
+   inputPlan.logicalLink with stages spliced in, AdaptiveSparkPlanExec.scala:277/355, so the original
+   tagged nodes are reused). Diagnostics showed taggedNodes=List(Aggregate) inside the AQE rule.
+2. Materialized stats reach the rule: the count-join build row counts were observed as Some(3) once
+   the build stages materialized.
+3. Schema-safe swap + correctness: with the revert adopted, the FINAL plan became plain SortMergeJoins
+   with the original aggregate (sum(v), count(1)), and checkAnswer matched vanilla. Bonus: the revert
+   REUSES the already-materialized exchanges (ReusedExchange), so it does not re-shuffle.
+
+THE KEY REFINEMENT (the real integration point): AQE only ADOPTS a re-optimized plan when it is
+cheaper by its CostEvaluator (AdaptiveSparkPlanExec.scala:359-362), and the default SimpleCostEvaluator
+prices only shuffle count - which a revert does not reduce. So the rule computed the revert but AQE
+DISCARDED it until a custom CostEvaluator made the count-join-free plan cheaper. Therefore the
+production decision belongs in a CostEvaluator (spark.sql.adaptive.customCostEvaluatorClass), not only
+in the rule: it must price a count-join's MEASURED (non-)reduction so non-reducing rewrites lose to
+their reverted form while the 7 reducing wins keep winning. The rule supplies the alternative; the
+cost model picks.
+
+Remaining production work (clear path, not blockers): (1) a reduction-aware CostEvaluator that, from
+materialized stage stats, charges a count-join exec by how little it reduces (build rows vs output
+rows) so the 7 wins are never reverted and q2/q34-class non-reducers are; (2) calibrate the rule's
+criterion (the placeholder build-rows threshold -> real break-even) and confirm against the 7 wins
+under CBO; (3) a synthetic cardinality-divergence harness (SF5 uniform data cannot exercise it). The
+hard feasibility questions (reversibility, stash durability, schema-safe swap, stats availability,
+adoption mechanism) are all answered YES.

@@ -30,7 +30,7 @@ import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftAnti, LeftOute
 import org.apache.spark.sql.catalyst.plans.{FullOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.catalyst.trees.TreePattern
+import org.apache.spark.sql.catalyst.trees.{TreeNodeTag, TreePattern}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.types.DecimalType.DoubleDecimal
@@ -46,6 +46,24 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
 
   private val MinWideDecoratingGroupRefs = 6
   private val MaxDecoratingPreAggExpansion = BigInt(48)
+
+  /**
+   * Stash for the original Aggregate-over-join subtree, set on the rewritten subtree's root when
+   * runtime revert is enabled. An AQE re-optimization rule (DemoteNonReducingCountJoin) reads this
+   * to swap the rewrite back to the original when materialized stats show it is non-reducing - the
+   * only layer that sees true cardinality. Retain-original avoids reconstructing a join from the
+   * (possibly chained) CountJoin carrier fields.
+   */
+  val ORIGINAL_PLAN_TAG: TreeNodeTag[LogicalPlan] =
+    TreeNodeTag[LogicalPlan]("yannakakis_original_plan")
+
+  /** Tags the rewritten subtree with its original Aggregate so AQE can revert it at runtime. */
+  private def stashOriginal(original: Aggregate, rewritten: LogicalPlan): LogicalPlan = {
+    if (conf.yannakakisRuntimeRevertEnabled && !(rewritten eq original)) {
+      rewritten.setTagValue(ORIGINAL_PLAN_TAG, original)
+    }
+    rewritten
+  }
 
   /**
    * Cost gate for the count-join rewrite. Returns true when vanilla Spark would broadcast
@@ -1288,18 +1306,21 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
         join@Join(_, _, LeftOuter | RightOuter | FullOuter, _, _)), _) =>
           // LEFT/RIGHT/FULL OUTER: split into a matched (inner) half plus one anti half per
           // null-extended side, and merge per group. Falls back to `agg` on any unsupported shape.
-          tryRewriteOuter(agg, groupingExpressions, aggExpressions, projectList, join)
-            .getOrElse(agg)
+          stashOriginal(agg,
+            tryRewriteOuter(agg, groupingExpressions, aggExpressions, projectList, join)
+              .getOrElse(agg))
         case agg@Aggregate(groupingExpressions, aggExpressions,
         join@Join(_, _, LeftOuter | RightOuter | FullOuter, _, _), _) =>
-          tryRewriteOuter(agg, groupingExpressions, aggExpressions, join.output, join)
-            .getOrElse(agg)
+          stashOriginal(agg,
+            tryRewriteOuter(agg, groupingExpressions, aggExpressions, join.output, join)
+              .getOrElse(agg))
         case agg@Aggregate(groupingExpressions, aggExpressions,
         project@Project(projectList,
         join@Join(_, _, _: InnerLike, _, _)), _) =>
           // InnerLike also matches Cross: a cross join whose join predicates were normalised into
           // its condition (or that has none) is semantically an inner join here.
-          rewriteOrFallback(agg, groupingExpressions, aggExpressions, projectList, join)
+          stashOriginal(agg,
+            rewriteOrFallback(agg, groupingExpressions, aggExpressions, projectList, join))
         case agg@Aggregate(groupingExpressions, aggExpressions,
         join@Join(_, _, _: InnerLike, _, _), _) =>
           // No Project wrapper (e.g. column pruning removed a redundant one): the aggregate
@@ -1309,7 +1330,8 @@ object RewriteJoinsAsSemijoins extends Rule[LogicalPlan]
           // pushed single-relation filters below it, so folding a surviving Filter back into the
           // join condition would risk dropping a single-relation predicate (the hypergraph only
           // models equi-edges and multi-relation filters), a silent wrong result.
-          rewriteOrFallback(agg, groupingExpressions, aggExpressions, join.output, join)
+          stashOriginal(agg,
+            rewriteOrFallback(agg, groupingExpressions, aggExpressions, join.output, join))
         case agg@Aggregate(_, _, _, _) =>
           debugLog("not applicable to aggregate: " + agg)
           agg

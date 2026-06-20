@@ -19,6 +19,9 @@ package org.apache.spark.sql
 
 import java.sql.Date
 
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.adaptive.{Cost, CostEvaluator, SimpleCost}
+import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 import org.apache.spark.sql.execution.joins.{HashCountJoin, SortMergeCountJoinExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -102,6 +105,49 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
       checkAnswer(df3, e3)
       assert(df3.queryExecution.optimizedPlan.toString.contains("CountJoin"),
         "gate should KEEP the multi-way (degree-3) fan-out star")
+    }
+  }
+
+  test("PROTOTYPE: AQE runtime revert swaps a non-reducing count-join back to the original") {
+    // Multi-way star so the rewrite fires (gate off in this suite); counting aggregates.
+    Seq((1, 10.0), (1, 20.0), (2, 30.0)).toDF("k", "v").createOrReplaceTempView("rv_fact")
+    Seq(1, 1, 2).toDF("k").createOrReplaceTempView("rv_d1")
+    Seq(1, 2, 2).toDF("k").createOrReplaceTempView("rv_d2")
+    val q = "select f.k, sum(f.v) as s, count(*) as c from rv_fact f " +
+      "join rv_d1 d1 on f.k = d1.k join rv_d2 d2 on f.k = d2.k group by f.k"
+    var expected: Seq[Row] = null
+    withSQLConf(SQLConf.YANNAKAKIS_ENABLED.key -> "false") {
+      expected = sql(q).collect().toSeq
+    }
+    // Precondition: the rewrite fires (count-join present) when revert is not engaged.
+    withSQLConf(yannakakisOn: _*) {
+      assert(sql(q).queryExecution.optimizedPlan.toString.contains("CountJoin"),
+        "precondition: the rewrite should fire on this star")
+    }
+    // With AQE + revert + threshold 0, the materialized build triggers a swap back to the original.
+    // autoBroadcast off so the count-join builds via a shuffle stage (materialized, stats present).
+    // The rule computes the revert, but AQE only ADOPTS a re-optimized plan when it is cheaper by
+    // its CostEvaluator (default = shuffle count), which a revert does not reduce. So the revert's
+    // real integration point is the cost model: a custom evaluator that prices the count-join's
+    // (non-)reduction. Here a test evaluator penalizes count-join execs so the reverted plan wins.
+    val revertOn = yannakakisOn ++ Seq(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+      SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.ADAPTIVE_CUSTOM_COST_EVALUATOR_CLASS.key ->
+        classOf[PenalizeCountJoinCostEvaluator].getName,
+      SQLConf.YANNAKAKIS_RUNTIME_REVERT_ENABLED.key -> "true",
+      SQLConf.YANNAKAKIS_RUNTIME_REVERT_MIN_BUILD_ROWS.key -> "0")
+    withSQLConf(revertOn: _*) {
+      val df = sql(q)
+      checkAnswer(df, expected) // correctness preserved across the swap
+      // Inspect the FINAL adaptive plan only (executedPlan.collect descends into the current/final
+      // physical plan, not the retained "== Initial Plan ==" display string).
+      val countJoinsInFinal = df.queryExecution.executedPlan.collect {
+        case p if p.nodeName.contains("CountJoin") => p.nodeName
+      }
+      assert(countJoinsInFinal.isEmpty,
+        s"revert should have removed the count-join from the final plan, found: " +
+          s"$countJoinsInFinal\n${df.queryExecution.executedPlan}")
     }
   }
 
@@ -2482,5 +2528,20 @@ class YannakakisCorrectnessSuite extends QueryTest with SharedSparkSession {
     withSQLConf(yannakakisOn: _*) {
       checkAnswer(sql(query), expected)
     }
+  }
+}
+
+/**
+ * Test-only AQE cost evaluator that makes a count-join-free plan cheaper, so the runtime revert
+ * (DemoteNonReducingCountJoin) is actually ADOPTED. The default SimpleCostEvaluator counts only
+ * shuffles, which a revert does not reduce, so it would discard the reverted plan. The production
+ * integration needs a real evaluator that prices a count-join's measured (non-)reduction; this
+ * stub just heavily penalizes count-join execs to exercise the swap end to end.
+ */
+class PenalizeCountJoinCostEvaluator extends CostEvaluator {
+  override def evaluateCost(plan: SparkPlan): Cost = {
+    val countJoins = plan.collect { case p if p.nodeName.contains("CountJoin") => p }.size
+    val shuffles = plan.collect { case s: ShuffleExchangeLike => s }.size
+    SimpleCost(countJoins.toLong * 1000000L + shuffles)
   }
 }
