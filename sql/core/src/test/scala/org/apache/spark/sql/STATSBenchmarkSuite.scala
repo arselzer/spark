@@ -137,19 +137,29 @@ class STATSBenchmarkSuite extends QueryTest with SharedSparkSession {
     val offTimeout = sys.env.getOrElse("STATS_OFF_TIMEOUT", "15").toInt
     val onTimeout = sys.env.getOrElse("STATS_ON_TIMEOUT", "60").toInt
 
+    // Gate-ON config = prod: the cost gate decides keep-vs-skip. Comparing to the unguarded run
+    // shows whether the gate skips the count-join-overhead LOSERS while keeping the WINS.
+    val gateOnConf = onConf :+ (SQLConf.YANNAKAKIS_COST_GATE_ENABLED.key -> "true")
     var rewritten = 0
     var mismatches = 0
     var offDNF = 0
     var onDNF = 0
-    val speedups = scala.collection.mutable.ArrayBuffer[Double]() // only where both finished
+    var gateKept = 0
+    var gateMissedSkipLoser = 0 // gate KEPT a query the unguarded rewrite made >=1.1x slower
+    var gateLostWinner = 0      // gate SKIPPED a clear win (unguarded >=1.3x or vanilla-DNF)
+    val speedups = scala.collection.mutable.ArrayBuffer[Double]()      // unguarded, both finished
+    val gatedSpeedups = scala.collection.mutable.ArrayBuffer[Double]() // prod (gate decides)
     // scalastyle:off println
     println(s"=== STATS-CEB: ${queries.size} queries, vanilla(<=${offTimeout}s) vs rewrite ===")
     queries.zipWithIndex.foreach { case ((name, q), idx) =>
-      val fired =
-        try withSQLConf(onConf: _*) {
+      def planHasCountJoin(conf: Seq[(String, String)]): Boolean =
+        try withSQLConf(conf: _*) {
           sql(q).queryExecution.optimizedPlan.toString.contains("CountJoin")
         } catch { case _: Throwable => false }
+      val fired = planHasCountJoin(onConf)
+      val gateKeeps = fired && planHasCountJoin(gateOnConf)
       if (fired) rewritten += 1
+      if (gateKeeps) gateKept += 1
       val on = runCount(onConf, q, onTimeout, "on")
       val off = runCount(offConf, q, offTimeout, "off")
       if (off.isEmpty) offDNF += 1
@@ -159,22 +169,35 @@ class STATSBenchmarkSuite extends QueryTest with SharedSparkSession {
           mismatches += 1; println(f"  MISMATCH $name: off=$vc on=$oc")
         case _ =>
       }
-      val spStr = (off, on) match {
-        case (Some((_, vMs)), Some((_, oMs))) =>
-          val sp = if (oMs == 0) 1.0 else vMs.toDouble / oMs.toDouble
-          speedups += sp; f"$sp%5.2fx"
-        case (None, Some(_)) => "vanilla-DNF (win)"
-        case _ => "-"
+      // Unguarded speedup, and the prod (gated) speedup: if the gate skips, prod == vanilla (1.0);
+      // if it keeps, prod == the unguarded rewrite. Classify gate decisions against the outcome.
+      val unguarded: Option[Double] = (off, on) match {
+        case (Some((_, vMs)), Some((_, oMs))) => Some(vMs.toDouble / math.max(1, oMs))
+        // vanilla DNF: lower-bound the speedup at timeout/on-ms.
+        case (None, Some(_)) => Some(offTimeout * 1000.0 / math.max(1, on.get._2))
+        case _ => None
       }
+      unguarded.foreach { sp =>
+        if (off.isDefined && on.isDefined) speedups += sp
+        gatedSpeedups += (if (gateKeeps) sp else 1.0)
+        val isLoser = off.isDefined && on.isDefined && sp <= 0.9
+        val isWinner = sp >= 1.3 || off.isEmpty
+        if (isLoser && gateKeeps) gateMissedSkipLoser += 1
+        if (isWinner && !gateKeeps) gateLostWinner += 1
+      }
+      val spStr = unguarded.map(s => if (off.isEmpty) "vanilla-DNF" else f"$s%.2fx").getOrElse("-")
       val offStr = off.map(r => s"${r._2}ms").getOrElse(s"DNF>${offTimeout}s")
       val onStr = on.map(r => s"${r._2}ms").getOrElse(s"DNF>${onTimeout}s")
       println(f"STATS-Q ${idx + 1}%3d/${queries.size} $name%-5s fired=$fired%-5s " +
-        f"off=$offStr%-9s on=$onStr%-9s sp=$spStr")
+        f"gateKeeps=$gateKeeps%-5s off=$offStr%-9s on=$onStr%-9s sp=$spStr")
     }
-    println(f"STATS-CEB: ${queries.size} queries | rewritten=$rewritten | " +
+    println(f"STATS-CEB: ${queries.size} queries | rewritten=$rewritten | gateKept=$gateKept | " +
       f"vanilla-DNF(>${offTimeout}s)=$offDNF | rewrite-DNF=$onDNF | mismatches=$mismatches")
     println(f"STATS-CEB: geomean speedup where BOTH finished (n=${speedups.size}) = " +
       f"${geomean(speedups.toSeq)}%.2fx ; vanilla DID-NOT-FINISH on $offDNF/${queries.size}")
+    println(f"STATS-CEB GATE: prod geomean (gate decides, n=${gatedSpeedups.size}) = " +
+      f"${geomean(gatedSpeedups.toSeq)}%.2fx | gate KEPT a loser: $gateMissedSkipLoser | " +
+      f"gate SKIPPED a winner: $gateLostWinner")
     // scalastyle:on println
     assert(mismatches == 0, s"$mismatches STATS queries gave a different count under the rewrite")
   }
