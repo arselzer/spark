@@ -1773,3 +1773,35 @@ end-to-end. Tally: WIN=7, changed~neutral=4, gate-skip=57, same-shape=9, REGRESS
 
 The branch is production-safe: Mode A is a pure robustness improvement (worst-case forced slowdowns
 reduced) with zero change to the production win set.
+
+## 2026-06-20 SHIPPED: q50 no-op PK-FK dimension elimination
+
+Implemented optimization #1 from the further-optimizations investigation (the top-ranked item).
+
+What: before hypertree construction, drop a dimension joined only on its provably-unique (PK) key to
+a provably non-null fact FK when (a) no dimension attribute is referenced by grouping/aggregates/
+projection/other joins and (b) the dimension is UNFILTERED (only isnotnull(key) predicates). Such an
+inner join is row-preserving (1:1) and never read - a semantic no-op - so removing it avoids a
+gratuitous existence stream. q50's store_sales -> unfiltered date_dim d1 pass (the documented 13.3M-
+row stream, cjOut==shuffleRecords) is exactly this shape. Code: eliminateNoOpDimensions in
+RewriteJoinsAsSemijoins.scala, called before `new Hypergraph(...)` so both counting and pre-agg
+paths benefit. Flag spark.sql.yannakakis.eliminateNoOpDimensionsEnabled (default on).
+
+Correctness safeguard (a bug found and fixed during validation): a FILTERED dimension (e.g. date_dim
+WHERE d_year=2001, like q50's d2) is a SELECTIVE semijoin, not a no-op - eliminating it would drop
+fact rows. isNonReducingLeaf requires the dimension to be a bare project/filter-over-leaf whose only
+predicate is isnotnull(key). So d2 is kept, d1 is removed.
+
+Validation:
+- YannakakisCorrectnessSuite 119/119, including a new dedicated test that eliminates the no-op
+  dimension AND keeps the filtered one (with ANALYZE'd column stats) and checks results == vanilla.
+- TPCDSApplicabilitySuite (injectStats): q50 CountJoin 3 -> 2 - the d1 existence join is dropped;
+  0 exceptions across all 103 queries, no other query's classification changed.
+
+Stats dependency (important): the elimination is gated on PROVABLE PK uniqueness, which needs column
+NDV stats (hasUniqueKeyStats). The SF5 parquet diagnostic tables have NO ANALYZE'd column stats, so
+on that benchmark the elimination is INERT (q50 prod unchanged at ~+14%/13.3M stream). It is
+plan-proven to fire and drop the stream when CBO column stats exist (the normal production case). A
+wall-clock SF5 demonstration would require ANALYZE'd catalog tables (data rewrite). NOTE: this same
+stats gap means ALL NDV-based logic in the rule (e.g. allEquiJoinsHaveUniqueSide arm of the cost
+gate) is inert on the current benchmark - the sweep results are driven by size-based stats only.
